@@ -234,11 +234,11 @@ const table = (devices: Device[], readings: Map<string, Reading>, online: Map<st
 const gridText = (g: GridState | null, now: number) =>
 	!g ? '' : g.state === 'ON' ? `💡 Світло є з ${clock(g.since)}` : `🕯 Без світла ${duration(now - g.since)} · з ${clock(g.since)}`
 
-// Детальна картка однієї станції: головне — звичайним текстом, світло — цитатою знизу
+// Детальна картка однієї станції: усе звичайним текстом, світло — окремим рядком знизу
 const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState | null, now: number) => {
 	const head = `<b>${esc(d.name)}</b>   <i>${clock(now)}</i>`
 	const g_ = gridText(g, now)
-	const foot = g_ ? `\n<blockquote>${g_}</blockquote>` : ''
+	const foot = g_ ? `\n\n${g_}` : ''
 	if (!isOnline) return `⚫️ ${head}\nОфлайн${foot}`
 	if (!r) return `❔ ${head}\nНемає даних${foot}`
 	const time =
@@ -256,7 +256,7 @@ async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel
 		return { text: card(d, readings.get(d.sn), online.get(d.sn)!, grid, now) }
 	}
 	const g_ = gridText(grid, now)
-	const foot = g_ ? `\n\n<blockquote>${g_}</blockquote>` : ''
+	const foot = g_ ? `\n\n${g_}` : ''
 	return { text: `📊 <b>Станції</b>   <i>${clock(now)}</i>\n\n${table(devices, readings, online)}${foot}` }
 }
 
@@ -273,7 +273,7 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 	if (!isOnline) {
 		st.offlineSince ??= now
 		if (!st.offlineAlerted && now - st.offlineSince >= OFFLINE_ALERT_MIN * 60000) {
-			await telegram(env, `⚠️ <b>${esc(dev.name)} — немає зв'язку</b>\n<blockquote>Вже ${duration(now - st.offlineSince)}. Сповіщення про заряд не працюють.</blockquote>`)
+			await telegram(env, `⚠️ <b>${esc(dev.name)} — немає зв'язку</b>\nВже ${duration(now - st.offlineSince)}. Сповіщення про заряд не працюють.`)
 			st.offlineAlerted = true
 		}
 	} else {
@@ -289,7 +289,7 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 				const rem = r.remMin !== null ? `⏳ Залишилось ≈ <b>${hhmm(r.remMin)}</b>` : r.gridIn ? '🔌 Від мережі' : '⏳ Час невідомий'
 				const load = r.loadW !== null ? `\n⚡ Споживання ${r.loadW} Вт` : ''
 				const custom = dev.messages?.[t] ? `\n💬 <i>${esc(dev.messages[t])}</i>` : ''
-				await telegram(env, `${socIcon(t)} <b>${esc(dev.name)} — ${r.soc}%</b>${custom}\n<blockquote><code>${bar(r.soc)}</code>\n${rem}${load}</blockquote>`, { loud })
+				await telegram(env, `${socIcon(t)} <b>${esc(dev.name)} — ${r.soc}%</b>${custom}\n<code>${bar(r.soc)}</code>\n${rem}${load}`, { loud })
 				st.notified.push(...crossed)
 			}
 			st.notified = st.notified.filter((t) => r.soc < t + RESET_GAP)
@@ -345,7 +345,7 @@ async function run(env: Env) {
 // ── Telegram webhook: команди і кнопки ──────────────────────────
 async function helpText() {
 	const list = DEVICES.map((d) => `/${d.cmd} — ${esc(d.name)}`).join('\n')
-	return `<b>🤖 Команди</b>\n<blockquote>/status — усі станції\n${list}</blockquote>\nАбо кнопки нижче.`
+	return `<b>🤖 Команди</b>\n/status — усі станції\n${list}\n\nАбо кнопки нижче.`
 }
 
 async function render(env: Env, cmd: string): Promise<Panel | null> {
@@ -356,7 +356,7 @@ async function render(env: Env, cmd: string): Promise<Panel | null> {
 		return await statusPanel(env, devices)
 	} catch (e) {
 		console.error('status', e)
-		return { text: `⚠️ <b>Не вдалося отримати дані</b>\n<blockquote>${esc(String(e))}</blockquote>` }
+		return { text: `⚠️ <b>Не вдалося отримати дані</b>\n${esc(String(e))}` }
 	}
 }
 
