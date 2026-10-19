@@ -1,10 +1,14 @@
 # EcoFlow → Telegram
 
-Cloudflare Worker, який раз на хвилину опитує EcoFlow IoT Open API (EU) і пише в Telegram:
+Cloudflare Worker, який раз на хвилину опитує станції EcoFlow і пише в Telegram.
+Маринка (DELTA 3 Max Plus) — через офіційний IoT Open API; UPS Kate / UPS Router (River 3) — через MQTT застосунку EcoFlow (`src/mqtt.ts`, `src/protobuf.ts`).
 
 - 🔋 / 🪫 / 🚨 при розряді до **50 / 25 / 10 %** — з орієнтовним часом роботи (hh:mm) і споживанням;
 - 💡 «Світло пішло / повернулось» (по входу AC) з тривалістю відключення;
-- ⚠️ якщо станція не на зв'язку довше 30 хв.
+- ⚠️ якщо станція не на зв'язку довше 30 хв;
+- команди в групі: `/status`, `/marinka`, `/kate`, `/router`, `/help`.
+
+Світло визначається по вхідній потужності UPS Router (`GRID_SOURCE`).
 
 Поріг «зводиться» знову, коли заряд піднімається на 10 % вище за нього. Стан — у KV `POWER_KV`.
 
@@ -21,6 +25,8 @@ GitHub → Settings → Secrets and variables → Actions:
 | `ECOFLOW_ACCESS_KEY`, `ECOFLOW_SECRET_KEY` | developer-eu.ecoflow.com → Security |
 | `TELEGRAM_BOT_TOKEN` | @BotFather |
 | `TELEGRAM_CHAT_ID` | `https://api.telegram.org/bot<TOKEN>/getUpdates` |
+| `EF_EMAIL`, `EF_PASSWORD` | логін і пароль від застосунку EcoFlow (для MQTT) |
+| `TG_WEBHOOK_SECRET` | будь-який випадковий рядок: `openssl rand -hex 32` |
 
 Деплой — автоматично при push у `main` (або Actions → Deploy worker → Run workflow).
 
@@ -28,4 +34,4 @@ GitHub → Settings → Secrets and variables → Actions:
 
 ## Обмеження
 
-API віддає дані лише для DELTA 3 Max Plus. RIVER 2 / River 3 (UPS) повертають `1006 current device is not allowed` — для них потрібен MQTT через логін застосунку (окремий сервіс).
+Офіційний API для River 2 / River 3 повертає `1006 current device is not allowed`, тому UPS читаються через неофіційний MQTT застосунку. Після оновлень прошивки/застосунку EcoFlow формат може змінитись — тоді `tools/probe` допоможе зняти новий дамп.

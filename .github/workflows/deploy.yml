@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+env:
+  WORKER_URL: https://frosty-union-469b.frosty-union-469b.workers.dev
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -22,10 +25,32 @@ jobs:
           secrets: |
             ECOFLOW_ACCESS_KEY
             ECOFLOW_SECRET_KEY
+            EF_EMAIL
+            EF_PASSWORD
             TELEGRAM_BOT_TOKEN
             TELEGRAM_CHAT_ID
+            TG_WEBHOOK_SECRET
         env:
           ECOFLOW_ACCESS_KEY: ${{ secrets.ECOFLOW_ACCESS_KEY }}
           ECOFLOW_SECRET_KEY: ${{ secrets.ECOFLOW_SECRET_KEY }}
+          EF_EMAIL: ${{ secrets.EF_EMAIL }}
+          EF_PASSWORD: ${{ secrets.EF_PASSWORD }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TG_WEBHOOK_SECRET: ${{ secrets.TG_WEBHOOK_SECRET }}
+      - name: Telegram webhook + меню команд
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          SECRET: ${{ secrets.TG_WEBHOOK_SECRET }}
+        run: |
+          curl -sf "https://api.telegram.org/bot${TOKEN}/setWebhook" \
+            --data-urlencode "url=${WORKER_URL}/telegram" \
+            --data-urlencode "secret_token=${SECRET}" \
+            --data-urlencode 'allowed_updates=["message"]'
+          echo
+          curl -sf "https://api.telegram.org/bot${TOKEN}/setMyCommands" -H 'content-type: application/json' -d '{"commands":[
+            {"command":"status","description":"Усі станції: заряд і час роботи"},
+            {"command":"marinka","description":"Маринка"},
+            {"command":"kate","description":"UPS Kate"},
+            {"command":"router","description":"UPS Router"},
+            {"command":"help","description":"Список команд"}]}'
