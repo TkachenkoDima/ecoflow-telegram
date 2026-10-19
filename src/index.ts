@@ -215,21 +215,20 @@ const table = (devices: Device[], readings: Map<string, Reading>, online: Map<st
 	return `<blockquote>${lines.join('\n')}</blockquote>`
 }
 
-// Детальна картка однієї станції
-const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState | null, now: number) => {
-	const t = `<i>${clock(now)}</i>`
-	if (!isOnline) return `⚫️ <b>${esc(d.name)}</b> — офлайн   ${t}`
-	if (!r) return `❔ <b>${esc(d.name)}</b> — немає даних   ${t}`
-	const grid = !g ? '' : g.state === 'ON' ? `\n💡 світло є з ${clock(g.since)}` : `\n🕯 без світла ${duration(now - g.since)}`
-	return `${socIcon(r.soc)} <b>${esc(d.name)} · ${r.soc}%</b>   ${t}\n<blockquote><code>${bar(r.soc)}</code>\n${stateLine(r)}${grid}</blockquote>`
-}
+// Рядок про світло — простим текстом під блоком
+const gridText = (g: GridState | null, now: number) =>
+	!g ? '' : g.state === 'ON' ? `💡 Світло є з ${clock(g.since)}` : `🕯 Без світла ${duration(now - g.since)} · з ${clock(g.since)}`
 
-const gridHead = (g: GridState | null, now: number) => {
-	const t = `<i>${clock(now)}</i>`
-	if (!g) return `📊 ${t}`
-	return g.state === 'ON'
-		? `<b>💡 Світло є</b> · з ${clock(g.since)}   ${t}`
-		: `<b>🕯 Без світла ${duration(now - g.since)}</b> · з ${clock(g.since)}   ${t}`
+// Детальна картка однієї станції: головне — в блоці, жирним; світло — текстом знизу
+const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState | null, now: number) => {
+	const head = `<b>${esc(d.name)}</b>   <i>${clock(now)}</i>`
+	const foot = gridText(g, now)
+	if (!isOnline) return `⚫️ ${head}\n<blockquote>Офлайн</blockquote>${foot ? `\n${foot}` : ''}`
+	if (!r) return `❔ ${head}\n<blockquote>Немає даних</blockquote>${foot ? `\n${foot}` : ''}`
+	const time =
+		r.remMin !== null ? `⏳ Залишилось  <b>${hhmm(r.remMin)}</b>` : r.gridIn ? `🔌 <b>Від мережі</b>` : `⏳ Залишилось  <b>—</b>`
+	const load = r.loadW !== null ? `\n⚡ Споживання  <b>${r.loadW} Вт</b>` : ''
+	return `${socIcon(r.soc)} ${head}\n<blockquote><code>${bar(r.soc)}</code>  <b>${r.soc}%</b>\n${time}${load}</blockquote>${foot ? `\n${foot}` : ''}`
 }
 
 async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel> {
@@ -240,7 +239,8 @@ async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel
 		const d = devices[0]
 		return { text: card(d, readings.get(d.sn), online.get(d.sn)!, grid, now) }
 	}
-	return { text: `${gridHead(grid, now)}\n${table(devices, readings, online)}` }
+	const foot = gridText(grid, now)
+	return { text: `📊 <b>Станції</b>   <i>${clock(now)}</i>\n${table(devices, readings, online)}${foot ? `\n${foot}` : ''}` }
 }
 
 const sendPanel = (env: Env, chatId: string | number, p: Panel) => telegram(env, p.text, { chatId, keyboard: true })
@@ -352,9 +352,14 @@ async function handleUpdate(env: Env, update: any) {
 		if (!ours) return
 		const panel = await render(env, String(cb.data))
 		if (!panel) return
-		// нове повідомлення з кнопками; у попереднього кнопки прибираємо — історія лишається, кнопки лише внизу
-		await tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [] } }).catch(() => {})
+		// Живе лише одна панель стану: стару (з якої натиснули) видаляємо, нову шлемо вниз.
+		// Пуші (пороги, світло) кнопок не мають, тому ніколи не видаляються.
+		const oldId = cb.message.message_id
 		await sendPanel(env, chatId, panel)
+		await tgCall(env, 'deleteMessage', { chat_id: chatId, message_id: oldId }).catch(() =>
+			// бот може видаляти свої повідомлення лише до 48 год — тоді просто прибираємо кнопки
+			tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: oldId, reply_markup: { inline_keyboard: [] } }).catch(() => {}),
+		)
 		return
 	}
 	const msg = update?.message
