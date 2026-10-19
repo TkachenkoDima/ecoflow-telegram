@@ -17,7 +17,7 @@ type Env = {
 
 import { API, DEVICES, GRID_SOURCE, MQTT_WAIT_MS, OFFLINE_ALERT_MIN, QUIET_FROM, QUIET_TO, RESET_GAP, THRESHOLDS, TIMEZONE, type Device } from './config'
 
-type Reading = { soc: number; remMin: number | null; loadW: number | null; gridIn: boolean | null }
+type Reading = { soc: number; remMin: number | null; loadW: number | null; gridIn: boolean | null; maxChg?: number }
 type DeviceState = { notified: number[]; offlineSince: number | null; offlineAlerted: boolean }
 type GridState = { state: 'ON' | 'OFF'; since: number }
 
@@ -44,7 +44,46 @@ async function readRest(env: Env, sn: string): Promise<Reading> {
 	if (!Number.isFinite(soc)) throw new Error(`${sn}: немає cmsBattSoc`)
 	const loadW = Number(q.powOutSumW ?? 0)
 	const acIn = Number(q.powGetAcIn ?? 0)
-	return { soc, loadW, gridIn: acIn > 0, remMin: loadW > 0 && acIn === 0 ? Number(q.cmsDsgRemTime) : null }
+	const maxChg = Number(q.cmsMaxChgSoc)
+	return {
+		soc,
+		loadW,
+		gridIn: acIn > 0,
+		remMin: loadW > 0 && acIn === 0 ? Number(q.cmsDsgRemTime) : null,
+		maxChg: Number.isFinite(maxChg) ? maxChg : undefined,
+	}
+}
+
+// ── Запис налаштувань через IoT Open API (PUT) ──────────────────
+// Підпис: тіло «розплющується» у key=value (вкладені — через крапку), сортується, + accessKey/nonce/timestamp
+const flatten = (o: any, prefix = ''): string[] =>
+	Object.entries(o).flatMap(([k, v]) => {
+		const key = prefix ? `${prefix}.${k}` : k
+		if (Array.isArray(v)) return v.flatMap((x, i) => (typeof x === 'object' ? flatten(x, `${key}[${i}]`) : [`${key}[${i}]=${x}`]))
+		return v !== null && typeof v === 'object' ? flatten(v, key) : [`${key}=${v}`]
+	})
+
+async function ecoflowSet(env: Env, sn: string, params: Record<string, number | boolean>) {
+	// Конверт для DELTA 3 / Stream: cmdId 17, cmdFunc 254, dest 2
+	const body = { sn, cmdId: 17, cmdFunc: 254, dirDest: 1, dirSrc: 1, dest: 2, needAck: true, params }
+	const nonce = String(100000 + Math.floor(Math.random() * 900000))
+	const timestamp = String(Date.now())
+	const toSign = [...flatten(body).sort(), `accessKey=${env.ECOFLOW_ACCESS_KEY}`, `nonce=${nonce}`, `timestamp=${timestamp}`].join('&')
+	const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(env.ECOFLOW_SECRET_KEY), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+	const sign = hex(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(toSign)))
+	const res = await fetch(`${API}/iot-open/sign/device/quota`, {
+		method: 'PUT',
+		headers: { 'Content-Type': 'application/json;charset=UTF-8', accessKey: env.ECOFLOW_ACCESS_KEY, nonce, timestamp, sign },
+		body: JSON.stringify(body),
+	})
+	const json = await res.json<any>()
+	if (json?.code !== '0') throw new Error(`EcoFlow set: ${json?.code} ${json?.message}`)
+}
+
+// Дії з кнопок: callback_data = "set:<cmd>:<дія>"
+const ACTIONS: Record<string, { label: string; via: Device['via']; params: Record<string, number> }> = {
+	max80: { label: '🔝 Ліміт 80%', via: 'rest', params: { cfgMaxChgSoc: 80 } },
+	max100: { label: '🔝 Ліміт 100%', via: 'rest', params: { cfgMaxChgSoc: 100 } },
 }
 
 // ── MQTT застосунку (для River 3) ───────────────────────────────
@@ -145,6 +184,14 @@ async function readAll(env: Env, devices: Device[] = DEVICES) {
 const KEYBOARD = {
 	inline_keyboard: [[{ text: '📊 Усі станції', callback_data: 'status' }], DEVICES.map((d) => ({ text: d.name, callback_data: d.cmd }))],
 }
+// Для картки станції — ще рядок керування (лише дії, які підтримує її тип підключення)
+const keyboardFor = (d?: Device) => {
+	if (!d) return KEYBOARD
+	const row = Object.entries(ACTIONS)
+		.filter(([, a]) => a.via === d.via)
+		.map(([id, a]) => ({ text: a.label, callback_data: `set:${d.cmd}:${id}` }))
+	return row.length ? { inline_keyboard: [row, ...KEYBOARD.inline_keyboard] } : KEYBOARD
+}
 
 async function tgCall(env: Env, method: string, body: object) {
 	const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
@@ -166,8 +213,8 @@ type SendOpts = { chatId?: string | number; loud?: boolean; keyboard?: boolean }
 
 // HTML-повідомлення; уночі — без звуку (якщо не loud); кнопки лише на панелі стану
 // Явний роздільник у кінці кожного повідомлення, щоб сусідні не зливались
-// U+2800 (порожній символ Брайля) Telegram не обрізає — дає «повітря» під лінією всередині бульбашки
-const DIVIDER = '━━━━━━━━━━━━━━━━━━\n\u2800'
+// U+2800 (порожній символ Брайля) Telegram не обрізає — дає «повітря» внизу бульбашки
+const DIVIDER = '\u2800'
 
 // TELEGRAM_CHAT_ID може містити кілька груп через кому: "-555…,-401…"
 const chatIds = (env: Env) => env.TELEGRAM_CHAT_ID.split(',').map((x) => x.trim()).filter(Boolean)
@@ -211,7 +258,7 @@ const bar = (soc: number) => {
 }
 
 
-type Panel = { text: string }
+type Panel = { text: string; device?: Device }
 
 // Стан станції одним рядком: «⏳ 04:01 · ⚡ 58 Вт» / «🔌 від мережі»
 const stateLine = (r: Reading) => {
@@ -246,7 +293,8 @@ const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState
 	const time =
 		r.remMin !== null ? `⏳ Залишилось  <b>${hhmm(r.remMin)}</b>` : r.gridIn ? `🔌 <b>Від мережі</b>` : `⏳ Залишилось  <b>—</b>`
 	const load = r.loadW !== null ? `\n⚡ Споживання  <b>${r.loadW} Вт</b>` : ''
-	return `${socIcon(r.soc)} ${head}\n<code>${bar(r.soc)}</code>  <b>${r.soc}%</b>\n${time}${load}${foot}`
+	const lim = r.maxChg !== undefined ? `\n🔝 Ліміт заряду  <b>${r.maxChg}%</b>` : ''
+	return `${socIcon(r.soc)} ${head}\n<code>${bar(r.soc)}</code>  <b>${r.soc}%</b>\n${time}${load}${lim}${foot}`
 }
 
 async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel> {
@@ -255,7 +303,7 @@ async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel
 	const now = Date.now()
 	if (devices.length === 1) {
 		const d = devices[0]
-		return { text: card(d, readings.get(d.sn), online.get(d.sn)!, grid, now) }
+		return { text: card(d, readings.get(d.sn), online.get(d.sn)!, grid, now), device: d }
 	}
 	const g_ = gridText(grid, now)
 	const foot = g_ ? `\n\n${g_}` : ''
@@ -278,7 +326,7 @@ async function sendPanel(env: Env, chatId: string | number, p: Panel) {
 		parse_mode: 'HTML',
 		link_preview_options: { is_disabled: true },
 		disable_notification: isQuiet(),
-		reply_markup: KEYBOARD,
+		reply_markup: keyboardFor(p.device),
 	})
 	if (msg?.message_id)
 		await cache.put(panelKey(chatId), new Response(String(msg.message_id), { headers: { 'Cache-Control': 'max-age=604800' } }))
@@ -388,9 +436,34 @@ async function handleUpdate(env: Env, update: any) {
 	if (cb) {
 		const chatId = cb.message?.chat?.id
 		const ours = isOurChat(env, chatId)
+		const data = String(cb.data)
+		if (ours && data.startsWith('set:')) {
+			const [, cmd, actionId] = data.split(':')
+			const d = DEVICES.find((x) => x.cmd === cmd)
+			const action = ACTIONS[actionId]
+			if (!d || !action || action.via !== d.via) return
+			let note: string
+			try {
+				await ecoflowSet(env, d.sn, action.params)
+				note = `✅ ${d.name}: ${action.label.replace(/^\S+\s/, '')}`
+			} catch (e) {
+				console.error('set', e)
+				note = `⚠️ Не вдалося: ${String(e).slice(0, 150)}`
+			}
+			await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text: note, show_alert: note.startsWith('⚠️') }).catch(() => {})
+			await new Promise((r) => setTimeout(r, 3000)) // станції потрібен час, щоб застосувати
+			const who = cb.from?.first_name ? ` · ${esc(cb.from.first_name)}` : ''
+			const panel = await render(env, d.cmd)
+			if (panel) {
+				panel.text = `${esc(note)}${who}\n\n${panel.text}`
+				await noKeyboard(env, chatId, cb.message.message_id)
+				await sendPanel(env, chatId, panel)
+			}
+			return
+		}
 		await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text: ours ? 'Оновлюю…' : undefined }).catch(() => {})
 		if (!ours) return
-		const panel = await render(env, String(cb.data))
+		const panel = await render(env, data)
 		if (!panel) return
 		// Нове повідомлення з кнопками; старе лишається в історії, з нього прибираємо лише кнопки
 		await noKeyboard(env, chatId, cb.message.message_id) // на випадок, якщо кеш порожній
