@@ -295,7 +295,9 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, 
 			const need = async (sn: string) => (refresh ? stale(sn) : detailed ? !(await getSettings(sn)) : false)
 			const pick = async (list: Device[]) => (await Promise.all(list.map(async (d) => ((await need(d.sn)) ? d.sn : '')))).filter(Boolean)
 			const settingsFor = await pick(want)
-			const restSet = await pick(devices.filter((d) => d.via === 'rest' && online.get(d.sn)))
+			// REST-станції (DELTA 3) не шлють налаштування в MQTT-телеметрії — не чекаємо їх;
+			// їхній «макс. вхід» запам'ятовується, коли його виставляють кнопкою з «Керування»
+			const restSet: string[] = []
 			const { result: r, parts } = await readMqtt(env, want.map((d) => d.sn), {
 				settingsFor,
 				restSettings: restSet,
