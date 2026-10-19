@@ -13,9 +13,25 @@ type Env = {
 	TELEGRAM_BOT_TOKEN: string
 	TELEGRAM_CHAT_ID: string
 	TG_WEBHOOK_SECRET: string
+	DEVICE_SNS: string // {"marinka": "D3M1…", "kate": "R655…"} — серійники не зберігаються в репо
 }
 
 import { API, DEVICES, GRID_SOURCE, MQTT_WAIT_MS, OFFLINE_ALERT_MIN, QUIET_FROM, QUIET_TO, RESET_GAP, THRESHOLDS, TIMEZONE, type Device } from './config'
+
+// Підставляємо серійники з секрету DEVICE_SNS (за cmd станції)
+function initDevices(env: Env) {
+	let map: Record<string, string>
+	try {
+		map = JSON.parse(env.DEVICE_SNS || '{}')
+	} catch {
+		throw new Error('DEVICE_SNS: невалідний JSON')
+	}
+	for (const d of DEVICES) {
+		d.sn = map[d.cmd] ?? ''
+		if (!d.sn) throw new Error(`DEVICE_SNS: немає серійника для "${d.cmd}"`)
+	}
+}
+const gridSn = () => DEVICES.find((d) => d.cmd === GRID_SOURCE)?.sn ?? ''
 
 type Reading = { soc: number; remMin: number | null; loadW: number | null; gridIn: boolean | null; maxChg?: number; acMax?: number }
 type DeviceState = { notified: number[]; offlineSince: number | null; offlineAlerted: boolean }
@@ -158,12 +174,27 @@ async function appAuth(env: Env): Promise<AppAuth> {
 	return a
 }
 
+// ── Кеш налаштувань станцій (ліміт заряду, макс. вхід) у Cache API: безкоштовно, не витрачає записи KV ──
+type Settings = { maxChg?: number; acMax?: number; at: number }
+const SETTINGS_FRESH_MS = 60 * 60_000 // раз на годину cron оновлює налаштування з телеметрії
+const settingsKey = (sn: string) => new Request(`https://settings.local/${sn}`)
+async function getSettings(sn: string): Promise<Settings | null> {
+	const r = await caches.default.match(settingsKey(sn))
+	return r ? r.json<Settings>() : null
+}
+async function saveSettings(sn: string, upd: { maxChg?: number; acMax?: number }) {
+	if (upd.maxChg === undefined && upd.acMax === undefined) return
+	const prev = (await getSettings(sn)) ?? { at: 0 }
+	const next: Settings = { maxChg: upd.maxChg ?? prev.maxChg, acMax: upd.acMax ?? prev.acMax, at: Date.now() }
+	await caches.default.put(settingsKey(sn), new Response(JSON.stringify(next), { headers: { 'Cache-Control': 'max-age=2592000' } }))
+}
+
 // sns — з кого читаємо заряд; settingsFor — у кого ще чекаємо налаштування (повний пакет 254/21:
 // ліміт заряду і макс. вхід); restSettings — REST-станції, з яких по MQTT беремо лише макс. вхід
 async function readMqtt(
 	env: Env,
 	sns: string[],
-	o: { settingsFor?: string[]; restSettings?: string[] } = {},
+	o: { settingsFor?: string[]; restSettings?: string[]; timeoutMs?: number } = {},
 ): Promise<{ result: Map<string, Reading>; parts: Map<string, UpsPart> }> {
 	const result = new Map<string, Reading>()
 	const settingsFor = new Set(o.settingsFor ?? [])
@@ -193,7 +224,7 @@ async function readMqtt(
 					JSON.stringify({ from: 'Android', id: String(Date.now() % 1e9), version: '1.1', moduleType: 0, operateType: 'latestQuotas', params: {} }),
 				),
 			})),
-			timeoutMs: MQTT_WAIT_MS,
+			timeoutMs: o.timeoutMs ?? MQTT_WAIT_MS,
 			onMessage: ({ topic, payload }) => {
 				const sn = all.find((s) => topic.endsWith(s))
 				if (!sn) return false
@@ -210,6 +241,8 @@ async function readMqtt(
 		if (e instanceof MqttAuthError) await env.POWER_KV.delete('appauth')
 		throw e
 	}
+	// усе, що побачили з налаштувань, — у кеш
+	await Promise.all([...parts].map(([sn, p]) => saveSettings(sn, { maxChg: restOnly.includes(sn) ? undefined : p.maxChg, acMax: p.acMax })))
 	for (const [sn, p] of parts) {
 		if (p.soc === undefined || restOnly.includes(sn)) continue
 		const discharging = (p.battOutW ?? 0) > 5 && (p.battInW ?? 0) === 0
@@ -228,8 +261,9 @@ async function readMqtt(
 }
 
 // ── Збір даних з усіх станцій ───────────────────────────────────
-// detailed — для картки однієї станції: чекаємо ще й налаштування (ліміт заряду, макс. вхід)
-async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false) {
+// detailed — картка однієї станції: додаємо налаштування з кешу (живі мають пріоритет)
+// refresh — cron: якщо налаштування в кеші застаріли, чекаємо повний пакет телеметрії довше
+async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, refresh = false) {
 	const list: Array<{ sn: string; online: number }> = await ecoflow(env, '/iot-open/sign/device/list')
 	const online = new Map(DEVICES.map((d) => [d.sn, list.find((x) => x.sn === d.sn)?.online === 1]))
 	const readings = new Map<string, Reading>()
@@ -237,7 +271,9 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false) 
 
 	const restJobs = devices.filter((d) => d.via === 'rest' && online.get(d.sn)).map(async (d) => {
 		try {
-			readings.set(d.sn, await readRest(env, d.sn))
+			const rd = await readRest(env, d.sn)
+			readings.set(d.sn, rd)
+			await saveSettings(d.sn, { maxChg: rd.maxChg })
 		} catch (e) {
 			errors.push(`${d.name}: ${e}`)
 		}
@@ -245,10 +281,20 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false) 
 	const mqttJob = (async () => {
 		try {
 			const want = devices.filter((d) => d.via === 'mqtt' && online.get(d.sn))
-			const restSet = detailed ? devices.filter((d) => d.via === 'rest' && online.get(d.sn)).map((d) => d.sn) : []
+			const stale = async (sn: string) => {
+				const c = await getSettings(sn)
+				return !c || Date.now() - c.at > SETTINGS_FRESH_MS
+			}
+			// cron: оновлюємо застарілі; картка: чекаємо наживо лише тих, кого ще немає в кеші
+			// (кеш Cloudflare — на рівні дата-центру, тож картка й cron можуть його не ділити)
+			const need = async (sn: string) => (refresh ? stale(sn) : detailed ? !(await getSettings(sn)) : false)
+			const pick = async (list: Device[]) => (await Promise.all(list.map(async (d) => ((await need(d.sn)) ? d.sn : '')))).filter(Boolean)
+			const settingsFor = await pick(want)
+			const restSet = await pick(devices.filter((d) => d.via === 'rest' && online.get(d.sn)))
 			const { result: r, parts } = await readMqtt(env, want.map((d) => d.sn), {
-				settingsFor: detailed ? want.map((d) => d.sn) : [],
+				settingsFor,
 				restSettings: restSet,
+				timeoutMs: refresh && (settingsFor.length || restSet.length) ? 25_000 : MQTT_WAIT_MS,
 			})
 			for (const [sn, v] of r) readings.set(sn, v)
 			// макс. вхід для REST-станцій (офіційний API його не віддає) — дописуємо після REST
@@ -265,6 +311,15 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false) 
 		}
 	})()
 	await Promise.all([...restJobs, mqttJob])
+	if (detailed)
+		for (const d of devices) {
+			const rd = readings.get(d.sn)
+			const c = rd ? await getSettings(d.sn) : null
+			if (rd && c) {
+				rd.maxChg ??= c.maxChg
+				rd.acMax ??= c.acMax
+			}
+		}
 	for (const e of errors) console.error(e)
 	return { online, readings, errors }
 }
@@ -485,7 +540,7 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 }
 
 async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<string, boolean>) {
-	const src = readings.get(GRID_SOURCE)
+	const src = readings.get(gridSn())
 	if (!src || src.gridIn === null) return // невідомо — нічого не міняємо
 	const now = Date.now()
 	const cur: GridState['state'] = src.gridIn ? 'ON' : 'OFF'
@@ -513,7 +568,7 @@ async function syncCommands(env: Env) {
 
 async function run(env: Env) {
 	await syncCommands(env).catch((e) => console.error('commands', e))
-	const { online, readings } = await readAll(env)
+	const { online, readings } = await readAll(env, DEVICES, false, true)
 	if (!(await env.POWER_KV.get('started:v3'))) {
 		const text = `📡 <b>Моніторинг EcoFlow запущено</b>\nПороги ${THRESHOLDS.join(' · ')}% · тиша ${QUIET_FROM}:00–${QUIET_TO}:00\n\n${table(DEVICES, readings, online)}`
 		for (const id of chatIds(env)) await sendPanel(env, id, { text }).catch((e) => console.error('start', id, e))
@@ -571,6 +626,10 @@ async function handleUpdate(env: Env, update: any) {
 			let note: string
 			try {
 				const confirmed = await runAction(env, d, action)
+				const f = action.kind === 'mqtt' ? new Map(action.fields) : null
+				const maxChg = action.kind === 'rest' ? action.params.cfgMaxChgSoc : f?.get(33)
+				const acMax = action.kind === 'rest' ? action.params.cfgPlugInInfoAcInChgPowMax : f?.get(54)
+				if (confirmed) await saveSettings(d.sn, { maxChg, acMax })
 				const what = `${d.name}: ${action.group.replace(/^\S+\s/, '').toLowerCase()} ${action.label}`
 				note = confirmed ? `✅ ${what}` : `📤 ${what} — надіслано, станція не підтвердила. Перевір у застосунку`
 			} catch (e) {
@@ -606,9 +665,11 @@ async function handleUpdate(env: Env, update: any) {
 
 export default {
 	async scheduled(_event, env, ctx) {
+		initDevices(env)
 		ctx.waitUntil(run(env))
 	},
 	async fetch(req, env, ctx) {
+		initDevices(env)
 		const url = new URL(req.url)
 		if (url.pathname === '/telegram' && req.method === 'POST') {
 			if (req.headers.get('X-Telegram-Bot-Api-Secret-Token') !== env.TG_WEBHOOK_SECRET) return new Response('forbidden', { status: 403 })

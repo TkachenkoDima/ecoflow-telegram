@@ -11,6 +11,9 @@ async function call(path, params = {}) {
   return { status: res.status, body: await res.json().catch(() => ({})) };
 }
 const d = await call("/iot-open/sign/device/list");
+console.log("\nDEVICE_SNS (заготовка для секрету — замініть ключі на свої cmd):");
+console.log(JSON.stringify(Object.fromEntries((d.body.data || []).map((x) => [String(x.deviceName || x.sn).toLowerCase().replace(/[^a-z0-9]+/g, "") || x.sn, x.sn]))));
+console.log("");
 console.log("LIST", d.status, JSON.stringify(d.body));
 for (const dev of d.body.data || []) {
   const q = await call("/iot-open/sign/device/quota/all", { sn: dev.sn });

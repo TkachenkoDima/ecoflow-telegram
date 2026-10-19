@@ -1,6 +1,6 @@
 // Зонд запису: надсилає одну команду SetCommand (protobuf) і 15 с пише ВСЕ, що приходить від станції.
 // Запуск: EF_EMAIL='...' EF_PASSWORD='...' node set-probe.mjs <SN> <поле> <значення>
-//   напр. node set-probe.mjs R655ZEBAXH170579 33 90   (Kate: ліміт заряду 90%)
+//   напр. node set-probe.mjs R655XXXXXXXX0001 33 90   (Kate: ліміт заряду 90%)
 import mqtt from 'mqtt'
 import { randomUUID } from 'node:crypto'
 

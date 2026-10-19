@@ -77,8 +77,8 @@ ACCESS_KEY='...' SECRET_KEY='...' node tools/check-api.mjs
 Для кожної станції скрипт виведе готовий рядок для конфігу, напр.:
 
 ```
-→ Маринка: { sn: 'D3M1ZE1A9H990005', via: 'rest' }
-→ UPS Kate: { sn: 'R655ZEBAXH170579', via: 'mqtt' }
+→ Маринка: { sn: 'D3M1XXXXXXXXXXXX', via: 'rest' }
+→ UPS Kate: { sn: 'R655XXXXXXXX0001', via: 'mqtt' }
 ```
 
 - `code 0` → `via: 'rest'`
@@ -96,20 +96,27 @@ ACCESS_KEY='...' SECRET_KEY='...' node tools/check-api.mjs
 
 ### 5. Налаштуйте `src/config.ts`
 
-Впишіть свої станції:
+Опишіть станції — **без серійників** (вони йдуть у секрет, щоб не світитись у репо):
 
 ```ts
 export const DEVICES: Device[] = [
-	{ sn: 'D3M1…', name: 'Вітальня', via: 'rest', cmd: 'living' },
-	{ sn: 'R655…', name: 'Роутер',   via: 'mqtt', cmd: 'router' },
+	{ sn: '', name: 'Вітальня', via: 'rest', cmd: 'living' },
+	{ sn: '', name: 'Роутер',   via: 'mqtt', cmd: 'router' },
 ]
-export const GRID_SOURCE = 'R655…' // станція, по якій визначати світло
+export const GRID_SOURCE = 'router' // cmd станції, по якій визначати світло
 ```
 
-- `cmd` — латиницею, стане командою `/router` і кнопкою.
+- `cmd` — латиницею, стане командою `/router` і кнопкою; за ним же підставляється серійник.
+- `via` — з виводу `check-api` (крок 3).
+- `GRID_SOURCE` — найкраще станція з **постійним** навантаженням (роутер, ПК): світло визначається за її вхідною потужністю.
 - `messages` — необов'язково: свій текст для порогу, напр. `messages: { 10: 'Я скоро сяду!' }`.
-- `GRID_SOURCE` — найкраще станція з **постійним** навантаженням (роутер, ПК): світло визначається за її вхідною потужністю. Для `rest`-станцій — за входом AC.
 - Там само пороги, тихий режим і часовий пояс.
+
+Серійники — у секрет `DEVICE_SNS` (крок 7) у вигляді JSON `{"<cmd>": "<серійник>"}`:
+
+```json
+{"living":"D3M1XXXXXXXXXXXX","router":"R655XXXXXXXX0002"}
+```
 
 ### 6. Cloudflare
 
@@ -140,8 +147,9 @@ npx wrangler kv namespace create POWER_KV   # виведе "id": "…"
 | `TELEGRAM_BOT_TOKEN` | крок 4 |
 | `TELEGRAM_CHAT_ID` | крок 4, з мінусом; кілька груп — через кому: `-555…,-401…` |
 | `TG_WEBHOOK_SECRET` | будь-який випадковий рядок: `openssl rand -hex 32` |
+| `DEVICE_SNS` | серійники станцій: `{"living":"D3M1…","router":"R655…"}` (ключі — `cmd` з `config.ts`) |
 
-Вставляйте без пробілів і переносів рядка. Всі 9 обов'язкові (`EF_*` можна заповнити будь-чим, якщо всі станції `rest`).
+Вставляйте без пробілів і переносів рядка. Всі 10 обов'язкові (`EF_*` можна заповнити будь-чим, якщо всі станції `rest`).
 
 ### 8. Деплой
 
@@ -179,7 +187,7 @@ npx wrangler tail
 
 ```bash
 cd tools/probe && npm install
-EF_EMAIL='...' EF_PASSWORD='...' node probe.mjs R655ZEBAXH170579 R655ZEBAXH171200
+EF_EMAIL='...' EF_PASSWORD='...' node probe.mjs R655XXXXXXXX0001 R655XXXXXXXX0002
 ```
 
 ---
@@ -212,7 +220,7 @@ EF_EMAIL='...' EF_PASSWORD='...' node probe.mjs R655ZEBAXH170579 R655ZEBAXH17120
 
 ## Безпека
 
-- Секрети зберігаються лише в GitHub Secrets і Cloudflare (зашифровано), у коді їх немає.
+- Секрети й серійники станцій зберігаються лише в GitHub Secrets і Cloudflare (зашифровано), у коді їх немає.
 - `EF_PASSWORD` — пароль від акаунта EcoFlow: використовуйте унікальний.
 - Бот відповідає лише в групах з `TELEGRAM_CHAT_ID`; щоб ніхто не додав його до своєї групи — @BotFather → Bot Settings → Allow Groups → Turn off; webhook захищений `TG_WEBHOOK_SECRET`.
 - MQTT-доступ неофіційний: EcoFlow може змінити протокол оновленням — тоді `tools/probe` допоможе розібратися.
