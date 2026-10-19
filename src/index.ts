@@ -176,7 +176,8 @@ async function appAuth(env: Env): Promise<AppAuth> {
 
 // ── Налаштування станцій (ліміт заряду, макс. вхід) у KV — спільні для всіх дата-центрів Cloudflare ──
 // Запис лише коли значення змінилось або минула година (≈ до 72 записів/добу на 3 станції — далеко від ліміту 1000)
-type Settings = { maxChg?: number; acMax?: number; at: number }
+type Settings = { maxChg?: number; acMax?: number; at: number; cmdAt?: number } // cmdAt — коли змінено командою бота
+const RECENT_CMD_MS = 10 * 60_000
 const SETTINGS_FRESH_MS = 60 * 60_000
 let settingsEnv: Env // KV доступний лише через env — запам'ятовуємо на час запиту
 const settingsCache = new Map<string, Settings | null>() // у межах одного запуску, щоб не читати KV двічі
@@ -184,12 +185,17 @@ async function getSettings(sn: string): Promise<Settings | null> {
 	if (!settingsCache.has(sn)) settingsCache.set(sn, await settingsEnv.POWER_KV.get<Settings>(`settings:${sn}`, 'json'))
 	return settingsCache.get(sn)!
 }
-async function saveSettings(sn: string, upd: { maxChg?: number; acMax?: number }) {
+async function saveSettings(sn: string, upd: { maxChg?: number; acMax?: number }, byCommand = false) {
 	if (upd.maxChg === undefined && upd.acMax === undefined) return
 	const prev = await getSettings(sn)
-	const next: Settings = { maxChg: upd.maxChg ?? prev?.maxChg, acMax: upd.acMax ?? prev?.acMax, at: Date.now() }
+	const next: Settings = {
+		maxChg: upd.maxChg ?? prev?.maxChg,
+		acMax: upd.acMax ?? prev?.acMax,
+		at: Date.now(),
+		cmdAt: byCommand ? Date.now() : prev?.cmdAt,
+	}
 	const changed = !prev || prev.maxChg !== next.maxChg || prev.acMax !== next.acMax
-	if (!changed && Date.now() - prev.at < SETTINGS_FRESH_MS) return
+	if (!byCommand && !changed && Date.now() - prev.at < SETTINGS_FRESH_MS) return
 	settingsCache.set(sn, next)
 	await settingsEnv.POWER_KV.put(`settings:${sn}`, JSON.stringify(next))
 }
@@ -277,8 +283,13 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, 
 	const restJobs = devices.filter((d) => d.via === 'rest' && online.get(d.sn)).map(async (d) => {
 		try {
 			const rd = await readRest(env, d.sn)
+			// Хмарний API віддає налаштування з запізненням (хвилини). Якщо бот сам щойно змінив ліміт —
+			// 10 хв довіряємо своєму значенню, а не старому з API
+			const c = await getSettings(d.sn)
+			const recent = c?.cmdAt !== undefined && Date.now() - c.cmdAt < RECENT_CMD_MS
+			if (recent && c?.maxChg !== undefined) rd.maxChg = c.maxChg
+			else await saveSettings(d.sn, { maxChg: rd.maxChg })
 			readings.set(d.sn, rd)
-			await saveSettings(d.sn, { maxChg: rd.maxChg })
 		} catch (e) {
 			errors.push(`${d.name}: ${e}`)
 		}
@@ -636,7 +647,7 @@ async function handleUpdate(env: Env, update: any) {
 				const f = action.kind === 'mqtt' ? new Map(action.fields) : null
 				const maxChg = action.kind === 'rest' ? action.params.cfgMaxChgSoc : f?.get(33)
 				const acMax = action.kind === 'rest' ? action.params.cfgPlugInInfoAcInChgPowMax : f?.get(54)
-				if (confirmed) await saveSettings(d.sn, { maxChg, acMax })
+				if (confirmed) await saveSettings(d.sn, { maxChg, acMax }, true)
 				const what = `${d.name}: ${action.group.replace(/^\S+\s/, '').toLowerCase()} ${action.label}`
 				note = confirmed ? `✅ ${what}` : `📤 ${what} — надіслано, станція не підтвердила. Перевір у застосунку`
 			} catch (e) {
