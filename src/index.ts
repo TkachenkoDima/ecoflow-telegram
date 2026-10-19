@@ -81,21 +81,25 @@ async function ecoflowSet(env: Env, sn: string, params: Record<string, number | 
 }
 
 // Дії з кнопок: callback_data = "set:<cmd>:<дія>"
-// rest — параметри IoT Open API; mqtt — номер поля River3SetCommand і значення
-type Action = { label: string; group: string } & ({ via: 'rest'; params: Record<string, number> } | { via: 'mqtt'; field: number; value: number })
+// for — для якого типу станції кнопка (як via у config.ts);
+// kind 'rest' — параметри IoT Open API; kind 'mqtt' — поле SetCommand (protobuf, однакове для DELTA 3 і River 3)
+type Action = { label: string; group: string; for: Device['via'] } & (
+	| { kind: 'rest'; params: Record<string, number> }
+	| { kind: 'mqtt'; field: number; value: number }
+)
 const ACTIONS: Record<string, Action> = {
 	// DELTA 3 (офіційний API)
-	max80: { label: '80%', group: '🔝 Ліміт заряду', via: 'rest', params: { cfgMaxChgSoc: 80 } },
-	max100: { label: '100%', group: '🔝 Ліміт заряду', via: 'rest', params: { cfgMaxChgSoc: 100 } },
-	ac500: { label: '500 Вт', group: '🔌 Вхідна потужність', via: 'rest', params: { cfgPlugInInfoAcInChgPowMax: 500 } },
-	ac1000: { label: '1 кВт', group: '🔌 Вхідна потужність', via: 'rest', params: { cfgPlugInInfoAcInChgPowMax: 1000 } },
-	ac2000: { label: '2 кВт', group: '🔌 Вхідна потужність', via: 'rest', params: { cfgPlugInInfoAcInChgPowMax: 2000 } },
+	max80: { label: '80%', group: '🔝 Ліміт заряду', for: 'rest', kind: 'rest', params: { cfgMaxChgSoc: 80 } },
+	max100: { label: '100%', group: '🔝 Ліміт заряду', for: 'rest', kind: 'rest', params: { cfgMaxChgSoc: 100 } },
+	ac500: { label: '500 Вт', group: '🔌 Вхідна потужність', for: 'rest', kind: 'mqtt', field: 54, value: 500 }, // API ігнорує → MQTT
+	ac1000: { label: '1 кВт', group: '🔌 Вхідна потужність', for: 'rest', kind: 'mqtt', field: 54, value: 1000 }, // API ігнорує → MQTT
+	ac2000: { label: '2 кВт', group: '🔌 Вхідна потужність', for: 'rest', kind: 'mqtt', field: 54, value: 2000 }, // API ігнорує → MQTT
 	// River 3 (MQTT; макс. вхід від мережі ~305 Вт)
-	rmax80: { label: '80%', group: '🔝 Ліміт заряду', via: 'mqtt', field: 33, value: 80 },
-	rmax100: { label: '100%', group: '🔝 Ліміт заряду', via: 'mqtt', field: 33, value: 100 },
-	rac100: { label: '100 Вт', group: '🔌 Вхідна потужність', via: 'mqtt', field: 54, value: 100 },
-	rac200: { label: '200 Вт', group: '🔌 Вхідна потужність', via: 'mqtt', field: 54, value: 200 },
-	rac300: { label: '300 Вт', group: '🔌 Вхідна потужність', via: 'mqtt', field: 54, value: 300 },
+	rmax80: { label: '80%', group: '🔝 Ліміт заряду', for: 'mqtt', kind: 'mqtt', field: 33, value: 80 },
+	rmax100: { label: '100%', group: '🔝 Ліміт заряду', for: 'mqtt', kind: 'mqtt', field: 33, value: 100 },
+	rac100: { label: '100 Вт', group: '🔌 Вхідна потужність', for: 'mqtt', kind: 'mqtt', field: 54, value: 100 },
+	rac200: { label: '200 Вт', group: '🔌 Вхідна потужність', for: 'mqtt', kind: 'mqtt', field: 54, value: 200 },
+	rac300: { label: '300 Вт', group: '🔌 Вхідна потужність', for: 'mqtt', kind: 'mqtt', field: 54, value: 300 },
 }
 
 // Запис у River 3 через MQTT застосунку; успіх — якщо станція відповіла set_reply
@@ -116,7 +120,7 @@ async function mqttSet(env: Env, sn: string, field: number, value: number) {
 	if (!replied) throw new Error('станція не підтвердила команду за 8 с')
 }
 
-const runAction = (env: Env, d: Device, a: Action) => (a.via === 'rest' ? ecoflowSet(env, d.sn, a.params) : mqttSet(env, d.sn, a.field, a.value))
+const runAction = (env: Env, d: Device, a: Action) => (a.kind === 'rest' ? ecoflowSet(env, d.sn, a.params) : mqttSet(env, d.sn, a.field, a.value))
 
 // ── MQTT застосунку (для River 3) ───────────────────────────────
 type AppAuth = { host: string; port: number; username: string; password: string; userId: string }
@@ -237,7 +241,7 @@ const KEYBOARD = {
 // «Папка» керування: спершу вибір станції…
 const CONTROL_KEYBOARD = {
 	inline_keyboard: [
-		DEVICES.filter((d) => Object.values(ACTIONS).some((a) => a.via === d.via)).map((d) => ({ text: d.name, callback_data: `menu:dev:${d.cmd}` })),
+		DEVICES.filter((d) => Object.values(ACTIONS).some((a) => a.for === d.via)).map((d) => ({ text: d.name, callback_data: `menu:dev:${d.cmd}` })),
 		[{ text: '⬅️ Назад', callback_data: 'menu:main' }],
 	],
 }
@@ -245,7 +249,7 @@ const CONTROL_KEYBOARD = {
 const deviceKeyboard = (d: Device) => {
 	const groups = new Map<string, { text: string; callback_data: string }[]>()
 	for (const [id, a] of Object.entries(ACTIONS)) {
-		if (a.via !== d.via) continue
+		if (a.for !== d.via) continue
 		if (!groups.has(a.group)) groups.set(a.group, [])
 		groups.get(a.group)!.push({ text: a.label, callback_data: `set:${d.cmd}:${id}` })
 	}
@@ -521,7 +525,7 @@ async function handleUpdate(env: Env, update: any) {
 			const [, cmd, actionId] = data.split(':')
 			const d = DEVICES.find((x) => x.cmd === cmd)
 			const action = ACTIONS[actionId]
-			if (!d || !action || action.via !== d.via) return
+			if (!d || !action || action.for !== d.via) return
 			await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text: 'Надсилаю команду…' }).catch(() => {})
 			let note: string
 			try {
@@ -529,13 +533,12 @@ async function handleUpdate(env: Env, update: any) {
 				note = `✅ ${d.name}: ${action.group.replace(/^\S+\s/, '').toLowerCase()} ${action.label}`
 			} catch (e) {
 				console.error('set', e)
-				note = `⚠️ Не вдалося: ${String(e).slice(0, 150)}`
+				note = `⚠️ Не вдалося: ${String(e).replace(/^Error:\s*/, '').slice(0, 150)}`
 			}
 			await new Promise((r) => setTimeout(r, 3000)) // станції потрібен час, щоб застосувати
-			const who = cb.from?.first_name ? ` · ${esc(cb.from.first_name)}` : ''
 			const panel = await render(env, d.cmd)
 			if (panel) {
-				panel.text = `${esc(note)}${who}\n\n${panel.text}`
+				panel.text = `${esc(note)}\n\n${panel.text}`
 				await noKeyboard(env, chatId, cb.message.message_id)
 				await sendPanel(env, chatId, panel)
 			}
