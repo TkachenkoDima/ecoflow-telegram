@@ -296,7 +296,7 @@ async function run(env: Env) {
 // ── Telegram webhook: команди і кнопки ──────────────────────────
 async function helpText() {
 	const list = DEVICES.map((d) => `/${d.cmd} — ${esc(d.name)}`).join('\n')
-	return `<b>🤖 Команди</b>\n<blockquote>/status — усі станції\n${list}</blockquote>\nАбо кнопки нижче — вони оновлюють це ж повідомлення.`
+	return `<b>🤖 Команди</b>\n<blockquote>/status — усі станції\n${list}</blockquote>\nАбо кнопки нижче.`
 }
 
 async function render(env: Env, cmd: string): Promise<string | null> {
@@ -320,16 +320,9 @@ async function handleUpdate(env: Env, update: any) {
 		if (!ours) return
 		const text = await render(env, String(cb.data))
 		if (!text) return
-		// оновлюємо ту саму панель замість нового повідомлення
-		await tgCall(env, 'editMessageText', {
-			chat_id: chatId,
-			message_id: cb.message.message_id,
-			text,
-			parse_mode: 'HTML',
-			reply_markup: KEYBOARD,
-		}).catch((e) => {
-			if (!String(e).includes('message is not modified')) console.error('edit', e)
-		})
+		// нове повідомлення з кнопками; у попереднього кнопки прибираємо — історія лишається, кнопки лише внизу
+		await tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [] } }).catch(() => {})
+		await telegram(env, text, { chatId, keyboard: true })
 		return
 	}
 	const msg = update?.message
