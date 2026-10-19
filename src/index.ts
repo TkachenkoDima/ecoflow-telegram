@@ -153,6 +153,7 @@ async function tgCall(env: Env, method: string, body: object) {
 		body: JSON.stringify(body),
 	})
 	if (!res.ok) throw new Error(`Telegram ${method} ${res.status}: ${await res.text()}`)
+	return (await res.json<any>()).result
 }
 
 const kyivHour = () => Number(new Intl.DateTimeFormat('en-GB', { timeZone: TIMEZONE, hour: '2-digit', hourCycle: 'h23' }).format(new Date()))
@@ -260,7 +261,27 @@ async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel
 	return { text: `📊 <b>Станції</b>   <i>${clock(now)}</i>\n\n${table(devices, readings, online)}${foot}` }
 }
 
-const sendPanel = (env: Env, chatId: string | number, p: Panel) => telegram(env, p.text, { chatId, keyboard: true })
+// ── Кнопки лише під останньою панеллю ──
+// id останньої панелі в кожному чаті тримаємо в Cache API (безкоштовно, не витрачає ліміт записів KV)
+const panelKey = (chatId: string | number) => new Request(`https://panel.local/${chatId}`)
+const noKeyboard = (env: Env, chatId: string | number, messageId: number) =>
+	tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }).catch(() => {})
+
+async function sendPanel(env: Env, chatId: string | number, p: Panel) {
+	const cache = caches.default
+	const prev = await cache.match(panelKey(chatId))
+	if (prev) await noKeyboard(env, chatId, Number(await prev.text()))
+	const msg = await tgCall(env, 'sendMessage', {
+		chat_id: chatId,
+		text: `${p.text}\n${DIVIDER}`,
+		parse_mode: 'HTML',
+		link_preview_options: { is_disabled: true },
+		disable_notification: isQuiet(),
+		reply_markup: KEYBOARD,
+	})
+	if (msg?.message_id)
+		await cache.put(panelKey(chatId), new Response(String(msg.message_id), { headers: { 'Cache-Control': 'max-age=604800' } }))
+}
 
 // ── Щохвилинна перевірка ────────────────────────────────────────
 async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading | undefined) {
@@ -329,7 +350,8 @@ async function run(env: Env) {
 	await syncCommands(env).catch((e) => console.error('commands', e))
 	const { online, readings } = await readAll(env)
 	if (!(await env.POWER_KV.get('started:v3'))) {
-		await telegram(env, `📡 <b>Моніторинг EcoFlow запущено</b>\nПороги ${THRESHOLDS.join(' · ')}% · тиша ${QUIET_FROM}:00–${QUIET_TO}:00\n\n${table(DEVICES, readings, online)}`, { keyboard: true })
+		const text = `📡 <b>Моніторинг EcoFlow запущено</b>\nПороги ${THRESHOLDS.join(' · ')}% · тиша ${QUIET_FROM}:00–${QUIET_TO}:00\n\n${table(DEVICES, readings, online)}`
+		for (const id of chatIds(env)) await sendPanel(env, id, { text }).catch((e) => console.error('start', id, e))
 		await env.POWER_KV.put('started:v3', String(Date.now()))
 	}
 	for (const d of DEVICES) {
@@ -370,7 +392,7 @@ async function handleUpdate(env: Env, update: any) {
 		const panel = await render(env, String(cb.data))
 		if (!panel) return
 		// Нове повідомлення з кнопками; старе лишається в історії, з нього прибираємо лише кнопки
-		await tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [] } }).catch(() => {})
+		await noKeyboard(env, chatId, cb.message.message_id) // на випадок, якщо кеш порожній
 		await sendPanel(env, chatId, panel)
 		return
 	}
