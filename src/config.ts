@@ -18,7 +18,17 @@ export const DEVICES: Device[] = [
 		cmd: 'marinka',
 		messages: { 10: 'Заканчивай катку лут гоблин, я скоро крякну' },
 	},
-	{ sn: 'R655ZEBAXH170579', name: 'Kate', via: 'mqtt', cmd: 'kate' },
+	{
+		sn: 'R655ZEBAXH170579',
+		name: 'Kate',
+		via: 'mqtt',
+		cmd: 'kate',
+		messages: {
+			50: 'Половина, уменьши яркость',
+			25: 'Максимум еще одну серию протяну',
+			10: 'Скоро крякну, закругляемся',
+		},
+	},
 	{ sn: 'R655ZEBAXH171200', name: 'Router', via: 'mqtt', cmd: 'router' },
 ]
 
