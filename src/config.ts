@@ -11,8 +11,8 @@ export type Device = {
 
 export const DEVICES: Device[] = [
 	{ sn: 'D3M1ZE1A9H990005', name: 'Маринка', via: 'rest', cmd: 'marinka' },
-	{ sn: 'R655ZEBAXH170579', name: 'UPS Kate', via: 'mqtt', cmd: 'kate' },
-	{ sn: 'R655ZEBAXH171200', name: 'UPS Router', via: 'mqtt', cmd: 'router' },
+	{ sn: 'R655ZEBAXH170579', name: 'Kate', via: 'mqtt', cmd: 'kate' },
+	{ sn: 'R655ZEBAXH171200', name: 'Router', via: 'mqtt', cmd: 'router' },
 ]
 
 // Станція, по якій визначаємо світло: краще та, що має постійне навантаження (роутер)
