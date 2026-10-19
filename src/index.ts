@@ -217,17 +217,18 @@ const stateLine = (r: Reading) => {
 	return r.remMin !== null ? `⏳ ${hhmm(r.remMin)}${load}` : r.gridIn ? `🔌 від мережі${load}` : `⏳ —${load}`
 }
 
-// Список усіх станцій в одній цитаті, по рядку на станцію
-const table = (devices: Device[], readings: Map<string, Reading>, online: Map<string, boolean>) => {
-	const lines = devices.map((d) => {
-		const name = `<b>${esc(d.name)}</b>`
-		const r = readings.get(d.sn)
-		if (!online.get(d.sn)) return `⚫️ ${name} — офлайн`
-		if (!r) return `❔ ${name} — немає даних`
-		return `${socIcon(r.soc)} ${name}  <b>${r.soc}%</b> · ${stateLine(r)}`
-	})
-	return `<blockquote>${lines.join('\n')}</blockquote>`
-}
+// Список станцій звичайним текстом: кожна — міні-блок «назва + %» і «шкала · прогноз · навантаження»,
+// між станціями порожній рядок
+const table = (devices: Device[], readings: Map<string, Reading>, online: Map<string, boolean>) =>
+	devices
+		.map((d) => {
+			const name = `<b>${esc(d.name)}</b>`
+			const r = readings.get(d.sn)
+			if (!online.get(d.sn)) return `⚫️ ${name} — офлайн`
+			if (!r) return `❔ ${name} — немає даних`
+			return `${socIcon(r.soc)} ${name}  <b>${r.soc}%</b>\n<code>${bar(r.soc)}</code>  ${stateLine(r)}`
+		})
+		.join('\n\n')
 
 // Рядок про світло — простим текстом під блоком
 const gridText = (g: GridState | null, now: number) =>
@@ -254,8 +255,9 @@ async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel
 		const d = devices[0]
 		return { text: card(d, readings.get(d.sn), online.get(d.sn)!, grid, now) }
 	}
-	const foot = gridText(grid, now)
-	return { text: `📊 <b>Станції</b>   <i>${clock(now)}</i>\n${table(devices, readings, online)}${foot ? `\n${foot}` : ''}` }
+	const g_ = gridText(grid, now)
+	const foot = g_ ? `\n\n<blockquote>${g_}</blockquote>` : ''
+	return { text: `📊 <b>Станції</b>   <i>${clock(now)}</i>\n\n${table(devices, readings, online)}${foot}` }
 }
 
 const sendPanel = (env: Env, chatId: string | number, p: Panel) => telegram(env, p.text, { chatId, keyboard: true })
@@ -306,8 +308,8 @@ async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<s
 	await env.POWER_KV.put('grid', JSON.stringify({ state: cur, since: now }))
 	if (!prev) return // перший запуск — просто запам'ятали
 	const t = table(DEVICES, readings, online)
-	if (cur === 'OFF') await telegram(env, `<b>🕯 Світло пішло</b>   <i>${clock(now)}</i>\n${t}`)
-	else await telegram(env, `<b>💡 Світло повернулось</b> · не було ${duration(now - prev.since)}   <i>${clock(now)}</i>\n${t}`)
+	if (cur === 'OFF') await telegram(env, `<b>🕯 Світло пішло</b>   <i>${clock(now)}</i>\n\n${t}`)
+	else await telegram(env, `<b>💡 Світло повернулось</b> · не було ${duration(now - prev.since)}   <i>${clock(now)}</i>\n\n${t}`)
 }
 
 // Меню команд у Telegram будується з config.ts і оновлюється лише при змінах
@@ -327,7 +329,7 @@ async function run(env: Env) {
 	await syncCommands(env).catch((e) => console.error('commands', e))
 	const { online, readings } = await readAll(env)
 	if (!(await env.POWER_KV.get('started:v3'))) {
-		await telegram(env, `📡 <b>Моніторинг EcoFlow запущено</b>\nПороги ${THRESHOLDS.join(' · ')}% · тиша ${QUIET_FROM}:00–${QUIET_TO}:00\n${table(DEVICES, readings, online)}`, { keyboard: true })
+		await telegram(env, `📡 <b>Моніторинг EcoFlow запущено</b>\nПороги ${THRESHOLDS.join(' · ')}% · тиша ${QUIET_FROM}:00–${QUIET_TO}:00\n\n${table(DEVICES, readings, online)}`, { keyboard: true })
 		await env.POWER_KV.put('started:v3', String(Date.now()))
 	}
 	for (const d of DEVICES) {
