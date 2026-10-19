@@ -352,14 +352,9 @@ async function handleUpdate(env: Env, update: any) {
 		if (!ours) return
 		const panel = await render(env, String(cb.data))
 		if (!panel) return
-		// Живе лише одна панель стану: стару (з якої натиснули) видаляємо, нову шлемо вниз.
-		// Пуші (пороги, світло) кнопок не мають, тому ніколи не видаляються.
-		const oldId = cb.message.message_id
+		// Нове повідомлення з кнопками; старе лишається в історії, з нього прибираємо лише кнопки
+		await tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [] } }).catch(() => {})
 		await sendPanel(env, chatId, panel)
-		await tgCall(env, 'deleteMessage', { chat_id: chatId, message_id: oldId }).catch(() =>
-			// бот може видаляти свої повідомлення лише до 48 год — тоді просто прибираємо кнопки
-			tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: oldId, reply_markup: { inline_keyboard: [] } }).catch(() => {}),
-		)
 		return
 	}
 	const msg = update?.message
