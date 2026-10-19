@@ -46,7 +46,7 @@ jobs:
           curl -sf "https://api.telegram.org/bot${TOKEN}/setWebhook" \
             --data-urlencode "url=${WORKER_URL}/telegram" \
             --data-urlencode "secret_token=${SECRET}" \
-            --data-urlencode 'allowed_updates=["message"]'
+            --data-urlencode 'allowed_updates=["message","callback_query"]'
           echo
           curl -sf "https://api.telegram.org/bot${TOKEN}/setMyCommands" -H 'content-type: application/json' -d '{"commands":[
             {"command":"status","description":"Усі станції: заряд і час роботи"},

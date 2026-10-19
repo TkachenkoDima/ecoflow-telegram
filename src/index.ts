@@ -157,14 +157,22 @@ async function readAll(env: Env, devices: Device[] = DEVICES) {
 }
 
 // ── Telegram ────────────────────────────────────────────────────
-async function telegram(env: Env, text: string, chatId: string | number = env.TELEGRAM_CHAT_ID) {
-	const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+const KEYBOARD = {
+	inline_keyboard: [[{ text: '📊 Усі станції', callback_data: 'status' }], DEVICES.map((d) => ({ text: d.name, callback_data: d.cmd }))],
+}
+
+async function tgCall(env: Env, method: string, body: object) {
+	const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ chat_id: chatId, text }),
+		body: JSON.stringify(body),
 	})
-	if (!res.ok) throw new Error(`Telegram ${res.status}: ${await res.text()}`)
+	if (!res.ok) throw new Error(`Telegram ${method} ${res.status}: ${await res.text()}`)
 }
+
+// Кожне повідомлення бота — з кнопками запиту стану
+const telegram = (env: Env, text: string, chatId: string | number = env.TELEGRAM_CHAT_ID) =>
+	tgCall(env, 'sendMessage', { chat_id: chatId, text, reply_markup: KEYBOARD })
 
 const hhmm = (minutes: number) => {
 	const m = Math.max(0, Math.round(minutes))
@@ -260,25 +268,37 @@ async function run(env: Env) {
 	await checkGrid(env, readings, online)
 }
 
-// ── Telegram webhook: /status ───────────────────────────────────
+// ── Telegram webhook: команди і кнопки ──────────────────────────
+async function reply(env: Env, chatId: number | string, cmd: string) {
+	if (cmd === 'help' || cmd === 'start') {
+		const list = DEVICES.map((d) => `/${d.cmd} — ${d.name}`).join('\n')
+		return telegram(env, `Команди (або кнопки нижче):\n/status — усі станції\n${list}`, chatId)
+	}
+	const devices = cmd === 'status' ? DEVICES : DEVICES.filter((d) => d.cmd === cmd)
+	if (!devices.length) return
+	try {
+		await telegram(env, await statusText(env, devices), chatId)
+	} catch (e) {
+		console.error('status', e)
+		await telegram(env, `⚠️ Не вдалося отримати дані: ${e}`, chatId)
+	}
+}
+
 async function handleUpdate(env: Env, update: any) {
+	const cb = update?.callback_query
+	if (cb) {
+		const chatId = cb.message?.chat?.id
+		const ours = String(chatId) === String(env.TELEGRAM_CHAT_ID)
+		// прибираємо «годинник» на кнопці
+		await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text: ours ? 'Збираю дані…' : undefined }).catch(() => {})
+		if (ours) await reply(env, chatId, String(cb.data))
+		return
+	}
 	const msg = update?.message
 	const cmd = (msg?.text ?? '').match(/^\/(\w+)(@\w+)?(\s|$)/)?.[1]?.toLowerCase()
 	if (!cmd) return
 	if (String(msg.chat.id) !== String(env.TELEGRAM_CHAT_ID)) return // лише наша група
-	const devices = cmd === 'status' ? DEVICES : DEVICES.filter((d) => d.cmd === cmd)
-	if (cmd === 'help' || cmd === 'start') {
-		const list = DEVICES.map((d) => `/${d.cmd} — ${d.name}`).join('\n')
-		await telegram(env, `Команди:\n/status — усі станції\n${list}`, msg.chat.id)
-		return
-	}
-	if (!devices.length) return
-	try {
-		await telegram(env, await statusText(env, devices), msg.chat.id)
-	} catch (e) {
-		console.error('status', e)
-		await telegram(env, `⚠️ Не вдалося отримати дані: ${e}`, msg.chat.id)
-	}
+	await reply(env, msg.chat.id, cmd)
 }
 
 export default {
