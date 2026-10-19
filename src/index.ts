@@ -186,10 +186,14 @@ const duration = (ms: number) => {
 const clock = (t: number, sec = false) =>
 	new Date(t).toLocaleTimeString('uk-UA', { timeZone: TIMEZONE, hour: '2-digit', minute: '2-digit', ...(sec ? { second: '2-digit' } : {}) })
 const socIcon = (soc: number) => (soc <= 10 ? '🚨' : soc <= 25 ? '🪫' : '🔋')
+// Кольорова шкала: зелена > 50%, жовта > 25%, червона ≤ 25%
 const bar = (soc: number) => {
 	const n = Math.max(0, Math.min(10, Math.round(soc / 10)))
-	return '▰'.repeat(n) + '▱'.repeat(10 - n)
+	const fill = soc > 50 ? '🟩' : soc > 25 ? '🟨' : '🟥'
+	return fill.repeat(n) + '⬜'.repeat(10 - n)
 }
+// Роздільник-заголовок на початку повідомлення, щоб сусідні не зливались
+const divider = (label: string) => `━━━━━  ${label}  ━━━━━`
 
 // Блок однієї станції — окрема цитата (вертикальна смуга зліва = роздільник)
 const block = (d: Device, r: Reading | undefined, isOnline: boolean) => {
@@ -198,7 +202,7 @@ const block = (d: Device, r: Reading | undefined, isOnline: boolean) => {
 	if (!r) return `<blockquote>${title}\n❔ немає даних</blockquote>`
 	const load = r.loadW !== null ? ` · ⚡ ${r.loadW} Вт` : ''
 	const state = r.remMin !== null ? `⏳ ${hhmm(r.remMin)}${load}` : r.gridIn ? `🔌 від мережі${load}` : `⏳ —${load}`
-	return `<blockquote>${socIcon(r.soc)} ${title}\n<code>${bar(r.soc)}</code>  <b>${r.soc}%</b>\n${state}</blockquote>`
+	return `<blockquote>${socIcon(r.soc)} ${title}  <b>${r.soc}%</b>\n${bar(r.soc)}\n${state}</blockquote>`
 }
 
 const gridLine = (g: GridState | null) =>
@@ -207,7 +211,7 @@ const gridLine = (g: GridState | null) =>
 async function statusText(env: Env, devices: Device[] = DEVICES) {
 	const { online, readings } = await readAll(env, devices)
 	const grid = await env.POWER_KV.get<GridState>('grid', 'json')
-	const head = `<b>📊 ${devices.length === 1 ? esc(devices[0].name) : 'Стан станцій'}</b>  <i>${clock(Date.now(), true)}</i>`
+	const head = `<b>${divider(`📊 ${clock(Date.now(), true)}`)}</b>`
 	const blocks = devices.map((d) => block(d, readings.get(d.sn), online.get(d.sn)!)).join('\n')
 	const g = gridLine(grid)
 	return `${head}\n${blocks}${g ? `\n${g}` : ''}`
@@ -239,7 +243,7 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 				const loud = t === Math.min(...THRESHOLDS)
 				const rem = r.remMin !== null ? `⏳ Залишилось ≈ <b>${hhmm(r.remMin)}</b>` : r.gridIn ? '🔌 Від мережі' : '⏳ Час невідомий'
 				const load = r.loadW !== null ? `\n⚡ Споживання ${r.loadW} Вт` : ''
-				await telegram(env, `${socIcon(t)} <b>${esc(dev.name)} — ${r.soc}%</b>\n<blockquote><code>${bar(r.soc)}</code>\n${rem}${load}</blockquote>`, { loud })
+				await telegram(env, `${socIcon(t)} <b>${esc(dev.name)} — ${r.soc}%</b>\n<blockquote>${bar(r.soc)}\n${rem}${load}</blockquote>`, { loud })
 				st.notified.push(...crossed)
 			}
 			st.notified = st.notified.filter((t) => r.soc < t + RESET_GAP)
@@ -258,8 +262,8 @@ async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<s
 	await env.POWER_KV.put('grid', JSON.stringify({ state: cur, since: now }))
 	if (!prev) return // перший запуск — просто запам'ятали
 	const blocks = DEVICES.map((d) => block(d, readings.get(d.sn), online.get(d.sn)!)).join('\n')
-	if (cur === 'OFF') await telegram(env, `🕯 <b>Світло пішло</b>  <i>${clock(now)}</i>\n${blocks}`)
-	else await telegram(env, `💡 <b>Світло повернулось</b>  <i>${clock(now)}</i>\n⏱ Не було ${duration(now - prev.since)}\n${blocks}`)
+	if (cur === 'OFF') await telegram(env, `<b>${divider(`🕯 ${clock(now)}`)}</b>\n<b>Світло пішло</b>\n${blocks}`)
+	else await telegram(env, `<b>${divider(`💡 ${clock(now)}`)}</b>\n<b>Світло повернулось</b> · не було ${duration(now - prev.since)}\n${blocks}`)
 }
 
 // Меню команд у Telegram будується з config.ts і оновлюється лише при змінах
