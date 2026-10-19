@@ -167,15 +167,29 @@ type SendOpts = { chatId?: string | number; loud?: boolean; keyboard?: boolean }
 // Явний роздільник у кінці кожного повідомлення, щоб сусідні не зливались
 const DIVIDER = '━━━━━━━━━━━━━━━━━━'
 
-const telegram = (env: Env, text: string, o: SendOpts = {}) =>
-	tgCall(env, 'sendMessage', {
-		chat_id: o.chatId ?? env.TELEGRAM_CHAT_ID,
-		text: `${text}\n${DIVIDER}`,
-		parse_mode: 'HTML',
-		link_preview_options: { is_disabled: true },
-		disable_notification: !o.loud && isQuiet(),
-		...(o.keyboard ? { reply_markup: KEYBOARD } : {}),
-	})
+// TELEGRAM_CHAT_ID може містити кілька груп через кому: "-555…,-401…"
+const chatIds = (env: Env) => env.TELEGRAM_CHAT_ID.split(',').map((x) => x.trim()).filter(Boolean)
+const isOurChat = (env: Env, id: unknown) => chatIds(env).includes(String(id))
+
+// Відповідь у конкретний чат (o.chatId) або розсилка в усі групи; збій однієї групи не блокує інші
+async function telegram(env: Env, text: string, o: SendOpts = {}) {
+	const targets = o.chatId !== undefined ? [o.chatId] : chatIds(env)
+	const results = await Promise.allSettled(
+		targets.map((chat_id) =>
+			tgCall(env, 'sendMessage', {
+				chat_id,
+				text: `${text}\n${DIVIDER}`,
+				parse_mode: 'HTML',
+				link_preview_options: { is_disabled: true },
+				disable_notification: !o.loud && isQuiet(),
+				...(o.keyboard ? { reply_markup: KEYBOARD } : {}),
+			}),
+		),
+	)
+	const failed = results.filter((r) => r.status === 'rejected') as PromiseRejectedResult[]
+	for (const f of failed) console.error('telegram', f.reason)
+	if (failed.length === results.length) throw failed[0].reason
+}
 
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 const hhmm = (minutes: number) => {
@@ -347,7 +361,7 @@ async function handleUpdate(env: Env, update: any) {
 	const cb = update?.callback_query
 	if (cb) {
 		const chatId = cb.message?.chat?.id
-		const ours = String(chatId) === String(env.TELEGRAM_CHAT_ID)
+		const ours = isOurChat(env, chatId)
 		await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text: ours ? 'Оновлюю…' : undefined }).catch(() => {})
 		if (!ours) return
 		const panel = await render(env, String(cb.data))
@@ -360,7 +374,7 @@ async function handleUpdate(env: Env, update: any) {
 	const msg = update?.message
 	const cmd = (msg?.text ?? '').match(/^\/(\w+)(@\w+)?(\s|$)/)?.[1]?.toLowerCase()
 	if (!cmd) return
-	if (String(msg.chat.id) !== String(env.TELEGRAM_CHAT_ID)) return // лише наша група
+	if (!isOurChat(env, msg.chat.id)) return // лише наші групи
 	const panel = await render(env, cmd)
 	if (panel) await sendPanel(env, msg.chat.id, panel)
 }

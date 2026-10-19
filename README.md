@@ -137,7 +137,7 @@ npx wrangler kv namespace create POWER_KV   # виведе "id": "…"
 | `EF_EMAIL` | email від застосунку EcoFlow (потрібен для `mqtt`-станцій) |
 | `EF_PASSWORD` | пароль від застосунку EcoFlow |
 | `TELEGRAM_BOT_TOKEN` | крок 4 |
-| `TELEGRAM_CHAT_ID` | крок 4, з мінусом |
+| `TELEGRAM_CHAT_ID` | крок 4, з мінусом; кілька груп — через кому: `-555…,-401…` |
 | `TG_WEBHOOK_SECRET` | будь-який випадковий рядок: `openssl rand -hex 32` |
 
 Вставляйте без пробілів і переносів рядка. Всі 9 обов'язкові (`EF_*` можна заповнити будь-чим, якщо всі станції `rest`).
@@ -200,7 +200,7 @@ EF_EMAIL='...' EF_PASSWORD='...' node probe.mjs R655ZEBAXH170579 R655ZEBAXH17120
 
 - Секрети зберігаються лише в GitHub Secrets і Cloudflare (зашифровано), у коді їх немає.
 - `EF_PASSWORD` — пароль від акаунта EcoFlow: використовуйте унікальний.
-- Бот відповідає лише в групі з `TELEGRAM_CHAT_ID`; webhook захищений `TG_WEBHOOK_SECRET`.
+- Бот відповідає лише в групах з `TELEGRAM_CHAT_ID`; щоб ніхто не додав його до своєї групи — @BotFather → Bot Settings → Allow Groups → Turn off; webhook захищений `TG_WEBHOOK_SECRET`.
 - MQTT-доступ неофіційний: EcoFlow може змінити протокол оновленням — тоді `tools/probe` допоможе розібратися.
 
 ## Структура
