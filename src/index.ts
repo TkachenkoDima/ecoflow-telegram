@@ -166,7 +166,8 @@ type SendOpts = { chatId?: string | number; loud?: boolean; keyboard?: boolean }
 
 // HTML-повідомлення; уночі — без звуку (якщо не loud); кнопки лише на панелі стану
 // Явний роздільник у кінці кожного повідомлення, щоб сусідні не зливались
-const DIVIDER = '━━━━━━━━━━━━━━━━━━'
+// U+2800 (порожній символ Брайля) Telegram не обрізає — дає «повітря» під лінією всередині бульбашки
+const DIVIDER = '━━━━━━━━━━━━━━━━━━\n\u2800'
 
 // TELEGRAM_CHAT_ID може містити кілька груп через кому: "-555…,-401…"
 const chatIds = (env: Env) => env.TELEGRAM_CHAT_ID.split(',').map((x) => x.trim()).filter(Boolean)
