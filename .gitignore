@@ -172,3 +172,7 @@ dist
 .env
 *.template-orig
 wrangler.jsonc.save
+
+# debug tools
+tools/**/node_modules/
+*.jsonl
