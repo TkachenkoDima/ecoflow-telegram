@@ -33,6 +33,7 @@ export async function mqttCollect(opts: {
 	topics: string[]
 	timeoutMs: number
 	onMessage: (m: MqttMessage) => boolean // true = зібрали все, можна відключатись
+	publish?: { topic: string; payload: Uint8Array } // надіслати одразу після підписки (QoS 0)
 }): Promise<void> {
 	const socket = connect({ hostname: opts.host, port: opts.port }, { secureTransport: 'on', allowHalfOpen: false })
 	const writer = socket.writable.getWriter()
@@ -82,6 +83,7 @@ export async function mqttCollect(opts: {
 					if (body[1] !== 0) throw new MqttAuthError(`MQTT CONNACK rc=${body[1]}`)
 					connected = true
 					await writer.write(packet(0x82, [0, 1, ...opts.topics.flatMap((t) => [...mqttStr(t), 0])]))
+					if (opts.publish) await writer.write(packet(0x30, [...mqttStr(opts.publish.topic), ...opts.publish.payload]))
 				} else if (type === 3) {
 					// PUBLISH
 					const qos = (flags >> 1) & 3

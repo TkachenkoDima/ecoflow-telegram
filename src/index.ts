@@ -2,7 +2,7 @@
 // Маринка — офіційний IoT Open API; UPS (River 3) — MQTT застосунку EcoFlow.
 // Cron раз на хвилину, стан у KV (пишемо лише при змінах, щоб влізти у free-ліміт).
 import { mqttCollect, MqttAuthError } from './mqtt'
-import { parseEcoflowPacket, type UpsPart } from './protobuf'
+import { encodeRiver3Set, parseEcoflowPacket, type UpsPart } from './protobuf'
 
 type Env = {
 	POWER_KV: KVNamespace
@@ -17,7 +17,7 @@ type Env = {
 
 import { API, DEVICES, GRID_SOURCE, MQTT_WAIT_MS, OFFLINE_ALERT_MIN, QUIET_FROM, QUIET_TO, RESET_GAP, THRESHOLDS, TIMEZONE, type Device } from './config'
 
-type Reading = { soc: number; remMin: number | null; loadW: number | null; gridIn: boolean | null; maxChg?: number }
+type Reading = { soc: number; remMin: number | null; loadW: number | null; gridIn: boolean | null; maxChg?: number; acMax?: number }
 type DeviceState = { notified: number[]; offlineSince: number | null; offlineAlerted: boolean }
 type GridState = { state: 'ON' | 'OFF'; since: number }
 
@@ -81,10 +81,42 @@ async function ecoflowSet(env: Env, sn: string, params: Record<string, number | 
 }
 
 // Дії з кнопок: callback_data = "set:<cmd>:<дія>"
-const ACTIONS: Record<string, { label: string; via: Device['via']; params: Record<string, number> }> = {
-	max80: { label: '🔝 Ліміт 80%', via: 'rest', params: { cfgMaxChgSoc: 80 } },
-	max100: { label: '🔝 Ліміт 100%', via: 'rest', params: { cfgMaxChgSoc: 100 } },
+// rest — параметри IoT Open API; mqtt — номер поля River3SetCommand і значення
+type Action = { label: string; group: string } & ({ via: 'rest'; params: Record<string, number> } | { via: 'mqtt'; field: number; value: number })
+const ACTIONS: Record<string, Action> = {
+	// DELTA 3 (офіційний API)
+	max80: { label: '80%', group: '🔝 Ліміт заряду', via: 'rest', params: { cfgMaxChgSoc: 80 } },
+	max100: { label: '100%', group: '🔝 Ліміт заряду', via: 'rest', params: { cfgMaxChgSoc: 100 } },
+	ac500: { label: '500 Вт', group: '🔌 Вхідна потужність', via: 'rest', params: { cfgPlugInInfoAcInChgPowMax: 500 } },
+	ac1000: { label: '1 кВт', group: '🔌 Вхідна потужність', via: 'rest', params: { cfgPlugInInfoAcInChgPowMax: 1000 } },
+	ac2000: { label: '2 кВт', group: '🔌 Вхідна потужність', via: 'rest', params: { cfgPlugInInfoAcInChgPowMax: 2000 } },
+	// River 3 (MQTT; макс. вхід від мережі ~305 Вт)
+	rmax80: { label: '80%', group: '🔝 Ліміт заряду', via: 'mqtt', field: 33, value: 80 },
+	rmax100: { label: '100%', group: '🔝 Ліміт заряду', via: 'mqtt', field: 33, value: 100 },
+	rac100: { label: '100 Вт', group: '🔌 Вхідна потужність', via: 'mqtt', field: 54, value: 100 },
+	rac200: { label: '200 Вт', group: '🔌 Вхідна потужність', via: 'mqtt', field: 54, value: 200 },
+	rac300: { label: '300 Вт', group: '🔌 Вхідна потужність', via: 'mqtt', field: 54, value: 300 },
 }
+
+// Запис у River 3 через MQTT застосунку; успіх — якщо станція відповіла set_reply
+async function mqttSet(env: Env, sn: string, field: number, value: number) {
+	const a = await appAuth(env)
+	let replied = false
+	await mqttCollect({
+		host: a.host,
+		port: a.port,
+		username: a.username,
+		password: a.password,
+		clientId: `ANDROID_${crypto.randomUUID().replace(/-/g, '').toUpperCase()}_${a.userId}`,
+		topics: [`/app/${a.userId}/${sn}/thing/property/set_reply`],
+		publish: { topic: `/app/${a.userId}/${sn}/thing/property/set`, payload: encodeRiver3Set(sn, field, value) },
+		timeoutMs: 8000,
+		onMessage: () => (replied = true),
+	})
+	if (!replied) throw new Error('станція не підтвердила команду за 8 с')
+}
+
+const runAction = (env: Env, d: Device, a: Action) => (a.via === 'rest' ? ecoflowSet(env, d.sn, a.params) : mqttSet(env, d.sn, a.field, a.value))
 
 // ── MQTT застосунку (для River 3) ───────────────────────────────
 type AppAuth = { host: string; port: number; username: string; password: string; userId: string }
@@ -148,6 +180,8 @@ async function readMqtt(env: Env, sns: string[]): Promise<Map<string, Reading>> 
 			remMin: discharging && p.remMin !== undefined ? p.remMin : null,
 			loadW: p.outSumW !== undefined ? Math.round(p.outSumW) : discharging ? (p.battOutW ?? null) : null,
 			gridIn,
+			maxChg: p.maxChg,
+			acMax: p.acMax,
 		})
 	}
 	return result
@@ -169,15 +203,18 @@ async function readAll(env: Env, devices: Device[] = DEVICES) {
 	})
 	const mqttJob = (async () => {
 		try {
-			const r = await readMqtt(env, devices.filter((d) => d.via === 'mqtt' && online.get(d.sn)).map((d) => d.sn))
+			const want = devices.filter((d) => d.via === 'mqtt' && online.get(d.sn))
+			const r = await readMqtt(env, want.map((d) => d.sn))
 			for (const [sn, v] of r) readings.set(sn, v)
+			const missing = want.filter((d) => !r.has(d.sn)).map((d) => d.name)
+			if (missing.length) errors.push(`${missing.join(', ')}: станція не надіслала дані за ${MQTT_WAIT_MS / 1000} с`)
 		} catch (e) {
 			errors.push(`MQTT: ${e}`)
 		}
 	})()
 	await Promise.all([...restJobs, mqttJob])
 	for (const e of errors) console.error(e)
-	return { online, readings }
+	return { online, readings, errors }
 }
 
 // ── Telegram ────────────────────────────────────────────────────
@@ -190,17 +227,30 @@ const KEYBOARD = {
 	],
 }
 
-// «Папка» керування: по кожній станції — заголовок і її дії; станції без дій не показуємо
+// «Папка» керування: спершу вибір станції…
 const CONTROL_KEYBOARD = {
 	inline_keyboard: [
-		...DEVICES.flatMap((d) => {
-			const row = Object.entries(ACTIONS)
-				.filter(([, a]) => a.via === d.via)
-				.map(([id, a]) => ({ text: a.label, callback_data: `set:${d.cmd}:${id}` }))
-			return row.length ? [[{ text: `— ${d.name} —`, callback_data: 'noop' }], row] : []
-		}),
+		DEVICES.filter((d) => Object.values(ACTIONS).some((a) => a.via === d.via)).map((d) => ({ text: d.name, callback_data: `menu:dev:${d.cmd}` })),
 		[{ text: '⬅️ Назад', callback_data: 'menu:main' }],
 	],
+}
+// …потім усі команди станції, згруповані рядками
+const deviceKeyboard = (d: Device) => {
+	const groups = new Map<string, { text: string; callback_data: string }[]>()
+	for (const [id, a] of Object.entries(ACTIONS)) {
+		if (a.via !== d.via) continue
+		if (!groups.has(a.group)) groups.set(a.group, [])
+		groups.get(a.group)!.push({ text: a.label, callback_data: `set:${d.cmd}:${id}` })
+	}
+	return {
+		inline_keyboard: [
+			...[...groups].flatMap(([g, row]) => [[{ text: `${g} · ${d.name}`, callback_data: 'noop' }], row]),
+			[
+				{ text: '⬅️ Станції', callback_data: 'menu:control' },
+				{ text: '🏠 Головна', callback_data: 'menu:main' },
+			],
+		],
+	}
 }
 
 async function tgCall(env: Env, method: string, body: object) {
@@ -303,21 +353,25 @@ const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState
 	const time =
 		r.remMin !== null ? `⏳ Залишилось  <b>${hhmm(r.remMin)}</b>` : r.gridIn ? `🔌 <b>Від мережі</b>` : `⏳ Залишилось  <b>—</b>`
 	const load = r.loadW !== null ? `\n⚡ Споживання  <b>${r.loadW} Вт</b>` : ''
-	const lim = r.maxChg !== undefined ? `\n🔝 Ліміт заряду  <b>${r.maxChg}%</b>` : ''
+	const lim =
+		(r.maxChg !== undefined ? `\n🔝 Ліміт заряду  <b>${r.maxChg}%</b>` : '') +
+		(r.acMax !== undefined ? `\n🔌 Макс. вхід  <b>${r.acMax} Вт</b>` : '')
 	return `${socIcon(r.soc)} ${head}\n<code>${bar(r.soc)}</code>  <b>${r.soc}%</b>\n${time}${load}${lim}${foot}`
 }
 
 async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel> {
-	const { online, readings } = await readAll(env, devices)
+	const { online, readings, errors } = await readAll(env, devices)
 	const grid = await env.POWER_KV.get<GridState>('grid', 'json')
 	const now = Date.now()
+	// якщо дані не прийшли — показуємо причину, а не просто «немає даних»
+	const errs = errors.length ? `\n\n<i>⚠️ ${esc(errors.join('; ').slice(0, 300))}</i>` : ''
 	if (devices.length === 1) {
 		const d = devices[0]
-		return { text: card(d, readings.get(d.sn), online.get(d.sn)!, grid, now), device: d }
+		return { text: card(d, readings.get(d.sn), online.get(d.sn)!, grid, now) + errs, device: d }
 	}
 	const g_ = gridText(grid, now)
 	const foot = g_ ? `\n\n${g_}` : ''
-	return { text: `📊 <b>Станції</b>   <i>${clock(now)}</i>\n\n${table(devices, readings, online)}${foot}` }
+	return { text: `📊 <b>Станції</b>   <i>${clock(now)}</i>\n\n${table(devices, readings, online)}${foot}${errs}` }
 }
 
 // ── Кнопки лише під останньою панеллю ──
@@ -451,7 +505,8 @@ async function handleUpdate(env: Env, update: any) {
 		if (data === 'noop' || data.startsWith('menu:')) {
 			await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id }).catch(() => {})
 			if (!ours || data === 'noop') return
-			const markup = data === 'menu:control' ? CONTROL_KEYBOARD : KEYBOARD
+			const dev = data.startsWith('menu:dev:') ? DEVICES.find((x) => x.cmd === data.slice(9)) : undefined
+			const markup = dev ? deviceKeyboard(dev) : data === 'menu:control' ? CONTROL_KEYBOARD : KEYBOARD
 			await tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: cb.message.message_id, reply_markup: markup }).catch(() => {})
 			return
 		}
@@ -460,15 +515,15 @@ async function handleUpdate(env: Env, update: any) {
 			const d = DEVICES.find((x) => x.cmd === cmd)
 			const action = ACTIONS[actionId]
 			if (!d || !action || action.via !== d.via) return
+			await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text: 'Надсилаю команду…' }).catch(() => {})
 			let note: string
 			try {
-				await ecoflowSet(env, d.sn, action.params)
-				note = `✅ ${d.name}: ${action.label.replace(/^\S+\s/, '')}`
+				await runAction(env, d, action)
+				note = `✅ ${d.name}: ${action.group.replace(/^\S+\s/, '').toLowerCase()} ${action.label}`
 			} catch (e) {
 				console.error('set', e)
 				note = `⚠️ Не вдалося: ${String(e).slice(0, 150)}`
 			}
-			await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text: note, show_alert: note.startsWith('⚠️') }).catch(() => {})
 			await new Promise((r) => setTimeout(r, 3000)) // станції потрібен час, щоб застосувати
 			const who = cb.from?.first_name ? ` · ${esc(cb.from.first_name)}` : ''
 			const panel = await render(env, d.cmd)

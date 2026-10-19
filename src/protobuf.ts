@@ -65,6 +65,8 @@ export type UpsPart = {
 	battOutW?: number // BMS 32/50 поле 27
 	inSumW?: number // 254/21 поле 3 — загальний вхід (мережа/сонце)
 	outSumW?: number // 254/21 поле 4 — загальне споживання
+	maxChg?: number // 254/21 поле 270 — ліміт заряду, %
+	acMax?: number // 254/21 поле 209 — макс. вхідна потужність AC, Вт
 }
 
 export function parseEcoflowPacket(payload: Uint8Array): UpsPart {
@@ -97,7 +99,49 @@ export function parseEcoflowPacket(payload: Uint8Array): UpsPart {
 				outW = num(m, 4)
 			if (inW !== undefined) part.inSumW = inW
 			if (outW !== undefined) part.outSumW = outW
+			const mx = num(m, 270),
+				ac = num(m, 209)
+			if (mx !== undefined) part.maxChg = mx
+			if (ac !== undefined) part.acMax = ac
 		}
 	}
 	return part
+}
+
+// ── Кодування команди запису для River 3 (схема з hassio-ecoflow-cloud: ef_river3.proto) ──
+const varint = (n: number) => {
+	const out: number[] = []
+	let v = BigInt(n)
+	if (v < 0n) v += 1n << 64n
+	do {
+		let b = Number(v & 0x7fn)
+		v >>= 7n
+		if (v > 0n) b |= 0x80
+		out.push(b)
+	} while (v > 0n)
+	return out
+}
+const fVar = (field: number, n: number) => [...varint((field << 3) | 0), ...varint(n)]
+const fBytes = (field: number, b: number[]) => [...varint((field << 3) | 2), ...varint(b.length), ...b]
+
+// River3SetCommand: одне поле int32 (напр. 33 = cms_max_chg_soc, 54 = plug_in_info_ac_in_chg_pow_max)
+export function encodeRiver3Set(sn: string, field: number, value: number): Uint8Array {
+	const pdata = fVar(field, value)
+	const header = [
+		...fBytes(1, pdata), // pdata
+		...fVar(2, 32), // src
+		...fVar(3, 2), // dest
+		...fVar(4, 1), // d_src
+		...fVar(5, 1), // d_dest
+		...fVar(8, 254), // cmd_func
+		...fVar(9, 17), // cmd_id
+		...fVar(10, pdata.length), // data_len
+		...fVar(11, 1), // need_ack
+		...fVar(14, Math.floor(Math.random() * 1e9)), // seq
+		...fVar(15, 1), // product_id
+		...fVar(16, 19), // version
+		...fVar(17, 1), // payload_ver
+		...fBytes(25, [...new TextEncoder().encode(sn)]), // device_sn
+	]
+	return new Uint8Array(fBytes(1, header)) // River3SendHeaderMsg { repeated header msg = 1 }
 }
