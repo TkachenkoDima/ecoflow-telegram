@@ -102,23 +102,35 @@ const ACTIONS: Record<string, Action> = {
 	rac300: { label: '300 Вт', group: '🔌 Вхідна потужність', for: 'mqtt', kind: 'mqtt', fields: [[54, 300]] },
 }
 
-// Запис через MQTT застосунку. Підтвердження — відповідь set_reply від станції.
-// Станції відповідають не завжди (команда при цьому застосовується), тому без відповіді — «надіслано», а не помилка.
+// Запис через MQTT застосунку. Підтвердження — будь-що з двох:
+//  1) відповідь станції set_reply;
+//  2) у телеметрії з'явилось нове значення (33 → поле 270 «ліміт заряду», 54 → поле 209 «макс. вхід»).
+// Якщо за 10 с нічого — «надіслано без підтвердження» (команда при цьому часто застосовується).
 async function mqttSet(env: Env, sn: string, fields: [number, number][]): Promise<boolean> {
 	const a = await appAuth(env)
-	let replied = false
+	const want = new Map(fields)
+	const expectMax = want.get(33)
+	const expectAc = want.get(54)
+	let confirmed = false
 	await mqttCollect({
 		host: a.host,
 		port: a.port,
 		username: a.username,
 		password: a.password,
 		clientId: `ANDROID_${crypto.randomUUID().replace(/-/g, '').toUpperCase()}_${a.userId}`,
-		topics: [`/app/${a.userId}/${sn}/thing/property/set_reply`],
+		topics: [`/app/${a.userId}/${sn}/thing/property/set_reply`, `/app/device/property/${sn}`],
 		publish: [{ topic: `/app/${a.userId}/${sn}/thing/property/set`, payload: encodeSetCommand(sn, fields) }],
-		timeoutMs: 8000,
-		onMessage: () => (replied = true),
+		timeoutMs: 10_000,
+		onMessage: ({ topic, payload }) => {
+			if (topic.endsWith('/set_reply')) return (confirmed = true)
+			try {
+				const p = parseEcoflowPacket(payload)
+				if ((expectMax !== undefined && p.maxChg === expectMax) || (expectAc !== undefined && p.acMax === expectAc)) confirmed = true
+			} catch {}
+			return confirmed
+		},
 	})
-	return replied
+	return confirmed
 }
 
 // true — підтверджено; false — надіслано без підтвердження
@@ -538,7 +550,8 @@ async function handleUpdate(env: Env, update: any) {
 				console.error('set', e)
 				note = `⚠️ Не вдалося: ${String(e).replace(/^Error:\s*/, '').slice(0, 150)}`
 			}
-			await new Promise((r) => setTimeout(r, 3000)) // станції потрібен час, щоб застосувати
+			// якщо нове значення вже видно — пауза не потрібна; інакше даємо станції 2 с (вкладаємось у ~30 с ліміту Cloudflare)
+			if (!note.startsWith('✅')) await new Promise((r) => setTimeout(r, 2000))
 			const panel = await render(env, d.cmd)
 			if (panel) {
 				panel.text = `${esc(note)}\n\n${panel.text}`
