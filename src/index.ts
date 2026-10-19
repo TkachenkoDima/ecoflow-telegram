@@ -109,7 +109,7 @@ async function mqttSet(env: Env, sn: string, field: number, value: number) {
 		password: a.password,
 		clientId: `ANDROID_${crypto.randomUUID().replace(/-/g, '').toUpperCase()}_${a.userId}`,
 		topics: [`/app/${a.userId}/${sn}/thing/property/set_reply`],
-		publish: { topic: `/app/${a.userId}/${sn}/thing/property/set`, payload: encodeRiver3Set(sn, field, value) },
+		publish: [{ topic: `/app/${a.userId}/${sn}/thing/property/set`, payload: encodeRiver3Set(sn, field, value) }],
 		timeoutMs: 8000,
 		onMessage: () => (replied = true),
 	})
@@ -153,6 +153,13 @@ async function readMqtt(env: Env, sns: string[]): Promise<Map<string, Reading>> 
 			password: a.password,
 			clientId: `ANDROID_${crypto.randomUUID().replace(/-/g, '').toUpperCase()}_${a.userId}`,
 			topics: sns.map((sn) => `/app/device/property/${sn}`),
+			// «Будимо» станції запитом як у застосунку — без нього River 3 може не слати телеметрію
+			publish: sns.map((sn) => ({
+				topic: `/app/${a.userId}/${sn}/thing/property/get`,
+				payload: new TextEncoder().encode(
+					JSON.stringify({ from: 'Android', id: String(Date.now() % 1e9), version: '1.1', moduleType: 0, operateType: 'latestQuotas', params: {} }),
+				),
+			})),
 			timeoutMs: MQTT_WAIT_MS,
 			onMessage: ({ topic, payload }) => {
 				const sn = sns.find((s) => topic.endsWith(s))
