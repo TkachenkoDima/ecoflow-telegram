@@ -186,11 +186,9 @@ const duration = (ms: number) => {
 const clock = (t: number, sec = false) =>
 	new Date(t).toLocaleTimeString('uk-UA', { timeZone: TIMEZONE, hour: '2-digit', minute: '2-digit', ...(sec ? { second: '2-digit' } : {}) })
 const socIcon = (soc: number) => (soc <= 10 ? '🚨' : soc <= 25 ? '🪫' : '🔋')
-// Кольорова шкала: зелена > 50%, жовта > 25%, червона ≤ 25%
 const bar = (soc: number) => {
 	const n = Math.max(0, Math.min(10, Math.round(soc / 10)))
-	const fill = soc > 50 ? '🟩' : soc > 25 ? '🟨' : '🟥'
-	return fill.repeat(n) + '⬜'.repeat(10 - n)
+	return '▰'.repeat(n) + '▱'.repeat(10 - n)
 }
 // Роздільник-заголовок на початку повідомлення, щоб сусідні не зливались
 const divider = (label: string) => `━━━━━  ${label}  ━━━━━`
@@ -202,19 +200,57 @@ const block = (d: Device, r: Reading | undefined, isOnline: boolean) => {
 	if (!r) return `<blockquote>${title}\n❔ немає даних</blockquote>`
 	const load = r.loadW !== null ? ` · ⚡ ${r.loadW} Вт` : ''
 	const state = r.remMin !== null ? `⏳ ${hhmm(r.remMin)}${load}` : r.gridIn ? `🔌 від мережі${load}` : `⏳ —${load}`
-	return `<blockquote>${socIcon(r.soc)} ${title}  <b>${r.soc}%</b>\n${bar(r.soc)}\n${state}</blockquote>`
+	return `<blockquote>${socIcon(r.soc)} ${title}\n<code>${bar(r.soc)}</code>  <b>${r.soc}%</b>\n${state}</blockquote>`
 }
 
 const gridLine = (g: GridState | null) =>
 	!g ? '' : g.state === 'ON' ? `💡 Світло є · з ${clock(g.since)}` : `🕯 Світла немає ${duration(Date.now() - g.since)} · з ${clock(g.since)}`
 
-async function statusText(env: Env, devices: Device[] = DEVICES) {
+type Panel = { text: string; rich?: string } // text — звичайний HTML (запасний), rich — таблиця (Bot API rich messages)
+
+// Рядок таблиці для однієї станції
+const row = (d: Device, r: Reading | undefined, isOnline: boolean) => {
+	const name = esc(d.name)
+	if (!isOnline) return `<tr><td>⚫️ ${name}</td><td align="center" colspan="3"><i>офлайн</i></td></tr>`
+	if (!r) return `<tr><td>❔ ${name}</td><td align="center" colspan="3"><i>немає даних</i></td></tr>`
+	const time = r.remMin !== null ? `⏳ ${hhmm(r.remMin)}` : r.gridIn ? '🔌 мережа' : '—'
+	const load = r.loadW !== null ? `${r.loadW} Вт` : '—'
+	return `<tr><td>${socIcon(r.soc)} ${name}</td><td align="right"><b>${r.soc}%</b></td><td align="center">${time}</td><td align="right">${load}</td></tr>`
+}
+
+async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel> {
 	const { online, readings } = await readAll(env, devices)
 	const grid = await env.POWER_KV.get<GridState>('grid', 'json')
-	const head = `<b>${divider(`📊 ${clock(Date.now(), true)}`)}</b>`
-	const blocks = devices.map((d) => block(d, readings.get(d.sn), online.get(d.sn)!)).join('\n')
+	const now = clock(Date.now(), true)
 	const g = gridLine(grid)
-	return `${head}\n${blocks}${g ? `\n${g}` : ''}`
+
+	const blocks = devices.map((d) => block(d, readings.get(d.sn), online.get(d.sn)!)).join('\n')
+	const text = `<b>${divider(`📊 ${now}`)}</b>\n${blocks}${g ? `\n${g}` : ''}`
+
+	const rows = devices.map((d) => row(d, readings.get(d.sn), online.get(d.sn)!)).join('')
+	const rich =
+		`<h3>📊 Станції · ${now}</h3>` +
+		`<table bordered striped compact><tr><th>Станція</th><th>Заряд</th><th>Прогноз</th><th>Навант.</th></tr>${rows}</table>` +
+		(g ? `<p>${g}</p>` : '')
+	return { text, rich }
+}
+
+// Надсилаємо панель rich-таблицею; якщо клієнт/API не підтримує — звичайним HTML
+async function sendPanel(env: Env, chatId: string | number, p: Panel) {
+	if (p.rich) {
+		try {
+			await tgCall(env, 'sendRichMessage', {
+				chat_id: chatId,
+				rich_message: { html: p.rich },
+				reply_markup: KEYBOARD,
+				disable_notification: isQuiet(),
+			})
+			return
+		} catch (e) {
+			console.warn('rich fallback', e)
+		}
+	}
+	await telegram(env, p.text, { chatId, keyboard: true })
 }
 
 // ── Щохвилинна перевірка ────────────────────────────────────────
@@ -243,7 +279,7 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 				const loud = t === Math.min(...THRESHOLDS)
 				const rem = r.remMin !== null ? `⏳ Залишилось ≈ <b>${hhmm(r.remMin)}</b>` : r.gridIn ? '🔌 Від мережі' : '⏳ Час невідомий'
 				const load = r.loadW !== null ? `\n⚡ Споживання ${r.loadW} Вт` : ''
-				await telegram(env, `${socIcon(t)} <b>${esc(dev.name)} — ${r.soc}%</b>\n<blockquote>${bar(r.soc)}\n${rem}${load}</blockquote>`, { loud })
+				await telegram(env, `${socIcon(t)} <b>${esc(dev.name)} — ${r.soc}%</b>\n<blockquote><code>${bar(r.soc)}</code>\n${rem}${load}</blockquote>`, { loud })
 				st.notified.push(...crossed)
 			}
 			st.notified = st.notified.filter((t) => r.soc < t + RESET_GAP)
@@ -303,15 +339,15 @@ async function helpText() {
 	return `<b>🤖 Команди</b>\n<blockquote>/status — усі станції\n${list}</blockquote>\nАбо кнопки нижче.`
 }
 
-async function render(env: Env, cmd: string): Promise<string | null> {
-	if (cmd === 'help' || cmd === 'start') return helpText()
+async function render(env: Env, cmd: string): Promise<Panel | null> {
+	if (cmd === 'help' || cmd === 'start') return { text: await helpText() }
 	const devices = cmd === 'status' ? DEVICES : DEVICES.filter((d) => d.cmd === cmd)
 	if (!devices.length) return null
 	try {
-		return await statusText(env, devices)
+		return await statusPanel(env, devices)
 	} catch (e) {
 		console.error('status', e)
-		return `⚠️ <b>Не вдалося отримати дані</b>\n<blockquote>${esc(String(e))}</blockquote>`
+		return { text: `⚠️ <b>Не вдалося отримати дані</b>\n<blockquote>${esc(String(e))}</blockquote>` }
 	}
 }
 
@@ -322,19 +358,19 @@ async function handleUpdate(env: Env, update: any) {
 		const ours = String(chatId) === String(env.TELEGRAM_CHAT_ID)
 		await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text: ours ? 'Оновлюю…' : undefined }).catch(() => {})
 		if (!ours) return
-		const text = await render(env, String(cb.data))
-		if (!text) return
+		const panel = await render(env, String(cb.data))
+		if (!panel) return
 		// нове повідомлення з кнопками; у попереднього кнопки прибираємо — історія лишається, кнопки лише внизу
 		await tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: cb.message.message_id, reply_markup: { inline_keyboard: [] } }).catch(() => {})
-		await telegram(env, text, { chatId, keyboard: true })
+		await sendPanel(env, chatId, panel)
 		return
 	}
 	const msg = update?.message
 	const cmd = (msg?.text ?? '').match(/^\/(\w+)(@\w+)?(\s|$)/)?.[1]?.toLowerCase()
 	if (!cmd) return
 	if (String(msg.chat.id) !== String(env.TELEGRAM_CHAT_ID)) return // лише наша група
-	const text = await render(env, cmd)
-	if (text) await telegram(env, text, { chatId: msg.chat.id, keyboard: true })
+	const panel = await render(env, cmd)
+	if (panel) await sendPanel(env, msg.chat.id, panel)
 }
 
 export default {
