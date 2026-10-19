@@ -233,16 +233,17 @@ const table = (devices: Device[], readings: Map<string, Reading>, online: Map<st
 const gridText = (g: GridState | null, now: number) =>
 	!g ? '' : g.state === 'ON' ? `💡 Світло є з ${clock(g.since)}` : `🕯 Без світла ${duration(now - g.since)} · з ${clock(g.since)}`
 
-// Детальна картка однієї станції: головне — в блоці, жирним; світло — текстом знизу
+// Детальна картка однієї станції: головне — звичайним текстом, світло — цитатою знизу
 const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState | null, now: number) => {
 	const head = `<b>${esc(d.name)}</b>   <i>${clock(now)}</i>`
-	const foot = gridText(g, now)
-	if (!isOnline) return `⚫️ ${head}\n<blockquote>Офлайн</blockquote>${foot ? `\n${foot}` : ''}`
-	if (!r) return `❔ ${head}\n<blockquote>Немає даних</blockquote>${foot ? `\n${foot}` : ''}`
+	const g_ = gridText(g, now)
+	const foot = g_ ? `\n<blockquote>${g_}</blockquote>` : ''
+	if (!isOnline) return `⚫️ ${head}\nОфлайн${foot}`
+	if (!r) return `❔ ${head}\nНемає даних${foot}`
 	const time =
 		r.remMin !== null ? `⏳ Залишилось  <b>${hhmm(r.remMin)}</b>` : r.gridIn ? `🔌 <b>Від мережі</b>` : `⏳ Залишилось  <b>—</b>`
 	const load = r.loadW !== null ? `\n⚡ Споживання  <b>${r.loadW} Вт</b>` : ''
-	return `${socIcon(r.soc)} ${head}\n<blockquote><code>${bar(r.soc)}</code>  <b>${r.soc}%</b>\n${time}${load}</blockquote>${foot ? `\n${foot}` : ''}`
+	return `${socIcon(r.soc)} ${head}\n<code>${bar(r.soc)}</code>  <b>${r.soc}%</b>\n${time}${load}${foot}`
 }
 
 async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel> {
