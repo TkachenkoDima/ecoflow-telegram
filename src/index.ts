@@ -15,22 +15,7 @@ type Env = {
 	TG_WEBHOOK_SECRET: string
 }
 
-// ── Налаштування ────────────────────────────────────────────────
-type Device = { sn: string; name: string; via: 'rest' | 'mqtt'; cmd: string }
-const DEVICES: Device[] = [
-	{ sn: 'D3M1ZE1A9H990005', name: 'Маринка', via: 'rest', cmd: 'marinka' },
-	{ sn: 'R655ZEBAXH170579', name: 'UPS Kate', via: 'mqtt', cmd: 'kate' },
-	{ sn: 'R655ZEBAXH171200', name: 'UPS Router', via: 'mqtt', cmd: 'router' },
-]
-const GRID_SOURCE = 'R655ZEBAXH171200' // по якій станції визначаємо світло (роутер має постійне навантаження)
-const THRESHOLDS = [50, 25, 10] // %
-const RESET_GAP = 10 // поріг знову активний, коли заряд піднявся на 10% вище
-const OFFLINE_ALERT_MIN = 30
-const MQTT_WAIT_MS = 15_000 // UPS шлють BMS-пакет кожні ~10 с
-const API = 'https://api-e.ecoflow.com'
-const QUIET_FROM = 0 // тихий режим (за Києвом): повідомлення без звуку,
-const QUIET_TO = 8 //   крім 🚨 10% — воно завжди зі звуком
-// ────────────────────────────────────────────────────────────────
+import { API, DEVICES, GRID_SOURCE, MQTT_WAIT_MS, OFFLINE_ALERT_MIN, QUIET_FROM, QUIET_TO, RESET_GAP, THRESHOLDS, TIMEZONE, type Device } from './config'
 
 type Reading = { soc: number; remMin: number | null; loadW: number | null; gridIn: boolean | null }
 type DeviceState = { notified: number[]; offlineSince: number | null; offlineAlerted: boolean }
@@ -117,14 +102,12 @@ async function readMqtt(env: Env, sns: string[]): Promise<Map<string, Reading>> 
 	for (const [sn, p] of parts) {
 		if (p.soc === undefined) continue
 		const discharging = (p.battOutW ?? 0) > 5 && (p.battInW ?? 0) === 0
-		let gridIn: boolean | null = null
-		if (p.inSumW !== undefined) gridIn = p.inSumW > 1
-		else if (discharging) gridIn = false
-		else if ((p.battInW ?? 0) > 0) gridIn = true
+		// вхід відомий лише з 254/21; інакше — якщо батарея не розряджається, живимось від мережі
+		const gridIn = p.inSumW !== undefined ? p.inSumW > 1 : !discharging
 		result.set(sn, {
 			soc: Math.round(p.soc),
 			remMin: discharging && p.remMin !== undefined ? p.remMin : null,
-			loadW: p.outSumW !== undefined ? Math.round(p.outSumW) : (p.battOutW ?? null),
+			loadW: p.outSumW !== undefined ? Math.round(p.outSumW) : discharging ? (p.battOutW ?? null) : null,
 			gridIn,
 		})
 	}
@@ -172,42 +155,62 @@ async function tgCall(env: Env, method: string, body: object) {
 	if (!res.ok) throw new Error(`Telegram ${method} ${res.status}: ${await res.text()}`)
 }
 
-const kyivHour = () => Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Kyiv', hour: '2-digit', hourCycle: 'h23' }).format(new Date()))
+const kyivHour = () => Number(new Intl.DateTimeFormat('en-GB', { timeZone: TIMEZONE, hour: '2-digit', hourCycle: 'h23' }).format(new Date()))
 const isQuiet = () => {
 	const h = kyivHour()
 	return QUIET_FROM < QUIET_TO ? h >= QUIET_FROM && h < QUIET_TO : h >= QUIET_FROM || h < QUIET_TO
 }
 
-// Кожне повідомлення бота — з кнопками запиту стану; уночі — без звуку (якщо не loud)
-const telegram = (env: Env, text: string, chatId: string | number = env.TELEGRAM_CHAT_ID, loud = false) =>
-	tgCall(env, 'sendMessage', { chat_id: chatId, text, reply_markup: KEYBOARD, disable_notification: !loud && isQuiet() })
+type SendOpts = { chatId?: string | number; loud?: boolean; keyboard?: boolean }
 
+// HTML-повідомлення; уночі — без звуку (якщо не loud); кнопки лише на панелі стану
+const telegram = (env: Env, text: string, o: SendOpts = {}) =>
+	tgCall(env, 'sendMessage', {
+		chat_id: o.chatId ?? env.TELEGRAM_CHAT_ID,
+		text,
+		parse_mode: 'HTML',
+		link_preview_options: { is_disabled: true },
+		disable_notification: !o.loud && isQuiet(),
+		...(o.keyboard ? { reply_markup: KEYBOARD } : {}),
+	})
+
+const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 const hhmm = (minutes: number) => {
 	const m = Math.max(0, Math.round(minutes))
 	return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`
 }
 const duration = (ms: number) => {
 	const m = Math.floor(ms / 60000)
-	return `${Math.floor(m / 60)} год ${m % 60} хв`
+	return m < 60 ? `${m} хв` : `${Math.floor(m / 60)} год ${m % 60} хв`
 }
-const clock = (t: number) => new Date(t).toLocaleTimeString('uk-UA', { timeZone: 'Europe/Kyiv', hour: '2-digit', minute: '2-digit' })
+const clock = (t: number, sec = false) =>
+	new Date(t).toLocaleTimeString('uk-UA', { timeZone: TIMEZONE, hour: '2-digit', minute: '2-digit', ...(sec ? { second: '2-digit' } : {}) })
+const socIcon = (soc: number) => (soc <= 10 ? '🚨' : soc <= 25 ? '🪫' : '🔋')
+const bar = (soc: number) => {
+	const n = Math.max(0, Math.min(10, Math.round(soc / 10)))
+	return '▰'.repeat(n) + '▱'.repeat(10 - n)
+}
 
-const line = (d: Device, r: Reading | undefined, isOnline: boolean) => {
-	if (!isOnline) return `⚫️ ${d.name}: офлайн`
-	if (!r) return `❔ ${d.name}: немає даних`
-	const icon = r.soc <= 10 ? '🚨' : r.soc <= 25 ? '🪫' : '🔋'
-	const rem = r.remMin !== null ? `⏳ ${hhmm(r.remMin)}` : r.gridIn ? 'від мережі' : '⏳ —'
+// Блок однієї станції — окрема цитата (вертикальна смуга зліва = роздільник)
+const block = (d: Device, r: Reading | undefined, isOnline: boolean) => {
+	const title = `<b>${esc(d.name)}</b>`
+	if (!isOnline) return `<blockquote>${title}\n⚫️ офлайн</blockquote>`
+	if (!r) return `<blockquote>${title}\n❔ немає даних</blockquote>`
 	const load = r.loadW !== null ? ` · ⚡ ${r.loadW} Вт` : ''
-	return `${icon} ${d.name}: ${r.soc}% · ${rem}${load}`
+	const state = r.remMin !== null ? `⏳ ${hhmm(r.remMin)}${load}` : r.gridIn ? `🔌 від мережі${load}` : `⏳ —${load}`
+	return `<blockquote>${socIcon(r.soc)} ${title}\n<code>${bar(r.soc)}</code>  <b>${r.soc}%</b>\n${state}</blockquote>`
 }
+
+const gridLine = (g: GridState | null) =>
+	!g ? '' : g.state === 'ON' ? `💡 Світло є · з ${clock(g.since)}` : `🕯 Світла немає ${duration(Date.now() - g.since)} · з ${clock(g.since)}`
 
 async function statusText(env: Env, devices: Device[] = DEVICES) {
 	const { online, readings } = await readAll(env, devices)
 	const grid = await env.POWER_KV.get<GridState>('grid', 'json')
-	const lines = devices.map((d) => line(d, readings.get(d.sn), online.get(d.sn)!))
-	let g = ''
-	if (grid) g = grid.state === 'ON' ? `\n💡 Світло є (з ${clock(grid.since)})` : `\n🕯 Світла немає ${duration(Date.now() - grid.since)} (з ${clock(grid.since)})`
-	return `📊 Стан на ${clock(Date.now())}\n${lines.join('\n')}${g}`
+	const head = `<b>📊 ${devices.length === 1 ? esc(devices[0].name) : 'Стан станцій'}</b>  <i>${clock(Date.now(), true)}</i>`
+	const blocks = devices.map((d) => block(d, readings.get(d.sn), online.get(d.sn)!)).join('\n')
+	const g = gridLine(grid)
+	return `${head}\n${blocks}${g ? `\n${g}` : ''}`
 }
 
 // ── Щохвилинна перевірка ────────────────────────────────────────
@@ -221,11 +224,11 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 	if (!isOnline) {
 		st.offlineSince ??= now
 		if (!st.offlineAlerted && now - st.offlineSince >= OFFLINE_ALERT_MIN * 60000) {
-			await telegram(env, `⚠️ ${dev.name}: немає зв'язку вже ${duration(now - st.offlineSince)}. Сповіщення про заряд не працюють.`)
+			await telegram(env, `⚠️ <b>${esc(dev.name)} — немає зв'язку</b>\n<blockquote>Вже ${duration(now - st.offlineSince)}. Сповіщення про заряд не працюють.</blockquote>`)
 			st.offlineAlerted = true
 		}
 	} else {
-		if (st.offlineAlerted) await telegram(env, `✅ ${dev.name}: знову на зв'язку`)
+		if (st.offlineAlerted) await telegram(env, `✅ <b>${esc(dev.name)}</b> знову на зв'язку`)
 		st.offlineSince = null
 		st.offlineAlerted = false
 
@@ -233,10 +236,10 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 			const crossed = THRESHOLDS.filter((t) => r.soc <= t && !st.notified.includes(t))
 			if (crossed.length) {
 				const t = Math.min(...crossed)
-				const icon = t <= 10 ? '🚨' : t <= 25 ? '🪫' : '🔋'
-				const rem = r.remMin !== null ? `⏳ Залишилось ≈ ${hhmm(r.remMin)}` : r.gridIn ? '🔌 Від мережі' : '⏳ Час невідомий'
-				const load = r.loadW !== null ? `\n⚡ Споживання: ${r.loadW} Вт` : ''
-				await telegram(env, `${icon} ${dev.name}: ${r.soc}%\n${rem}${load}`, env.TELEGRAM_CHAT_ID, t <= 10)
+				const loud = t === Math.min(...THRESHOLDS)
+				const rem = r.remMin !== null ? `⏳ Залишилось ≈ <b>${hhmm(r.remMin)}</b>` : r.gridIn ? '🔌 Від мережі' : '⏳ Час невідомий'
+				const load = r.loadW !== null ? `\n⚡ Споживання ${r.loadW} Вт` : ''
+				await telegram(env, `${socIcon(t)} <b>${esc(dev.name)} — ${r.soc}%</b>\n<blockquote><code>${bar(r.soc)}</code>\n${rem}${load}</blockquote>`, { loud })
 				st.notified.push(...crossed)
 			}
 			st.notified = st.notified.filter((t) => r.soc < t + RESET_GAP)
@@ -254,17 +257,31 @@ async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<s
 	if (prev?.state === cur) return
 	await env.POWER_KV.put('grid', JSON.stringify({ state: cur, since: now }))
 	if (!prev) return // перший запуск — просто запам'ятали
-	const lines = DEVICES.map((d) => line(d, readings.get(d.sn), online.get(d.sn)!))
-	if (cur === 'OFF') await telegram(env, `🕯 Світло пішло\n${lines.join('\n')}`)
-	else await telegram(env, `💡 Світло повернулось\n⏱ Не було: ${duration(now - prev.since)}\n${lines.join('\n')}`)
+	const blocks = DEVICES.map((d) => block(d, readings.get(d.sn), online.get(d.sn)!)).join('\n')
+	if (cur === 'OFF') await telegram(env, `🕯 <b>Світло пішло</b>  <i>${clock(now)}</i>\n${blocks}`)
+	else await telegram(env, `💡 <b>Світло повернулось</b>  <i>${clock(now)}</i>\n⏱ Не було ${duration(now - prev.since)}\n${blocks}`)
+}
+
+// Меню команд у Telegram будується з config.ts і оновлюється лише при змінах
+async function syncCommands(env: Env) {
+	const commands = [
+		{ command: 'status', description: 'Усі станції: заряд і час роботи' },
+		...DEVICES.map((d) => ({ command: d.cmd, description: d.name })),
+		{ command: 'help', description: 'Список команд' },
+	]
+	const json = JSON.stringify(commands)
+	if ((await env.POWER_KV.get('commands')) === json) return
+	await tgCall(env, 'setMyCommands', { commands })
+	await env.POWER_KV.put('commands', json)
 }
 
 async function run(env: Env) {
+	await syncCommands(env).catch((e) => console.error('commands', e))
 	const { online, readings } = await readAll(env)
-	if (!(await env.POWER_KV.get('started:v2'))) {
-		const lines = DEVICES.map((d) => line(d, readings.get(d.sn), online.get(d.sn)!))
-		await telegram(env, `📡 Моніторинг EcoFlow запущено\nПороги: ${THRESHOLDS.join(' / ')}%\n${lines.join('\n')}\n\nКоманда /status — поточний стан`)
-		await env.POWER_KV.put('started:v2', String(Date.now()))
+	if (!(await env.POWER_KV.get('started:v3'))) {
+		const blocks = DEVICES.map((d) => block(d, readings.get(d.sn), online.get(d.sn)!)).join('\n')
+		await telegram(env, `📡 <b>Моніторинг EcoFlow запущено</b>\nПороги ${THRESHOLDS.join(' · ')}%  ·  тиша ${QUIET_FROM}:00–${QUIET_TO}:00\n${blocks}`, { keyboard: true })
+		await env.POWER_KV.put('started:v3', String(Date.now()))
 	}
 	for (const d of DEVICES) {
 		try {
@@ -277,18 +294,20 @@ async function run(env: Env) {
 }
 
 // ── Telegram webhook: команди і кнопки ──────────────────────────
-async function reply(env: Env, chatId: number | string, cmd: string) {
-	if (cmd === 'help' || cmd === 'start') {
-		const list = DEVICES.map((d) => `/${d.cmd} — ${d.name}`).join('\n')
-		return telegram(env, `Команди (або кнопки нижче):\n/status — усі станції\n${list}`, chatId)
-	}
+async function helpText() {
+	const list = DEVICES.map((d) => `/${d.cmd} — ${esc(d.name)}`).join('\n')
+	return `<b>🤖 Команди</b>\n<blockquote>/status — усі станції\n${list}</blockquote>\nАбо кнопки нижче — вони оновлюють це ж повідомлення.`
+}
+
+async function render(env: Env, cmd: string): Promise<string | null> {
+	if (cmd === 'help' || cmd === 'start') return helpText()
 	const devices = cmd === 'status' ? DEVICES : DEVICES.filter((d) => d.cmd === cmd)
-	if (!devices.length) return
+	if (!devices.length) return null
 	try {
-		await telegram(env, await statusText(env, devices), chatId)
+		return await statusText(env, devices)
 	} catch (e) {
 		console.error('status', e)
-		await telegram(env, `⚠️ Не вдалося отримати дані: ${e}`, chatId)
+		return `⚠️ <b>Не вдалося отримати дані</b>\n<blockquote>${esc(String(e))}</blockquote>`
 	}
 }
 
@@ -297,16 +316,28 @@ async function handleUpdate(env: Env, update: any) {
 	if (cb) {
 		const chatId = cb.message?.chat?.id
 		const ours = String(chatId) === String(env.TELEGRAM_CHAT_ID)
-		// прибираємо «годинник» на кнопці
-		await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text: ours ? 'Збираю дані…' : undefined }).catch(() => {})
-		if (ours) await reply(env, chatId, String(cb.data))
+		await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text: ours ? 'Оновлюю…' : undefined }).catch(() => {})
+		if (!ours) return
+		const text = await render(env, String(cb.data))
+		if (!text) return
+		// оновлюємо ту саму панель замість нового повідомлення
+		await tgCall(env, 'editMessageText', {
+			chat_id: chatId,
+			message_id: cb.message.message_id,
+			text,
+			parse_mode: 'HTML',
+			reply_markup: KEYBOARD,
+		}).catch((e) => {
+			if (!String(e).includes('message is not modified')) console.error('edit', e)
+		})
 		return
 	}
 	const msg = update?.message
 	const cmd = (msg?.text ?? '').match(/^\/(\w+)(@\w+)?(\s|$)/)?.[1]?.toLowerCase()
 	if (!cmd) return
 	if (String(msg.chat.id) !== String(env.TELEGRAM_CHAT_ID)) return // лише наша група
-	await reply(env, msg.chat.id, cmd)
+	const text = await render(env, cmd)
+	if (text) await telegram(env, text, { chatId: msg.chat.id, keyboard: true })
 }
 
 export default {

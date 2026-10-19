@@ -1,14 +1,12 @@
 // Зонд: логін як застосунок EcoFlow → MQTT → 2 хв слухаємо станції → probe-dump.jsonl
-// Запуск: EF_EMAIL='...' EF_PASSWORD='...' node probe.mjs
+// Запуск: EF_EMAIL='...' EF_PASSWORD='...' node probe.mjs SN1 SN2
 import mqtt from 'mqtt'
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, writeFileSync } from 'node:fs'
 
-const DEVICES = {
-  D3M1ZE1A9H990005: 'Маринка',
-  R655ZEBAXH170579: 'UPS Kate',
-  R655ZEBAXH171200: 'UPS Router',
-}
+// Серійники — аргументами: node probe.mjs SN1 SN2 ...
+const DEVICES = Object.fromEntries(process.argv.slice(2).map((sn) => [sn, sn]))
+if (!Object.keys(DEVICES).length) { console.error('Вкажіть серійники: node probe.mjs SN1 SN2'); process.exit(1) }
 const SECONDS = Number(process.env.SECONDS ?? 120)
 const OUT = process.env.OUT ?? 'probe-dump.jsonl'
 const { EF_EMAIL, EF_PASSWORD } = process.env

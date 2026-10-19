@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 const { ACCESS_KEY, SECRET_KEY } = process.env;
-const HOST = "https://api-e.ecoflow.com";
+const HOST = process.env.API ?? "https://api-e.ecoflow.com"; // US: https://api.ecoflow.com
 async function call(path, params = {}) {
   const nonce = String(Math.floor(100000 + Math.random() * 900000));
   const timestamp = String(Date.now());
@@ -16,5 +16,7 @@ for (const dev of d.body.data || []) {
   const q = await call("/iot-open/sign/device/quota/all", { sn: dev.sn });
   const data = q.body.data || {};
   const soc = Object.keys(data).filter(k => /soc/i.test(k)).map(k => `${k}=${data[k]}`);
+  const via = q.body.code === "0" ? "via: 'rest'" : q.body.code === "1006" ? "via: 'mqtt'" : "?";
+  console.log(`→ ${dev.deviceName}: { sn: '${dev.sn}', ${via} }`);
   console.log("QUOTA", dev.sn, dev.productName, dev.deviceName, "online:", dev.online, "| http", q.status, "code", q.body.code, q.body.message, "| keys:", Object.keys(data).length, "|", soc.join(", "));
 }
