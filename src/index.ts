@@ -158,11 +158,26 @@ async function appAuth(env: Env): Promise<AppAuth> {
 	return a
 }
 
-async function readMqtt(env: Env, sns: string[]): Promise<Map<string, Reading>> {
+// sns — з кого читаємо заряд; settingsFor — у кого ще чекаємо налаштування (повний пакет 254/21:
+// ліміт заряду і макс. вхід); restSettings — REST-станції, з яких по MQTT беремо лише макс. вхід
+async function readMqtt(
+	env: Env,
+	sns: string[],
+	o: { settingsFor?: string[]; restSettings?: string[] } = {},
+): Promise<{ result: Map<string, Reading>; parts: Map<string, UpsPart> }> {
 	const result = new Map<string, Reading>()
-	if (!sns.length) return result
+	const settingsFor = new Set(o.settingsFor ?? [])
+	const restOnly = o.restSettings ?? []
+	const all = [...sns, ...restOnly]
+	if (!all.length) return { result, parts: new Map() }
 	const a = await appAuth(env)
-	const parts = new Map<string, UpsPart>(sns.map((sn) => [sn, {}]))
+	const parts = new Map<string, UpsPart>(all.map((sn) => [sn, {}]))
+	const ready = (sn: string) => {
+		const p = parts.get(sn)!
+		if (restOnly.includes(sn)) return p.acMax !== undefined
+		if (p.soc === undefined) return false
+		return !settingsFor.has(sn) || (p.maxChg !== undefined && p.acMax !== undefined)
+	}
 	try {
 		await mqttCollect({
 			host: a.host,
@@ -170,9 +185,9 @@ async function readMqtt(env: Env, sns: string[]): Promise<Map<string, Reading>> 
 			username: a.username,
 			password: a.password,
 			clientId: `ANDROID_${crypto.randomUUID().replace(/-/g, '').toUpperCase()}_${a.userId}`,
-			topics: sns.map((sn) => `/app/device/property/${sn}`),
+			topics: all.map((sn) => `/app/device/property/${sn}`),
 			// «Будимо» станції запитом як у застосунку — без нього River 3 може не слати телеметрію
-			publish: sns.map((sn) => ({
+			publish: all.map((sn) => ({
 				topic: `/app/${a.userId}/${sn}/thing/property/get`,
 				payload: new TextEncoder().encode(
 					JSON.stringify({ from: 'Android', id: String(Date.now() % 1e9), version: '1.1', moduleType: 0, operateType: 'latestQuotas', params: {} }),
@@ -180,15 +195,15 @@ async function readMqtt(env: Env, sns: string[]): Promise<Map<string, Reading>> 
 			})),
 			timeoutMs: MQTT_WAIT_MS,
 			onMessage: ({ topic, payload }) => {
-				const sn = sns.find((s) => topic.endsWith(s))
+				const sn = all.find((s) => topic.endsWith(s))
 				if (!sn) return false
 				try {
 					Object.assign(parts.get(sn)!, parseEcoflowPacket(payload))
 				} catch (e) {
 					console.warn('parse', sn, e)
 				}
-				// вистачає, коли від кожної UPS є BMS-пакет (заряд)
-				return sns.every((s) => parts.get(s)!.soc !== undefined)
+				// досить, коли від кожної станції є все потрібне
+				return all.every(ready)
 			},
 		})
 	} catch (e) {
@@ -196,7 +211,7 @@ async function readMqtt(env: Env, sns: string[]): Promise<Map<string, Reading>> 
 		throw e
 	}
 	for (const [sn, p] of parts) {
-		if (p.soc === undefined) continue
+		if (p.soc === undefined || restOnly.includes(sn)) continue
 		const discharging = (p.battOutW ?? 0) > 5 && (p.battInW ?? 0) === 0
 		// вхід відомий лише з 254/21; інакше — якщо батарея не розряджається, живимось від мережі
 		const gridIn = p.inSumW !== undefined ? p.inSumW > 1 : !discharging
@@ -209,11 +224,12 @@ async function readMqtt(env: Env, sns: string[]): Promise<Map<string, Reading>> 
 			acMax: p.acMax,
 		})
 	}
-	return result
+	return { result, parts }
 }
 
 // ── Збір даних з усіх станцій ───────────────────────────────────
-async function readAll(env: Env, devices: Device[] = DEVICES) {
+// detailed — для картки однієї станції: чекаємо ще й налаштування (ліміт заряду, макс. вхід)
+async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false) {
 	const list: Array<{ sn: string; online: number }> = await ecoflow(env, '/iot-open/sign/device/list')
 	const online = new Map(DEVICES.map((d) => [d.sn, list.find((x) => x.sn === d.sn)?.online === 1]))
 	const readings = new Map<string, Reading>()
@@ -229,8 +245,19 @@ async function readAll(env: Env, devices: Device[] = DEVICES) {
 	const mqttJob = (async () => {
 		try {
 			const want = devices.filter((d) => d.via === 'mqtt' && online.get(d.sn))
-			const r = await readMqtt(env, want.map((d) => d.sn))
+			const restSet = detailed ? devices.filter((d) => d.via === 'rest' && online.get(d.sn)).map((d) => d.sn) : []
+			const { result: r, parts } = await readMqtt(env, want.map((d) => d.sn), {
+				settingsFor: detailed ? want.map((d) => d.sn) : [],
+				restSettings: restSet,
+			})
 			for (const [sn, v] of r) readings.set(sn, v)
+			// макс. вхід для REST-станцій (офіційний API його не віддає) — дописуємо після REST
+			await Promise.all(restJobs)
+			for (const sn of restSet) {
+				const ac = parts.get(sn)?.acMax
+				const rd = readings.get(sn)
+				if (rd && ac !== undefined) rd.acMax = ac
+			}
 			const missing = want.filter((d) => !r.has(d.sn)).map((d) => d.name)
 			if (missing.length) errors.push(`${missing.join(', ')}: станція не надіслала дані за ${MQTT_WAIT_MS / 1000} с`)
 		} catch (e) {
@@ -385,7 +412,7 @@ const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState
 }
 
 async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel> {
-	const { online, readings, errors } = await readAll(env, devices)
+	const { online, readings, errors } = await readAll(env, devices, devices.length === 1)
 	const grid = await env.POWER_KV.get<GridState>('grid', 'json')
 	const now = Date.now()
 	// якщо дані не прийшли — показуємо причину, а не просто «немає даних»
