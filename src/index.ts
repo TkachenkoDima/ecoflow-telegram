@@ -174,19 +174,24 @@ async function appAuth(env: Env): Promise<AppAuth> {
 	return a
 }
 
-// ── Кеш налаштувань станцій (ліміт заряду, макс. вхід) у Cache API: безкоштовно, не витрачає записи KV ──
+// ── Налаштування станцій (ліміт заряду, макс. вхід) у KV — спільні для всіх дата-центрів Cloudflare ──
+// Запис лише коли значення змінилось або минула година (≈ до 72 записів/добу на 3 станції — далеко від ліміту 1000)
 type Settings = { maxChg?: number; acMax?: number; at: number }
-const SETTINGS_FRESH_MS = 60 * 60_000 // раз на годину cron оновлює налаштування з телеметрії
-const settingsKey = (sn: string) => new Request(`https://settings.local/${sn}`)
+const SETTINGS_FRESH_MS = 60 * 60_000
+let settingsEnv: Env // KV доступний лише через env — запам'ятовуємо на час запиту
+const settingsCache = new Map<string, Settings | null>() // у межах одного запуску, щоб не читати KV двічі
 async function getSettings(sn: string): Promise<Settings | null> {
-	const r = await caches.default.match(settingsKey(sn))
-	return r ? r.json<Settings>() : null
+	if (!settingsCache.has(sn)) settingsCache.set(sn, await settingsEnv.POWER_KV.get<Settings>(`settings:${sn}`, 'json'))
+	return settingsCache.get(sn)!
 }
 async function saveSettings(sn: string, upd: { maxChg?: number; acMax?: number }) {
 	if (upd.maxChg === undefined && upd.acMax === undefined) return
-	const prev = (await getSettings(sn)) ?? { at: 0 }
-	const next: Settings = { maxChg: upd.maxChg ?? prev.maxChg, acMax: upd.acMax ?? prev.acMax, at: Date.now() }
-	await caches.default.put(settingsKey(sn), new Response(JSON.stringify(next), { headers: { 'Cache-Control': 'max-age=2592000' } }))
+	const prev = await getSettings(sn)
+	const next: Settings = { maxChg: upd.maxChg ?? prev?.maxChg, acMax: upd.acMax ?? prev?.acMax, at: Date.now() }
+	const changed = !prev || prev.maxChg !== next.maxChg || prev.acMax !== next.acMax
+	if (!changed && Date.now() - prev.at < SETTINGS_FRESH_MS) return
+	settingsCache.set(sn, next)
+	await settingsEnv.POWER_KV.put(`settings:${sn}`, JSON.stringify(next))
 }
 
 // sns — з кого читаємо заряд; settingsFor — у кого ще чекаємо налаштування (повний пакет 254/21:
@@ -666,10 +671,14 @@ async function handleUpdate(env: Env, update: any) {
 export default {
 	async scheduled(_event, env, ctx) {
 		initDevices(env)
+		settingsEnv = env
+		settingsCache.clear()
 		ctx.waitUntil(run(env))
 	},
 	async fetch(req, env, ctx) {
 		initDevices(env)
+		settingsEnv = env
+		settingsCache.clear()
 		const url = new URL(req.url)
 		if (url.pathname === '/telegram' && req.method === 'POST') {
 			if (req.headers.get('X-Telegram-Bot-Api-Secret-Token') !== env.TG_WEBHOOK_SECRET) return new Response('forbidden', { status: 403 })
