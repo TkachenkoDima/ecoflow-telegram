@@ -164,10 +164,13 @@ const isQuiet = () => {
 type SendOpts = { chatId?: string | number; loud?: boolean; keyboard?: boolean }
 
 // HTML-повідомлення; уночі — без звуку (якщо не loud); кнопки лише на панелі стану
+// Явний роздільник у кінці кожного повідомлення, щоб сусідні не зливались
+const DIVIDER = '━━━━━━━━━━━━━━━━━━'
+
 const telegram = (env: Env, text: string, o: SendOpts = {}) =>
 	tgCall(env, 'sendMessage', {
 		chat_id: o.chatId ?? env.TELEGRAM_CHAT_ID,
-		text,
+		text: `${text}\n${DIVIDER}`,
 		parse_mode: 'HTML',
 		link_preview_options: { is_disabled: true },
 		disable_notification: !o.loud && isQuiet(),
@@ -194,24 +197,31 @@ const bar = (soc: number) => {
 
 type Panel = { text: string }
 
-// Компактна таблиця: одна станція — один рядок моноширинним шрифтом, колонки вирівняні
-//   Станція   Заряд           Час   Нав.
-//   Kate       92% ▰▰▰▰▰▰▰▱  04:08  54Вт
+// Стан станції одним рядком: «⏳ 04:01 · ⚡ 58 Вт» / «🔌 від мережі»
+const stateLine = (r: Reading) => {
+	const load = r.loadW !== null ? ` · ⚡ ${r.loadW} Вт` : ''
+	return r.remMin !== null ? `⏳ ${hhmm(r.remMin)}${load}` : r.gridIn ? `🔌 від мережі${load}` : `⏳ —${load}`
+}
+
+// Список усіх станцій в одній цитаті, по рядку на станцію
 const table = (devices: Device[], readings: Map<string, Reading>, online: Map<string, boolean>) => {
-	const w = Math.max(...devices.map((d) => d.name.length))
 	const lines = devices.map((d) => {
-		const name = d.name.padEnd(w)
+		const name = `<b>${esc(d.name)}</b>`
 		const r = readings.get(d.sn)
-		if (!online.get(d.sn)) return `${name}  ── офлайн ──`
-		if (!r) return `${name}  ── немає даних ──`
-		const pct = `${r.soc}%`.padStart(4)
-		const n = Math.max(0, Math.min(8, Math.round(r.soc / 12.5)))
-		const bar8 = '▰'.repeat(n) + '▱'.repeat(8 - n)
-		const time = (r.remMin !== null ? hhmm(r.remMin) : r.gridIn ? 'мережа' : '—').padStart(6)
-		const load = r.loadW !== null ? `${r.loadW}Вт` : ''
-		return `${name} ${pct} ${bar8} ${time} ${load}`.trimEnd()
+		if (!online.get(d.sn)) return `⚫️ ${name} — офлайн`
+		if (!r) return `❔ ${name} — немає даних`
+		return `${socIcon(r.soc)} ${name}  <b>${r.soc}%</b> · ${stateLine(r)}`
 	})
-	return `<pre>${esc(lines.join('\n'))}</pre>`
+	return `<blockquote>${lines.join('\n')}</blockquote>`
+}
+
+// Детальна картка однієї станції
+const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState | null, now: number) => {
+	const t = `<i>${clock(now)}</i>`
+	if (!isOnline) return `⚫️ <b>${esc(d.name)}</b> — офлайн   ${t}`
+	if (!r) return `❔ <b>${esc(d.name)}</b> — немає даних   ${t}`
+	const grid = !g ? '' : g.state === 'ON' ? `\n💡 світло є з ${clock(g.since)}` : `\n🕯 без світла ${duration(now - g.since)}`
+	return `${socIcon(r.soc)} <b>${esc(d.name)} · ${r.soc}%</b>   ${t}\n<blockquote><code>${bar(r.soc)}</code>\n${stateLine(r)}${grid}</blockquote>`
 }
 
 const gridHead = (g: GridState | null, now: number) => {
@@ -225,7 +235,12 @@ const gridHead = (g: GridState | null, now: number) => {
 async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel> {
 	const { online, readings } = await readAll(env, devices)
 	const grid = await env.POWER_KV.get<GridState>('grid', 'json')
-	return { text: `${gridHead(grid, Date.now())}\n${table(devices, readings, online)}` }
+	const now = Date.now()
+	if (devices.length === 1) {
+		const d = devices[0]
+		return { text: card(d, readings.get(d.sn), online.get(d.sn)!, grid, now) }
+	}
+	return { text: `${gridHead(grid, now)}\n${table(devices, readings, online)}` }
 }
 
 const sendPanel = (env: Env, chatId: string | number, p: Panel) => telegram(env, p.text, { chatId, keyboard: true })
