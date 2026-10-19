@@ -181,16 +181,26 @@ async function readAll(env: Env, devices: Device[] = DEVICES) {
 }
 
 // ── Telegram ────────────────────────────────────────────────────
+// Головні кнопки: стан + перехід у «папку» керування
 const KEYBOARD = {
-	inline_keyboard: [[{ text: '📊 Усі станції', callback_data: 'status' }], DEVICES.map((d) => ({ text: d.name, callback_data: d.cmd }))],
+	inline_keyboard: [
+		[{ text: '📊 Усі станції', callback_data: 'status' }],
+		DEVICES.map((d) => ({ text: d.name, callback_data: d.cmd })),
+		[{ text: '⚙️ Керування', callback_data: 'menu:control' }],
+	],
 }
-// Для картки станції — ще рядок керування (лише дії, які підтримує її тип підключення)
-const keyboardFor = (d?: Device) => {
-	if (!d) return KEYBOARD
-	const row = Object.entries(ACTIONS)
-		.filter(([, a]) => a.via === d.via)
-		.map(([id, a]) => ({ text: a.label, callback_data: `set:${d.cmd}:${id}` }))
-	return row.length ? { inline_keyboard: [row, ...KEYBOARD.inline_keyboard] } : KEYBOARD
+
+// «Папка» керування: по кожній станції — заголовок і її дії; станції без дій не показуємо
+const CONTROL_KEYBOARD = {
+	inline_keyboard: [
+		...DEVICES.flatMap((d) => {
+			const row = Object.entries(ACTIONS)
+				.filter(([, a]) => a.via === d.via)
+				.map(([id, a]) => ({ text: a.label, callback_data: `set:${d.cmd}:${id}` }))
+			return row.length ? [[{ text: `— ${d.name} —`, callback_data: 'noop' }], row] : []
+		}),
+		[{ text: '⬅️ Назад', callback_data: 'menu:main' }],
+	],
 }
 
 async function tgCall(env: Env, method: string, body: object) {
@@ -326,7 +336,7 @@ async function sendPanel(env: Env, chatId: string | number, p: Panel) {
 		parse_mode: 'HTML',
 		link_preview_options: { is_disabled: true },
 		disable_notification: isQuiet(),
-		reply_markup: keyboardFor(p.device),
+		reply_markup: KEYBOARD,
 	})
 	if (msg?.message_id)
 		await cache.put(panelKey(chatId), new Response(String(msg.message_id), { headers: { 'Cache-Control': 'max-age=604800' } }))
@@ -437,6 +447,14 @@ async function handleUpdate(env: Env, update: any) {
 		const chatId = cb.message?.chat?.id
 		const ours = isOurChat(env, chatId)
 		const data = String(cb.data)
+		// Навігація між «папками» — міняємо лише кнопки під тим самим повідомленням
+		if (data === 'noop' || data.startsWith('menu:')) {
+			await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id }).catch(() => {})
+			if (!ours || data === 'noop') return
+			const markup = data === 'menu:control' ? CONTROL_KEYBOARD : KEYBOARD
+			await tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: cb.message.message_id, reply_markup: markup }).catch(() => {})
+			return
+		}
 		if (ours && data.startsWith('set:')) {
 			const [, cmd, actionId] = data.split(':')
 			const d = DEVICES.find((x) => x.cmd === cmd)
