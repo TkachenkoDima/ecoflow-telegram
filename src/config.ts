@@ -7,10 +7,17 @@ export type Device = {
 	name: string // як підписувати в повідомленнях
 	via: 'rest' | 'mqtt' // 'rest' — якщо check-api показує code 0; 'mqtt' — якщо code 1006
 	cmd: string // команда бота латиницею, напр. 'kate' → /kate
+	messages?: Record<number, string> // необов'язково: свій текст для порогу, напр. { 10: 'Я сідаю!' }
 }
 
 export const DEVICES: Device[] = [
-	{ sn: 'D3M1ZE1A9H990005', name: 'Маринка', via: 'rest', cmd: 'marinka' },
+	{
+		sn: 'D3M1ZE1A9H990005',
+		name: 'Маринка',
+		via: 'rest',
+		cmd: 'marinka',
+		messages: { 10: 'Заканчивай катку лут гоблин, я скоро крякну' },
+	},
 	{ sn: 'R655ZEBAXH170579', name: 'Kate', via: 'mqtt', cmd: 'kate' },
 	{ sn: 'R655ZEBAXH171200', name: 'Router', via: 'mqtt', cmd: 'router' },
 ]
