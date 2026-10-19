@@ -28,6 +28,8 @@ const RESET_GAP = 10 // поріг знову активний, коли зар�
 const OFFLINE_ALERT_MIN = 30
 const MQTT_WAIT_MS = 15_000 // UPS шлють BMS-пакет кожні ~10 с
 const API = 'https://api-e.ecoflow.com'
+const QUIET_FROM = 0 // тихий режим (за Києвом): повідомлення без звуку,
+const QUIET_TO = 8 //   крім 🚨 10% — воно завжди зі звуком
 // ────────────────────────────────────────────────────────────────
 
 type Reading = { soc: number; remMin: number | null; loadW: number | null; gridIn: boolean | null }
@@ -170,9 +172,15 @@ async function tgCall(env: Env, method: string, body: object) {
 	if (!res.ok) throw new Error(`Telegram ${method} ${res.status}: ${await res.text()}`)
 }
 
-// Кожне повідомлення бота — з кнопками запиту стану
-const telegram = (env: Env, text: string, chatId: string | number = env.TELEGRAM_CHAT_ID) =>
-	tgCall(env, 'sendMessage', { chat_id: chatId, text, reply_markup: KEYBOARD })
+const kyivHour = () => Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Kyiv', hour: '2-digit', hourCycle: 'h23' }).format(new Date()))
+const isQuiet = () => {
+	const h = kyivHour()
+	return QUIET_FROM < QUIET_TO ? h >= QUIET_FROM && h < QUIET_TO : h >= QUIET_FROM || h < QUIET_TO
+}
+
+// Кожне повідомлення бота — з кнопками запиту стану; уночі — без звуку (якщо не loud)
+const telegram = (env: Env, text: string, chatId: string | number = env.TELEGRAM_CHAT_ID, loud = false) =>
+	tgCall(env, 'sendMessage', { chat_id: chatId, text, reply_markup: KEYBOARD, disable_notification: !loud && isQuiet() })
 
 const hhmm = (minutes: number) => {
 	const m = Math.max(0, Math.round(minutes))
@@ -228,7 +236,7 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 				const icon = t <= 10 ? '🚨' : t <= 25 ? '🪫' : '🔋'
 				const rem = r.remMin !== null ? `⏳ Залишилось ≈ ${hhmm(r.remMin)}` : r.gridIn ? '🔌 Від мережі' : '⏳ Час невідомий'
 				const load = r.loadW !== null ? `\n⚡ Споживання: ${r.loadW} Вт` : ''
-				await telegram(env, `${icon} ${dev.name}: ${r.soc}%\n${rem}${load}`)
+				await telegram(env, `${icon} ${dev.name}: ${r.soc}%\n${rem}${load}`, env.TELEGRAM_CHAT_ID, t <= 10)
 				st.notified.push(...crossed)
 			}
 			st.notified = st.notified.filter((t) => r.soc < t + RESET_GAP)
