@@ -190,68 +190,45 @@ const bar = (soc: number) => {
 	const n = Math.max(0, Math.min(10, Math.round(soc / 10)))
 	return '▰'.repeat(n) + '▱'.repeat(10 - n)
 }
-// Роздільник-заголовок на початку повідомлення, щоб сусідні не зливались
-const divider = (label: string) => `━━━━━  ${label}  ━━━━━`
 
-// Блок однієї станції — окрема цитата (вертикальна смуга зліва = роздільник)
-const block = (d: Device, r: Reading | undefined, isOnline: boolean) => {
-	const title = `<b>${esc(d.name)}</b>`
-	if (!isOnline) return `<blockquote>${title}\n⚫️ офлайн</blockquote>`
-	if (!r) return `<blockquote>${title}\n❔ немає даних</blockquote>`
-	const load = r.loadW !== null ? ` · ⚡ ${r.loadW} Вт` : ''
-	const state = r.remMin !== null ? `⏳ ${hhmm(r.remMin)}${load}` : r.gridIn ? `🔌 від мережі${load}` : `⏳ —${load}`
-	return `<blockquote>${socIcon(r.soc)} ${title}\n<code>${bar(r.soc)}</code>  <b>${r.soc}%</b>\n${state}</blockquote>`
+
+type Panel = { text: string }
+
+// Компактна таблиця: одна станція — один рядок моноширинним шрифтом, колонки вирівняні
+//   Станція   Заряд           Час   Нав.
+//   Kate       92% ▰▰▰▰▰▰▰▱  04:08  54Вт
+const table = (devices: Device[], readings: Map<string, Reading>, online: Map<string, boolean>) => {
+	const w = Math.max(...devices.map((d) => d.name.length))
+	const lines = devices.map((d) => {
+		const name = d.name.padEnd(w)
+		const r = readings.get(d.sn)
+		if (!online.get(d.sn)) return `${name}  ── офлайн ──`
+		if (!r) return `${name}  ── немає даних ──`
+		const pct = `${r.soc}%`.padStart(4)
+		const n = Math.max(0, Math.min(8, Math.round(r.soc / 12.5)))
+		const bar8 = '▰'.repeat(n) + '▱'.repeat(8 - n)
+		const time = (r.remMin !== null ? hhmm(r.remMin) : r.gridIn ? 'мережа' : '—').padStart(6)
+		const load = r.loadW !== null ? `${r.loadW}Вт` : ''
+		return `${name} ${pct} ${bar8} ${time} ${load}`.trimEnd()
+	})
+	return `<pre>${esc(lines.join('\n'))}</pre>`
 }
 
-const gridLine = (g: GridState | null) =>
-	!g ? '' : g.state === 'ON' ? `💡 Світло є · з ${clock(g.since)}` : `🕯 Світла немає ${duration(Date.now() - g.since)} · з ${clock(g.since)}`
-
-type Panel = { text: string; rich?: string } // text — звичайний HTML (запасний), rich — таблиця (Bot API rich messages)
-
-// Рядок таблиці для однієї станції
-const row = (d: Device, r: Reading | undefined, isOnline: boolean) => {
-	const name = esc(d.name)
-	if (!isOnline) return `<tr><td>⚫️ ${name}</td><td align="center" colspan="3"><i>офлайн</i></td></tr>`
-	if (!r) return `<tr><td>❔ ${name}</td><td align="center" colspan="3"><i>немає даних</i></td></tr>`
-	const time = r.remMin !== null ? `⏳ ${hhmm(r.remMin)}` : r.gridIn ? '🔌 мережа' : '—'
-	const load = r.loadW !== null ? `${r.loadW} Вт` : '—'
-	return `<tr><td>${socIcon(r.soc)} ${name}</td><td align="right"><b>${r.soc}%</b></td><td align="center">${time}</td><td align="right">${load}</td></tr>`
+const gridHead = (g: GridState | null, now: number) => {
+	const t = `<i>${clock(now)}</i>`
+	if (!g) return `📊 ${t}`
+	return g.state === 'ON'
+		? `<b>💡 Світло є</b> · з ${clock(g.since)}   ${t}`
+		: `<b>🕯 Без світла ${duration(now - g.since)}</b> · з ${clock(g.since)}   ${t}`
 }
 
 async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel> {
 	const { online, readings } = await readAll(env, devices)
 	const grid = await env.POWER_KV.get<GridState>('grid', 'json')
-	const now = clock(Date.now(), true)
-	const g = gridLine(grid)
-
-	const blocks = devices.map((d) => block(d, readings.get(d.sn), online.get(d.sn)!)).join('\n')
-	const text = `<b>${divider(`📊 ${now}`)}</b>\n${blocks}${g ? `\n${g}` : ''}`
-
-	const rows = devices.map((d) => row(d, readings.get(d.sn), online.get(d.sn)!)).join('')
-	const rich =
-		`<h3>📊 Станції · ${now}</h3>` +
-		`<table bordered striped compact><tr><th>Станція</th><th>Заряд</th><th>Прогноз</th><th>Навант.</th></tr>${rows}</table>` +
-		(g ? `<p>${g}</p>` : '')
-	return { text, rich }
+	return { text: `${gridHead(grid, Date.now())}\n${table(devices, readings, online)}` }
 }
 
-// Надсилаємо панель rich-таблицею; якщо клієнт/API не підтримує — звичайним HTML
-async function sendPanel(env: Env, chatId: string | number, p: Panel) {
-	if (p.rich) {
-		try {
-			await tgCall(env, 'sendRichMessage', {
-				chat_id: chatId,
-				rich_message: { html: p.rich },
-				reply_markup: KEYBOARD,
-				disable_notification: isQuiet(),
-			})
-			return
-		} catch (e) {
-			console.warn('rich fallback', e)
-		}
-	}
-	await telegram(env, p.text, { chatId, keyboard: true })
-}
+const sendPanel = (env: Env, chatId: string | number, p: Panel) => telegram(env, p.text, { chatId, keyboard: true })
 
 // ── Щохвилинна перевірка ────────────────────────────────────────
 async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading | undefined) {
@@ -297,9 +274,9 @@ async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<s
 	if (prev?.state === cur) return
 	await env.POWER_KV.put('grid', JSON.stringify({ state: cur, since: now }))
 	if (!prev) return // перший запуск — просто запам'ятали
-	const blocks = DEVICES.map((d) => block(d, readings.get(d.sn), online.get(d.sn)!)).join('\n')
-	if (cur === 'OFF') await telegram(env, `<b>${divider(`🕯 ${clock(now)}`)}</b>\n<b>Світло пішло</b>\n${blocks}`)
-	else await telegram(env, `<b>${divider(`💡 ${clock(now)}`)}</b>\n<b>Світло повернулось</b> · не було ${duration(now - prev.since)}\n${blocks}`)
+	const t = table(DEVICES, readings, online)
+	if (cur === 'OFF') await telegram(env, `<b>🕯 Світло пішло</b>   <i>${clock(now)}</i>\n${t}`)
+	else await telegram(env, `<b>💡 Світло повернулось</b> · не було ${duration(now - prev.since)}   <i>${clock(now)}</i>\n${t}`)
 }
 
 // Меню команд у Telegram будується з config.ts і оновлюється лише при змінах
@@ -319,8 +296,7 @@ async function run(env: Env) {
 	await syncCommands(env).catch((e) => console.error('commands', e))
 	const { online, readings } = await readAll(env)
 	if (!(await env.POWER_KV.get('started:v3'))) {
-		const blocks = DEVICES.map((d) => block(d, readings.get(d.sn), online.get(d.sn)!)).join('\n')
-		await telegram(env, `📡 <b>Моніторинг EcoFlow запущено</b>\nПороги ${THRESHOLDS.join(' · ')}%  ·  тиша ${QUIET_FROM}:00–${QUIET_TO}:00\n${blocks}`, { keyboard: true })
+		await telegram(env, `📡 <b>Моніторинг EcoFlow запущено</b>\nПороги ${THRESHOLDS.join(' · ')}% · тиша ${QUIET_FROM}:00–${QUIET_TO}:00\n${table(DEVICES, readings, online)}`, { keyboard: true })
 		await env.POWER_KV.put('started:v3', String(Date.now()))
 	}
 	for (const d of DEVICES) {
