@@ -2,7 +2,7 @@
 // Маринка — офіційний IoT Open API; UPS (River 3) — MQTT застосунку EcoFlow.
 // Cron раз на хвилину, стан у KV (пишемо лише при змінах, щоб влізти у free-ліміт).
 import { mqttCollect, MqttAuthError } from './mqtt'
-import { encodeRiver3Set, parseEcoflowPacket, type UpsPart } from './protobuf'
+import { encodeSetCommand, parseEcoflowPacket, type UpsPart } from './protobuf'
 
 type Env = {
 	POWER_KV: KVNamespace
@@ -85,25 +85,26 @@ async function ecoflowSet(env: Env, sn: string, params: Record<string, number | 
 // kind 'rest' — параметри IoT Open API; kind 'mqtt' — поле SetCommand (protobuf, однакове для DELTA 3 і River 3)
 type Action = { label: string; group: string; for: Device['via'] } & (
 	| { kind: 'rest'; params: Record<string, number> }
-	| { kind: 'mqtt'; field: number; value: number }
+	| { kind: 'mqtt'; fields: [number, number][] }
 )
 const ACTIONS: Record<string, Action> = {
 	// DELTA 3 (офіційний API)
 	max80: { label: '80%', group: '🔝 Ліміт заряду', for: 'rest', kind: 'rest', params: { cfgMaxChgSoc: 80 } },
 	max100: { label: '100%', group: '🔝 Ліміт заряду', for: 'rest', kind: 'rest', params: { cfgMaxChgSoc: 100 } },
-	ac500: { label: '500 Вт', group: '🔌 Вхідна потужність', for: 'rest', kind: 'mqtt', field: 54, value: 500 }, // API ігнорує → MQTT
-	ac1000: { label: '1 кВт', group: '🔌 Вхідна потужність', for: 'rest', kind: 'mqtt', field: 54, value: 1000 }, // API ігнорує → MQTT
-	ac2000: { label: '2 кВт', group: '🔌 Вхідна потужність', for: 'rest', kind: 'mqtt', field: 54, value: 2000 }, // API ігнорує → MQTT
+	ac500: { label: '500 Вт', group: '🔌 Вхідна потужність', for: 'rest', kind: 'mqtt', fields: [[54, 500], [125, 0]] }, // API ігнорує; 125=0 — «застосувати»
+	ac1000: { label: '1 кВт', group: '🔌 Вхідна потужність', for: 'rest', kind: 'mqtt', fields: [[54, 1000], [125, 0]] }, // API ігнорує; 125=0 — «застосувати»
+	ac2000: { label: '2 кВт', group: '🔌 Вхідна потужність', for: 'rest', kind: 'mqtt', fields: [[54, 2000], [125, 0]] }, // API ігнорує; 125=0 — «застосувати»
 	// River 3 (MQTT; макс. вхід від мережі ~305 Вт)
-	rmax80: { label: '80%', group: '🔝 Ліміт заряду', for: 'mqtt', kind: 'mqtt', field: 33, value: 80 },
-	rmax100: { label: '100%', group: '🔝 Ліміт заряду', for: 'mqtt', kind: 'mqtt', field: 33, value: 100 },
-	rac100: { label: '100 Вт', group: '🔌 Вхідна потужність', for: 'mqtt', kind: 'mqtt', field: 54, value: 100 },
-	rac200: { label: '200 Вт', group: '🔌 Вхідна потужність', for: 'mqtt', kind: 'mqtt', field: 54, value: 200 },
-	rac300: { label: '300 Вт', group: '🔌 Вхідна потужність', for: 'mqtt', kind: 'mqtt', field: 54, value: 300 },
+	rmax80: { label: '80%', group: '🔝 Ліміт заряду', for: 'mqtt', kind: 'mqtt', fields: [[33, 80]] },
+	rmax100: { label: '100%', group: '🔝 Ліміт заряду', for: 'mqtt', kind: 'mqtt', fields: [[33, 100]] },
+	rac100: { label: '100 Вт', group: '🔌 Вхідна потужність', for: 'mqtt', kind: 'mqtt', fields: [[54, 100]] },
+	rac200: { label: '200 Вт', group: '🔌 Вхідна потужність', for: 'mqtt', kind: 'mqtt', fields: [[54, 200]] },
+	rac300: { label: '300 Вт', group: '🔌 Вхідна потужність', for: 'mqtt', kind: 'mqtt', fields: [[54, 300]] },
 }
 
-// Запис у River 3 через MQTT застосунку; успіх — якщо станція відповіла set_reply
-async function mqttSet(env: Env, sn: string, field: number, value: number) {
+// Запис через MQTT застосунку. Підтвердження — відповідь set_reply від станції.
+// Станції відповідають не завжди (команда при цьому застосовується), тому без відповіді — «надіслано», а не помилка.
+async function mqttSet(env: Env, sn: string, fields: [number, number][]): Promise<boolean> {
 	const a = await appAuth(env)
 	let replied = false
 	await mqttCollect({
@@ -113,14 +114,15 @@ async function mqttSet(env: Env, sn: string, field: number, value: number) {
 		password: a.password,
 		clientId: `ANDROID_${crypto.randomUUID().replace(/-/g, '').toUpperCase()}_${a.userId}`,
 		topics: [`/app/${a.userId}/${sn}/thing/property/set_reply`],
-		publish: [{ topic: `/app/${a.userId}/${sn}/thing/property/set`, payload: encodeRiver3Set(sn, field, value) }],
+		publish: [{ topic: `/app/${a.userId}/${sn}/thing/property/set`, payload: encodeSetCommand(sn, fields) }],
 		timeoutMs: 8000,
 		onMessage: () => (replied = true),
 	})
-	if (!replied) throw new Error('станція не підтвердила команду за 8 с')
+	return replied
 }
 
-const runAction = (env: Env, d: Device, a: Action) => (a.kind === 'rest' ? ecoflowSet(env, d.sn, a.params) : mqttSet(env, d.sn, a.field, a.value))
+// true — підтверджено; false — надіслано без підтвердження
+const runAction = async (env: Env, d: Device, a: Action) => (a.kind === 'rest' ? (await ecoflowSet(env, d.sn, a.params), true) : mqttSet(env, d.sn, a.fields))
 
 // ── MQTT застосунку (для River 3) ───────────────────────────────
 type AppAuth = { host: string; port: number; username: string; password: string; userId: string }
@@ -529,8 +531,9 @@ async function handleUpdate(env: Env, update: any) {
 			await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text: 'Надсилаю команду…' }).catch(() => {})
 			let note: string
 			try {
-				await runAction(env, d, action)
-				note = `✅ ${d.name}: ${action.group.replace(/^\S+\s/, '').toLowerCase()} ${action.label}`
+				const confirmed = await runAction(env, d, action)
+				const what = `${d.name}: ${action.group.replace(/^\S+\s/, '').toLowerCase()} ${action.label}`
+				note = confirmed ? `✅ ${what}` : `📤 ${what} — надіслано, станція не підтвердила. Перевір у застосунку`
 			} catch (e) {
 				console.error('set', e)
 				note = `⚠️ Не вдалося: ${String(e).replace(/^Error:\s*/, '').slice(0, 150)}`

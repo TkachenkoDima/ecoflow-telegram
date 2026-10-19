@@ -124,9 +124,11 @@ const varint = (n: number) => {
 const fVar = (field: number, n: number) => [...varint((field << 3) | 0), ...varint(n)]
 const fBytes = (field: number, b: number[]) => [...varint((field << 3) | 2), ...varint(b.length), ...b]
 
-// River3SetCommand: одне поле int32 (напр. 33 = cms_max_chg_soc, 54 = plug_in_info_ac_in_chg_pow_max)
-export function encodeRiver3Set(sn: string, field: number, value: number): Uint8Array {
-	const pdata = fVar(field, value)
+// SetCommand (River 3 / DELTA 3): пари [поле, значення] int32
+// напр. [[33, 80]] = ліміт заряду 80%; [[54, 500], [125, 0]] = вхід AC 500 Вт для DELTA 3
+// (поле 125 = 0 — «застосувати», без нього DELTA 3 мовчки ігнорує поле 54; так шле застосунок)
+export function encodeSetCommand(sn: string, fields: [number, number][]): Uint8Array {
+	const pdata = fields.flatMap(([f, v]) => fVar(f, v))
 	const header = [
 		...fBytes(1, pdata), // pdata
 		...fVar(2, 32), // src
