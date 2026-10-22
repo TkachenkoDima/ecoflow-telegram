@@ -656,7 +656,8 @@ const ruleWhat = (x: Automation) =>
 // Опис автоматики станції: які правила, коли спрацьовують, яке діє зараз
 function autoRules(d: Device, r: Reading | undefined, g: GridState | null, manualSince?: number) {
 	const rules = AUTOMATIONS.filter((x) => x.cmd === d.cmd || x.cmd === '*')
-	if (!rules.length) return ''
+	// у ручному режимі правила не працюють — не показуємо їх (режим видно по ✋ у «Макс. вхід»)
+	if (!rules.length || manualSince) return ''
 	const range = (a?: number, b?: number) => `${a ?? 0}–${b ?? 100}%`
 	// коротко: лише діапазон заряду → що виставляє; чинне зараз — жирним
 	const when = (x: Automation) =>
