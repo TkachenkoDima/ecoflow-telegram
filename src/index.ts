@@ -418,7 +418,7 @@ const isQuiet = () => {
 	return QUIET_FROM < QUIET_TO ? h >= QUIET_FROM && h < QUIET_TO : h >= QUIET_FROM || h < QUIET_TO
 }
 
-type SendOpts = { chatId?: string | number; loud?: boolean; keyboard?: boolean; silent?: boolean }
+type SendOpts = { chatId?: string | number; loud?: boolean; keyboard?: boolean; silent?: boolean; forDevice?: string; replaceKey?: string }
 
 // HTML-повідомлення; уночі — без звуку (якщо не loud); кнопки лише на панелі стану
 // Явний роздільник у кінці кожного повідомлення, щоб сусідні не зливались
@@ -430,19 +430,34 @@ const chatIds = (env: Env) => env.TELEGRAM_CHAT_ID.split(',').map((x) => x.trim(
 const isOurChat = (env: Env, id: unknown) => chatIds(env).includes(String(id))
 
 // Відповідь у конкретний чат (o.chatId) або розсилка в усі групи; збій однієї групи не блокує інші
+// «Станція групи» — та, що закріплена через /pin; без /pin група отримує все
+const groupStation = async (env: Env, chatId: string | number) => (await env.POWER_KV.get<{ cmd: string }>(`pin:${chatId}`, 'json'))?.cmd
+
 async function telegram(env: Env, text: string, o: SendOpts = {}) {
-	const targets = o.chatId !== undefined ? [o.chatId] : chatIds(env)
+	let targets: (string | number)[] = o.chatId !== undefined ? [o.chatId] : chatIds(env)
+	if (o.chatId === undefined && o.forDevice) {
+		const st = await Promise.all(targets.map((id) => groupStation(env, id)))
+		targets = targets.filter((_, i) => !st[i] || st[i] === o.forDevice)
+		if (!targets.length) return
+	}
 	const results = await Promise.allSettled(
-		targets.map((chat_id) =>
-			tgCall(env, 'sendMessage', {
+		targets.map(async (chat_id) => {
+			const msg = await tgCall(env, 'sendMessage', {
 				chat_id,
 				text: `${text}\n${DIVIDER}`,
 				parse_mode: 'HTML',
 				link_preview_options: { is_disabled: true },
 				disable_notification: o.silent || (!o.loud && isQuiet()),
 				...(o.keyboard ? { reply_markup: KEYBOARD } : {}),
-			}),
-		),
+			})
+			// схема «лише останнє»: прибираємо попередній пуш цього ж типу
+			if (o.replaceKey && msg?.message_id) {
+				const key = `${o.replaceKey}:${chat_id}`
+				const prev = Number(await env.POWER_KV.get(key))
+				if (prev) await tgCall(env, 'deleteMessage', { chat_id, message_id: prev }).catch(() => {})
+				await env.POWER_KV.put(key, String(msg.message_id))
+			}
+		}),
 	)
 	const failed = results.filter((r) => r.status === 'rejected') as PromiseRejectedResult[]
 	for (const f of failed) console.error('telegram', f.reason)
@@ -533,24 +548,26 @@ async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel
 
 // ── Кнопки лише під останньою панеллю ──
 // id останньої панелі в кожному чаті тримаємо в Cache API (безкоштовно, не витрачає ліміт записів KV)
-const panelKey = (chatId: string | number) => new Request(`https://panel.local/${chatId}`)
+// id останньої панелі (відповідь на кнопку/команду) у KV — щоб видалити її, коли прийде нова
+const panelKey = (chatId: string | number) => `panel:${chatId}`
 const noKeyboard = (env: Env, chatId: string | number, messageId: number) =>
 	tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }).catch(() => {})
+// видалити повідомлення бота; якщо не вийшло (старше 48 год або немає прав) — хоча б прибрати кнопки
+const removeMsg = (env: Env, chatId: string | number, messageId: number) =>
+	tgCall(env, 'deleteMessage', { chat_id: chatId, message_id: messageId }).catch(() => noKeyboard(env, chatId, messageId))
 
-async function sendPanel(env: Env, chatId: string | number, p: Panel) {
-	const cache = caches.default
-	const prev = await cache.match(panelKey(chatId))
-	if (prev) await noKeyboard(env, chatId, Number(await prev.text()))
+async function sendPanel(env: Env, chatId: string | number, p: Panel, markup: object = KEYBOARD) {
+	const prev = Number(await env.POWER_KV.get(panelKey(chatId)))
 	const msg = await tgCall(env, 'sendMessage', {
 		chat_id: chatId,
 		text: `${p.text}\n${DIVIDER}`,
 		parse_mode: 'HTML',
 		link_preview_options: { is_disabled: true },
-		disable_notification: isQuiet(),
-		reply_markup: KEYBOARD,
+		disable_notification: true, // відповідь на дію — без звуку
+		reply_markup: markup,
 	})
-	if (msg?.message_id)
-		await cache.put(panelKey(chatId), new Response(String(msg.message_id), { headers: { 'Cache-Control': 'max-age=604800' } }))
+	if (prev && prev !== msg?.message_id && !(await isPinnedMsg(env, chatId, prev))) await removeMsg(env, chatId, prev)
+	if (msg?.message_id) await env.POWER_KV.put(panelKey(chatId), String(msg.message_id))
 }
 
 // ── Щохвилинна перевірка ────────────────────────────────────────
@@ -580,7 +597,7 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 				const rem = r.remMin !== null ? `⏳ Залишилось ≈ <b>${hhmm(r.remMin)}</b>` : r.gridIn ? '🔌 Від мережі' : '⏳ Час невідомий'
 				const load = r.loadW !== null ? `\n⚡ Споживання ${r.loadW} Вт` : ''
 				const custom = dev.messages?.[t] ? `\n💬 <i>${esc(dev.messages[t])}</i>` : ''
-				await telegram(env, `${socIcon(t)} <b>${esc(dev.name)} — ${r.soc}%</b>${custom}\n<code>${bar(r.soc)}</code>\n${rem}${load}`, { loud })
+				await telegram(env, `${socIcon(t)} <b>${esc(dev.name)} — ${r.soc}%</b>${custom}\n<code>${bar(r.soc)}</code>\n${rem}${load}`, { loud, forDevice: dev.cmd, replaceKey: `last:thr:${dev.cmd}` })
 				st.notified.push(...crossed)
 			}
 			st.notified = st.notified.filter((t) => r.soc < t + RESET_GAP)
@@ -599,23 +616,28 @@ async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<s
 	if (prev?.state === cur) return null
 	await env.POWER_KV.put('grid', JSON.stringify({ state: cur, since: now }))
 	if (!prev) return null // перший запуск — просто запам'ятали
-	const t = table(DEVICES, readings, online)
+	// кожній групі — таблиця лише її станції (або всіх, якщо станцію не закріплено)
+	const send = async (head: string) => {
+		for (const chatId of chatIds(env)) {
+			const st = await groupStation(env, chatId)
+			const devs = st ? DEVICES.filter((d) => d.cmd === st) : DEVICES
+			await telegram(env, `${head}\n\n${table(devs, readings, online)}`, { chatId, replaceKey: 'last:grid' }).catch((e) => console.error('grid push', chatId, e))
+		}
+	}
 	if (cur === 'OFF') {
 		// поточне відключення щойно почалось — рахуємо лише завершені сьогодні і додаємо його номером
 		const day = await outagesIn(env, dayStart(now), now, false)
 		const nth = day.count + 1
 		const before = day.ms ? ` · всього ${duration(day.ms)} без світла` : '' // включно з нічним хвостом з учора
-		await telegram(
-			env,
-			`<b>🕯 Світло пішло</b>   <i>${clock(now)}</i>\n💡 Було ${duration(now - prev.since)}\n📈 Сьогодні: ${nth}-е відключення${before}${await prevOutageLine(env)}\n\n${t}`,
+		await send(
+			`<b>🕯 Світло пішло</b>   <i>${clock(now)}</i>\n💡 Було ${duration(now - prev.since)}\n📈 Сьогодні: ${nth}-е відключення${before}${await prevOutageLine(env)}`,
 		)
 		return 'gridOff'
 	}
 	await logOutage(env, prev.since, now)
 	const day = await outagesIn(env, dayStart(now), now)
-	await telegram(
-		env,
-		`<b>💡 Світло повернулось</b>   <i>${clock(now)}</i>\n🕯 Не було ${duration(now - prev.since)}\n📈 Сьогодні: ${fmtOut(day)}${await prevOutageLine(env, true)}\n\n${t}`,
+	await send(
+		`<b>💡 Світло повернулось</b>   <i>${clock(now)}</i>\n🕯 Не було ${duration(now - prev.since)}\n📈 Сьогодні: ${fmtOut(day)}${await prevOutageLine(env, true)}`,
 	)
 	return 'gridOn'
 }
@@ -778,7 +800,7 @@ async function runAutomations(env: Env, readings: Map<string, Reading>, online: 
 				console.log('auto', d.name, r.soc, what) // успіх — без повідомлення, видно в картці станції
 			} else {
 				if (!rule.on) await env.POWER_KV.put(retryKey, String(Date.now()), { expirationTtl: 3600 })
-				await telegram(env, `🤖 ${esc(d.name)} → ${what}${why}: станція не підтвердила${rule.on ? '' : ', повторю за 30 хв'}`, { silent: true })
+				await telegram(env, `🤖 ${esc(d.name)} → ${what}${why}: станція не підтвердила${rule.on ? '' : ', повторю за 30 хв'}`, { silent: true, forDevice: d.cmd, replaceKey: 'last:auto' })
 			}
 		}
 	}
@@ -789,20 +811,48 @@ async function runAutomations(env: Env, readings: Map<string, Reading>, online: 
 // cron щохвилини редагує його (лише якщо текст змінився — це перевіряє сам Telegram).
 type Pin = { cmd: string; messageId: number }
 const pinKey = (chatId: string | number) => `pin:${chatId}`
+const isPinnedMsg = async (env: Env, chatId: string | number, messageId: number) =>
+	(await env.POWER_KV.get<Pin>(pinKey(chatId), 'json'))?.messageId === messageId
 
-const pinText = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState | null, now: number) => {
+// Стан «екрана» в закріпленому: що показано і яке меню кнопок. Живе VIEW_TTL_S, потім — картка станції групи
+type View = { body?: string; label?: string; menu?: string; at: number }
+const VIEW_TTL_S = 180
+const viewKey = (chatId: string | number) => `view:${chatId}`
+const getView = (env: Env, chatId: string | number) => env.POWER_KV.get<View>(viewKey(chatId), 'json')
+const saveView = (env: Env, chatId: string | number, v: View) => env.POWER_KV.put(viewKey(chatId), JSON.stringify(v), { expirationTtl: VIEW_TTL_S })
+const menuMarkup = (menu?: string) => {
+	if (menu === 'control') return CONTROL_KEYBOARD
+	const dev = menu?.startsWith('dev:') ? DEVICES.find((x) => x.cmd === menu.slice(4)) : undefined
+	return dev ? deviceKeyboard(dev) : KEYBOARD
+}
+
+// Перший рядок — це смужка вгорі чату: завжди станція групи
+const pinFirstLine = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState | null, now: number) => {
 	let first: string
 	if (!isOnline) first = `⚫️ ${d.name} офлайн`
 	else if (!r) first = `❔ ${d.name} — немає даних`
-	else {
-		const state = r.remMin !== null ? ` · ⏳ ${hhmm(r.remMin)}` : ''
-		first = `${socIcon(r.soc)} ${d.name} ${r.soc}%${state}`
-	}
+	else first = `${socIcon(r.soc)} ${d.name} ${r.soc}%${r.remMin !== null ? ` · ⏳ ${hhmm(r.remMin)}` : ''}`
 	const light = !g ? '' : g.state === 'ON' ? ' · 💡' : ` · 🕯 ${duration(now - g.since)}`
-	// повна картка під першим рядком — видно, якщо натиснути на смужку
-	return `${esc(first + light)}\n\n${card(d, r, isOnline, g, now)}\n\n<i>Оновлюється щохвилини · ${clock(now)}</i>`
+	return esc(first + light)
 }
 
+const pinBody = (line1: string, body: string, v: View | null, d: Device, now: number) => {
+	const footer = v?.body
+		? `<i>👁 ${esc(v.label ?? '')} · о ${clock(v.at + VIEW_TTL_S * 1000)} повернусь до «${esc(d.name)}»</i>`
+		: `<i>Оновлюється щохвилини · ${clock(now)}</i>`
+	return `${line1}\n\n${v?.body ?? body}\n\n${footer}`
+}
+
+async function editPinned(env: Env, chatId: string | number, pin: Pin, text: string, markup: object) {
+	await tgCall(env, 'editMessageText', { chat_id: chatId, message_id: pin.messageId, text, parse_mode: 'HTML', reply_markup: markup }).catch(async (e) => {
+		const err = String(e)
+		if (err.includes('message is not modified')) return
+		console.error('pin', chatId, err)
+		if (err.includes('message to edit not found')) await env.POWER_KV.delete(pinKey(chatId)) // повідомлення видалили
+	})
+}
+
+// Cron: щохвилини оновлюємо смужку і (якщо нічого не відкрито) картку станції групи
 async function updatePins(env: Env, readings: Map<string, Reading>, online: Map<string, boolean>) {
 	const g = await env.POWER_KV.get<GridState>('grid', 'json')
 	const now = Date.now()
@@ -818,18 +868,28 @@ async function updatePins(env: Env, readings: Map<string, Reading>, online: Map<
 			r.acMax ??= c.acMax
 			r.minDsg ??= c.minDsg
 		}
-		await tgCall(env, 'editMessageText', {
-			chat_id: chatId,
-			message_id: pin.messageId,
-			text: pinText(d, readings.get(d.sn), online.get(d.sn)!, g, now),
-			parse_mode: 'HTML',
-		}).catch(async (e) => {
-			const err = String(e)
-			if (err.includes('message is not modified')) return
-			console.error('pin', chatId, err)
-			if (err.includes('message to edit not found')) await env.POWER_KV.delete(pinKey(chatId)) // повідомлення видалили
-		})
+		const v = await getView(env, chatId)
+		const line1 = pinFirstLine(d, r, online.get(d.sn)!, g, now)
+		await editPinned(env, chatId, pin, pinBody(line1, card(d, r, online.get(d.sn)!, g, now), v, d, now), menuMarkup(v?.menu))
 	}
+}
+
+// Натискання в закріпленому: показуємо результат прямо в ньому (новіх повідомлень немає)
+async function showInPinned(env: Env, chatId: string | number, pin: Pin, line1: string, upd: { body?: string; label?: string; menu?: string; home?: boolean }) {
+	const prev = upd.home ? null : await getView(env, chatId) // «Головна» — скидаємо все до картки станції групи
+	const v: View = { body: upd.body ?? prev?.body, label: upd.label ?? prev?.label, menu: upd.menu ?? prev?.menu, at: upd.body ? Date.now() : (prev?.at ?? Date.now()) }
+	if (!v.body && (!v.menu || v.menu === 'main')) await env.POWER_KV.delete(viewKey(chatId))
+	else await saveView(env, chatId, v)
+	const d = DEVICES.find((x) => x.cmd === pin.cmd)!
+	const now = Date.now()
+	let body = ''
+	if (!v.body || !line1) {
+		const { online, readings } = await readAll(env, [d], true)
+		const g = await env.POWER_KV.get<GridState>('grid', 'json')
+		body = card(d, readings.get(d.sn), online.get(d.sn)!, g, now)
+		line1 = pinFirstLine(d, readings.get(d.sn), online.get(d.sn)!, g, now)
+	}
+	await editPinned(env, chatId, pin, pinBody(line1, body, v.body ? v : null, d, now), menuMarkup(v.menu))
 }
 
 async function pinCommand(env: Env, chatId: number | string, arg: string | undefined): Promise<string> {
@@ -841,13 +901,16 @@ async function pinCommand(env: Env, chatId: number | string, arg: string | undef
 	}
 	const d = DEVICES.find((x) => x.cmd === arg.toLowerCase())
 	if (!d) return `Не знаю станцію «${esc(arg)}». Доступні: ${DEVICES.map((x) => x.cmd).join(', ')}`
-	const { online, readings } = await readAll(env, [d])
+	const { online, readings } = await readAll(env, [d], true)
 	const g = await env.POWER_KV.get<GridState>('grid', 'json')
+	const now = Date.now()
+	const r = readings.get(d.sn)
 	const msg = await tgCall(env, 'sendMessage', {
 		chat_id: chatId,
-		text: pinText(d, readings.get(d.sn), online.get(d.sn)!, g, Date.now()),
+		text: pinBody(pinFirstLine(d, r, online.get(d.sn)!, g, now), card(d, r, online.get(d.sn)!, g, now), null, d, now),
 		parse_mode: 'HTML',
 		disable_notification: true,
+		reply_markup: KEYBOARD,
 	})
 	try {
 		await tgCall(env, 'pinChatMessage', { chat_id: chatId, message_id: msg.message_id, disable_notification: true })
@@ -904,12 +967,20 @@ async function handleUpdate(env: Env, update: any) {
 		const chatId = cb.message?.chat?.id
 		const ours = isOurChat(env, chatId)
 		const data = String(cb.data)
+		const pin = ours ? await env.POWER_KV.get<Pin>(pinKey(chatId), 'json') : null
+		if (pin && pin.messageId === cb.message?.message_id) return pinnedCallback(env, cb, chatId, pin, data)
 		// Навігація між «папками» — міняємо лише кнопки під тим самим повідомленням
 		if (data === 'noop' || data.startsWith('menu:')) {
 			await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id }).catch(() => {})
 			if (!ours || data === 'noop') return
 			const dev = data.startsWith('menu:dev:') ? DEVICES.find((x) => x.cmd === data.slice(9)) : undefined
 			const markup = dev ? deviceKeyboard(dev) : data === 'menu:control' ? CONTROL_KEYBOARD : KEYBOARD
+			// Закріплене повідомлення бот оновлює щохвилини — меню з нього відкриваємо окремим повідомленням
+			if (await isPinnedMsg(env, chatId, cb.message.message_id)) {
+				if (data === 'menu:main') return
+				await sendPanel(env, chatId, { text: `⚙️ <b>Керування${dev ? ' · ' + esc(dev.name) : ''}</b>` }, markup).catch((e) => console.error('menu', e))
+				return
+			}
 			await tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: cb.message.message_id, reply_markup: markup }).catch(() => {})
 			return
 		}
@@ -927,28 +998,12 @@ async function handleUpdate(env: Env, update: any) {
 			const action = ACTIONS[actionId]
 			if (!d || !action || action.for !== d.via) return
 			await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text: 'Надсилаю команду…' }).catch(() => {})
-			let note: string
-			try {
-				const confirmed = await runAction(env, d, action)
-				const f = action.kind === 'mqtt' ? new Map(action.fields) : null
-				const maxChg = action.kind === 'rest' ? action.params.cfgMaxChgSoc : f?.get(33)
-				const acMax = action.kind === 'rest' ? action.params.cfgPlugInInfoAcInChgPowMax : f?.get(54)
-				const minDsg = action.kind === 'rest' ? action.params.cfgMinDsgSoc : f?.get(34)
-				if (confirmed) await saveSettings(d.sn, { maxChg, acMax, minDsg }, true)
-				// ручна дія має пріоритет над автоматизаціями
-				if (AUTOMATIONS.some((r) => r.cmd === d.cmd || r.cmd === '*')) await setManual(env, d.sn)
-				const what = `${d.name}: ${action.group.replace(/^\S+\s/, '').toLowerCase()} ${action.label}`
-				note = confirmed ? `✅ ${what}` : `📤 ${what} — надіслано, станція не підтвердила. Перевір у застосунку`
-			} catch (e) {
-				console.error('set', e)
-				note = `⚠️ Не вдалося: ${String(e).replace(/^Error:\s*/, '').slice(0, 150)}`
-			}
+			const note = await applyAction(env, d, action)
 			// якщо нове значення вже видно — пауза не потрібна; інакше даємо станції 2 с (вкладаємось у ~30 с ліміту Cloudflare)
 			if (!note.startsWith('✅')) await new Promise((r) => setTimeout(r, 2000))
 			const panel = await render(env, d.cmd)
 			if (panel) {
 				panel.text = `${esc(note)}\n\n${panel.text}`
-				await noKeyboard(env, chatId, cb.message.message_id)
 				await sendPanel(env, chatId, panel)
 			}
 			return
@@ -958,7 +1013,7 @@ async function handleUpdate(env: Env, update: any) {
 		const panel = await render(env, data)
 		if (!panel) return
 		// Нове повідомлення з кнопками; старе лишається в історії, з нього прибираємо лише кнопки
-		await noKeyboard(env, chatId, cb.message.message_id) // на випадок, якщо кеш порожній
+
 		await sendPanel(env, chatId, panel)
 		return
 	}
@@ -968,17 +1023,78 @@ async function handleUpdate(env: Env, update: any) {
 	if (!cmd) return
 	if (!isOurChat(env, msg.chat.id)) return // лише наші групи
 	if (cmd === 'pin' || cmd === 'unpin') {
+		await removeUserMsg(env, msg)
 		if (cmd === 'pin' && !m?.[3]) {
-			await telegram(env, `📌 Вкажіть станцію: ${DEVICES.map((x) => `/pin ${x.cmd}`).join(' · ')}`, { chatId: msg.chat.id })
+			await sendPanel(env, msg.chat.id, { text: `📌 Вкажіть станцію: ${DEVICES.map((x) => `/pin ${x.cmd}`).join(' · ')}` })
 			return
 		}
 		const reply = await pinCommand(env, msg.chat.id, cmd === 'pin' ? m?.[3] : undefined)
-		if (reply) await telegram(env, reply, { chatId: msg.chat.id })
+		if (reply) await sendPanel(env, msg.chat.id, { text: reply })
 		return
 	}
 	const panel = await render(env, cmd)
-	if (panel) await sendPanel(env, msg.chat.id, panel)
+	if (!panel) return
+	await removeUserMsg(env, msg)
+	const pin = await env.POWER_KV.get<Pin>(pinKey(msg.chat.id), 'json')
+	if (pin) return showInPinned(env, msg.chat.id, pin, '', { body: panel.text, label: labelFor(cmd) })
+	await sendPanel(env, msg.chat.id, panel)
 }
+
+// ── Кнопки під закріпленим: результат — у ньому ж, без нових повідомлень ──
+const labelFor = (data: string) =>
+	data === 'status' ? 'Усі станції' : data === 'stats' ? 'Статистика' : data === 'help' ? 'Команди' : (DEVICES.find((d) => d.cmd === data)?.name ?? data)
+
+async function pinnedCallback(env: Env, cb: any, chatId: number | string, pin: Pin, data: string) {
+	const line1 = esc(String(cb.message?.text ?? '').split('\n')[0]) // поточна смужка — до наступного оновлення
+	const answer = (text?: string) => tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text }).catch(() => {})
+	if (data === 'noop') return answer()
+	if (data.startsWith('menu:')) {
+		await answer()
+		const menu = data === 'menu:main' ? 'main' : data === 'menu:control' ? 'control' : `dev:${data.slice(9)}`
+		return showInPinned(env, chatId, pin, line1, { menu, home: menu === 'main' })
+	}
+	if (data.startsWith('auto:')) {
+		const d = DEVICES.find((x) => x.cmd === data.slice(5))
+		if (d) await clearManual(env, d.sn)
+		await answer(d ? `🤖 ${d.name}: автоматизації знову працюють` : '')
+		return showInPinned(env, chatId, pin, line1, { menu: 'main' })
+	}
+	if (data.startsWith('set:')) {
+		const [, cmd, actionId] = data.split(':')
+		const d = DEVICES.find((x) => x.cmd === cmd)
+		const action = ACTIONS[actionId]
+		if (!d || !action || action.for !== d.via) return answer()
+		await answer('Надсилаю команду…')
+		const note = await applyAction(env, d, action)
+		if (!note.startsWith('✅')) await new Promise((r) => setTimeout(r, 2000))
+		const panel = await render(env, d.cmd)
+		return showInPinned(env, chatId, pin, line1, { body: `${esc(note)}\n\n${panel?.text ?? ''}`, label: d.name, menu: `dev:${d.cmd}` })
+	}
+	await answer('Оновлюю…')
+	const panel = await render(env, data)
+	if (panel) await showInPinned(env, chatId, pin, line1, { body: panel.text, label: labelFor(data) })
+}
+
+// Ручна дія з «Керування»: виконати, запам'ятати, увімкнути ручний режим; повертає текст результату
+async function applyAction(env: Env, d: Device, action: Action): Promise<string> {
+	try {
+		const confirmed = await runAction(env, d, action)
+		const f = action.kind === 'mqtt' ? new Map(action.fields) : null
+		const maxChg = action.kind === 'rest' ? action.params.cfgMaxChgSoc : f?.get(33)
+		const acMax = action.kind === 'rest' ? action.params.cfgPlugInInfoAcInChgPowMax : f?.get(54)
+		const minDsg = action.kind === 'rest' ? action.params.cfgMinDsgSoc : f?.get(34)
+		if (confirmed) await saveSettings(d.sn, { maxChg, acMax, minDsg }, true)
+		if (AUTOMATIONS.some((r) => r.cmd === d.cmd || r.cmd === '*')) await setManual(env, d.sn) // ручне — пріоритетніше
+		const what = `${d.name}: ${action.group.replace(/^\S+\s/, '').toLowerCase()} ${action.label}`
+		return confirmed ? `✅ ${what}` : `📤 ${what} — надіслано, станція не підтвердила. Перевір у застосунку`
+	} catch (e) {
+		console.error('set', e)
+		return `⚠️ Не вдалося: ${String(e).replace(/^Error:\s*/, '').slice(0, 150)}`
+	}
+}
+
+// Команду користувача прибираємо, щоб не засмічувати чат (потрібне право адміна «Видаляти повідомлення»)
+const removeUserMsg = (env: Env, msg: any) => tgCall(env, 'deleteMessage', { chat_id: msg.chat.id, message_id: msg.message_id }).catch(() => {})
 
 export default {
 	async scheduled(_event, env, ctx) {
