@@ -640,6 +640,19 @@ const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState
 	return `${socIcon(r.soc)} ${head}\n<code>${bar(r.soc)}</code>  <b>${r.soc}%</b>\n${time}${load}${lim}${foot}`
 }
 
+// Чи діє правило зараз (за зарядом і світлом); правила «on: подія» — лише в момент події
+const ruleActive = (x: Automation, r: Reading | undefined, g: GridState | null) =>
+	!!r &&
+	!x.on &&
+	(x.socAtLeast === undefined || r.soc >= x.socAtLeast) &&
+	(x.socAtMost === undefined || r.soc <= x.socAtMost) &&
+	(!x.grid || g?.state === x.grid) &&
+	(!x.gridOnForH || (g?.state === 'ON' && Date.now() - g.since >= x.gridOnForH * 3600_000))
+const ruleWhat = (x: Automation) =>
+	[x.set.acMax !== undefined ? `вхід ${x.set.acMax >= 1000 ? x.set.acMax / 1000 + ' кВт' : x.set.acMax + ' Вт'}` : '', x.set.maxChg !== undefined ? `ліміт ${x.set.maxChg}%` : '']
+		.filter(Boolean)
+		.join(', ')
+
 // Опис автоматики станції: які правила, коли спрацьовують, яке діє зараз
 function autoRules(d: Device, r: Reading | undefined, g: GridState | null, manualSince?: number) {
 	const rules = AUTOMATIONS.filter((x) => x.cmd === d.cmd || x.cmd === '*')
@@ -648,17 +661,8 @@ function autoRules(d: Device, r: Reading | undefined, g: GridState | null, manua
 	// коротко: лише діапазон заряду → що виставляє; чинне зараз — жирним
 	const when = (x: Automation) =>
 		x.on ? (x.on === 'gridOn' ? 'світло з\'явилось' : 'світло зникло') : range(x.socAtLeast, x.socAtMost)
-	const what = (x: Automation) =>
-		[x.set.acMax !== undefined ? `вхід ${x.set.acMax >= 1000 ? x.set.acMax / 1000 + ' кВт' : x.set.acMax + ' Вт'}` : '', x.set.maxChg !== undefined ? `ліміт ${x.set.maxChg}%` : '']
-			.filter(Boolean)
-			.join(', ')
-	const active = (x: Automation) =>
-		!!r &&
-		!x.on &&
-		(x.socAtLeast === undefined || r.soc >= x.socAtLeast) &&
-		(x.socAtMost === undefined || r.soc <= x.socAtMost) &&
-		(!x.grid || g?.state === x.grid) &&
-		(!x.gridOnForH || (g?.state === 'ON' && Date.now() - g.since >= x.gridOnForH * 3600_000))
+	const what = ruleWhat
+	const active = (x: Automation) => ruleActive(x, r, g)
 	const lines = rules.map((x) => {
 		const line = `${when(x)} → ${what(x)}`
 		return !manualSince && active(x) ? `<b>${line}</b>` : line
@@ -667,7 +671,11 @@ function autoRules(d: Device, r: Reading | undefined, g: GridState | null, manua
 	// ліміт заряду нижче порогу правила — до нього заряд не дійде
 	const cap = r?.maxChg
 	const dead = cap !== undefined ? rules.filter((x) => x.set.acMax !== undefined && (x.socAtLeast ?? 0) >= cap) : []
-	const capNote = dead.length ? `\n<i>Ліміт ${cap}%: правила від ${Math.min(...dead.map((x) => x.socAtLeast ?? 0))}% зайві</i>` : ''
+	// короткими рядками, щоб не розширювати екран
+	const deadRanges = dead.map((x) => range(x.socAtLeast, x.socAtMost))
+	const capNote = dead.length
+		? `\n\n<i>⚠️ Ліміт заряду ${cap}%\nвище заряд не піде,\n${dead.length === 1 ? `правило ${deadRanges[0]} не діє` : `не діють правила:\n${deadRanges.join(', ')}`}</i>`
+		: ''
 	return `${head}
 ${lines.join('\n')}${capNote}`
 }
@@ -1473,8 +1481,16 @@ async function pinnedCallback(env: Env, cb: any, chatId: number | string, pin: P
 	if (data.startsWith('auto:')) {
 		const d = DEVICES.find((x) => x.cmd === data.slice(5))
 		if (d) await clearManual(env, d.sn)
-		await answer(d ? `🤖 ${d.name}: автоматизації знову працюють` : '')
-		return d ? showInPinned(env, chatId, pin, { dev: d.cmd, note: `🤖 ${d.name}: автоматика знову керує`, menu: 'main' }) : undefined
+		await answer()
+		if (!d) return
+		await instant(KEYBOARD, `${d.name}: авто`)
+		// не чекаємо cron — застосовуємо чинне правило одразу
+		const { readings, online } = await readCached(env, [d], false)
+		const g = await env.POWER_KV.get<GridState>('grid', 'json')
+		const rule = AUTOMATIONS.find((x) => (x.cmd === d.cmd || x.cmd === '*') && ruleActive(x, readings.get(d.sn), g))
+		await runAutomations(env, readings, online, null).catch((e) => console.error('automations', e))
+		const note = `🤖 Авто режим\n${rule ? `${ruleWhat(rule)} (${rule.socAtLeast ?? 0}–${rule.socAtMost ?? 100}%)` : 'зараз жодне правило не діє'}`
+		return showInPinned(env, chatId, pin, { dev: d.cmd, note, menu: 'main' })
 	}
 	if (data.startsWith('set:')) {
 		const [, cmd, actionId] = data.split(':')
