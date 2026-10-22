@@ -709,6 +709,8 @@ async function syncCommands(env: Env) {
 		{ command: 'status', description: 'Усі станції: заряд і час роботи' },
 		...DEVICES.map((d) => ({ command: d.cmd, description: d.name })),
 		{ command: 'stats', description: 'Статистика відключень' },
+		{ command: 'pin', description: 'Закріпити смужку стану: /pin marinka' },
+		{ command: 'unpin', description: 'Прибрати закріплену смужку' },
 		{ command: 'help', description: 'Список команд' },
 	]
 	const json = JSON.stringify(commands)
@@ -782,6 +784,81 @@ async function runAutomations(env: Env, readings: Map<string, Reading>, online: 
 	}
 }
 
+// ── Закріплена «смужка» стану станції в групі ──────────────────
+// /pin <станція> — закріпити, /unpin — прибрати. Перший рядок повідомлення видно у смужці вгорі чату;
+// cron щохвилини редагує його (лише якщо текст змінився — це перевіряє сам Telegram).
+type Pin = { cmd: string; messageId: number }
+const pinKey = (chatId: string | number) => `pin:${chatId}`
+
+const pinText = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState | null, now: number) => {
+	let first: string
+	if (!isOnline) first = `⚫️ ${d.name} офлайн`
+	else if (!r) first = `❔ ${d.name} — немає даних`
+	else {
+		const state = r.remMin !== null ? ` · ⏳ ${hhmm(r.remMin)}` : ''
+		first = `${socIcon(r.soc)} ${d.name} ${r.soc}%${state}`
+	}
+	const light = !g ? '' : g.state === 'ON' ? ' · 💡' : ` · 🕯 ${duration(now - g.since)}`
+	// повна картка під першим рядком — видно, якщо натиснути на смужку
+	return `${esc(first + light)}\n\n${card(d, r, isOnline, g, now)}\n\n<i>Оновлюється щохвилини · ${clock(now)}</i>`
+}
+
+async function updatePins(env: Env, readings: Map<string, Reading>, online: Map<string, boolean>) {
+	const g = await env.POWER_KV.get<GridState>('grid', 'json')
+	const now = Date.now()
+	for (const chatId of chatIds(env)) {
+		const pin = await env.POWER_KV.get<Pin>(pinKey(chatId), 'json')
+		if (!pin) continue
+		const d = DEVICES.find((x) => x.cmd === pin.cmd)
+		if (!d) continue
+		const r = readings.get(d.sn)
+		const c = r ? await getSettings(d.sn) : null
+		if (r && c) {
+			r.maxChg ??= c.maxChg
+			r.acMax ??= c.acMax
+			r.minDsg ??= c.minDsg
+		}
+		await tgCall(env, 'editMessageText', {
+			chat_id: chatId,
+			message_id: pin.messageId,
+			text: pinText(d, readings.get(d.sn), online.get(d.sn)!, g, now),
+			parse_mode: 'HTML',
+		}).catch(async (e) => {
+			const err = String(e)
+			if (err.includes('message is not modified')) return
+			console.error('pin', chatId, err)
+			if (err.includes('message to edit not found')) await env.POWER_KV.delete(pinKey(chatId)) // повідомлення видалили
+		})
+	}
+}
+
+async function pinCommand(env: Env, chatId: number | string, arg: string | undefined): Promise<string> {
+	const old = await env.POWER_KV.get<Pin>(pinKey(chatId), 'json')
+	if (old) await tgCall(env, 'unpinChatMessage', { chat_id: chatId, message_id: old.messageId }).catch(() => {})
+	if (!arg) {
+		await env.POWER_KV.delete(pinKey(chatId))
+		return old ? '📌 Смужку прибрано' : '📌 Закріпленої смужки не було'
+	}
+	const d = DEVICES.find((x) => x.cmd === arg.toLowerCase())
+	if (!d) return `Не знаю станцію «${esc(arg)}». Доступні: ${DEVICES.map((x) => x.cmd).join(', ')}`
+	const { online, readings } = await readAll(env, [d])
+	const g = await env.POWER_KV.get<GridState>('grid', 'json')
+	const msg = await tgCall(env, 'sendMessage', {
+		chat_id: chatId,
+		text: pinText(d, readings.get(d.sn), online.get(d.sn)!, g, Date.now()),
+		parse_mode: 'HTML',
+		disable_notification: true,
+	})
+	try {
+		await tgCall(env, 'pinChatMessage', { chat_id: chatId, message_id: msg.message_id, disable_notification: true })
+	} catch (e) {
+		console.error('pinChatMessage', e)
+		return '⚠️ Не можу закріпити: зробіть бота адміністратором групи з правом «Закріплювати повідомлення» і повторіть /pin'
+	}
+	await env.POWER_KV.put(pinKey(chatId), JSON.stringify({ cmd: d.cmd, messageId: msg.message_id }))
+	return ''
+}
+
 async function run(env: Env) {
 	await syncCommands(env).catch((e) => console.error('commands', e))
 	const { online, readings } = await readAll(env, DEVICES, false, true)
@@ -799,12 +876,13 @@ async function run(env: Env) {
 	}
 	const event = await checkGrid(env, readings, online)
 	await runAutomations(env, readings, online, event).catch((e) => console.error('automations', e))
+	await updatePins(env, readings, online).catch((e) => console.error('pins', e))
 }
 
 // ── Telegram webhook: команди і кнопки ──────────────────────────
 async function helpText() {
 	const list = DEVICES.map((d) => `/${d.cmd} — ${esc(d.name)}`).join('\n')
-	return `<b>🤖 Команди</b>\n/status — усі станції\n${list}\n/stats — статистика відключень\n\nАбо кнопки нижче.`
+	return `<b>🤖 Команди</b>\n/status — усі станції\n${list}\n/stats — статистика відключень\n/pin &lt;станція&gt; — закріпити смужку стану (напр. /pin marinka)\n/unpin — прибрати смужку\n\nАбо кнопки нижче.`
 }
 
 async function render(env: Env, cmd: string): Promise<Panel | null> {
@@ -885,9 +963,19 @@ async function handleUpdate(env: Env, update: any) {
 		return
 	}
 	const msg = update?.message
-	const cmd = (msg?.text ?? '').match(/^\/(\w+)(@\w+)?(\s|$)/)?.[1]?.toLowerCase()
+	const m = (msg?.text ?? '').match(/^\/(\w+)(@\w+)?(?:\s+(\S+))?/)
+	const cmd = m?.[1]?.toLowerCase()
 	if (!cmd) return
 	if (!isOurChat(env, msg.chat.id)) return // лише наші групи
+	if (cmd === 'pin' || cmd === 'unpin') {
+		if (cmd === 'pin' && !m?.[3]) {
+			await telegram(env, `📌 Вкажіть станцію: ${DEVICES.map((x) => `/pin ${x.cmd}`).join(' · ')}`, { chatId: msg.chat.id })
+			return
+		}
+		const reply = await pinCommand(env, msg.chat.id, cmd === 'pin' ? m?.[3] : undefined)
+		if (reply) await telegram(env, reply, { chatId: msg.chat.id })
+		return
+	}
 	const panel = await render(env, cmd)
 	if (panel) await sendPanel(env, msg.chat.id, panel)
 }
