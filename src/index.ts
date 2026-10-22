@@ -660,7 +660,7 @@ function autoRules(d: Device, r: Reading | undefined, g: GridState | null, manua
 		const line = `${when(x)} → ${what(x)}`
 		return !manualSince && active(x) ? `<b>${line}</b>` : line
 	})
-	const head = manualSince ? `✋ Ручне з ${clock(manualSince)} — до «🤖 Авто»` : '🤖 Авто'
+	const head = manualSince ? '✋ Ручне' : '🤖 Авто'
 	return `${head}
 ${lines.join('\n')}`
 }
