@@ -51,6 +51,10 @@ export const PIN_TO_TOP = false
 // уночі (тихий режим) — о QUIET_TO:00 + PUSH_TTL_MIN хв, щоб уранці встигнути побачити нічні події
 export const PUSH_TTL_MIN = 3
 
+// Ширина «екрана» в символах (невидимий рядок унизу). Менше — вужча бульбашка на Telegram Desktop,
+// але найдовший рядок екрана має бути коротшим, інакше ширина знову «гулятиме»
+export const SCREEN_WIDTH = 23
+
 export const TIMEZONE = 'Europe/Kyiv'
 export const QUIET_FROM = 0 // тихий режим: повідомлення без звуку (крім найнижчого порогу)
 export const QUIET_TO = 8

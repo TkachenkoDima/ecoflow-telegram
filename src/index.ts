@@ -16,7 +16,7 @@ type Env = {
 	DEVICE_SNS: string // {"marinka": "D3M1…", "kate": "R655…"} — серійники не зберігаються в репо
 }
 
-import { API, AUTOMATIONS, DEVICES, PIN_TO_TOP, PUSH_TTL_MIN, GRID_SOURCE, MQTT_WAIT_MS, OFFLINE_ALERT_MIN, QUIET_FROM, QUIET_TO, RESET_GAP, THRESHOLDS, TIMEZONE, type Automation, type Device } from './config'
+import { API, AUTOMATIONS, DEVICES, PIN_TO_TOP, PUSH_TTL_MIN, SCREEN_WIDTH, GRID_SOURCE, MQTT_WAIT_MS, OFFLINE_ALERT_MIN, QUIET_FROM, QUIET_TO, RESET_GAP, THRESHOLDS, TIMEZONE, type Automation, type Device } from './config'
 
 // Підставляємо серійники з секрету DEVICE_SNS (за cmd станції)
 function initDevices(env: Env) {
@@ -612,13 +612,15 @@ const table = (devices: Device[], readings: Map<string, Reading>, online: Map<st
 			const r = readings.get(d.sn)
 			if (!online.get(d.sn)) return `⚫️ ${name} — офлайн`
 			if (!r) return `❔ ${name} — немає даних`
-			return `${socIcon(r.soc)} ${name}  <b>${r.soc}%</b>\n<code>${bar(r.soc)}</code>  ${stateLine(r)}`
+			const load = r.loadW !== null ? ` · ⚡ ${r.loadW} Вт` : ''
+			const st = r.remMin !== null ? `⏳ ${hhmm(r.remMin)}` : r.gridIn ? '🔌 від мережі' : '⏳ —'
+			return `${socIcon(r.soc)} ${name}  <b>${r.soc}%</b>${load}\n<code>${bar(r.soc)}</code>  ${st}`
 		})
 		.join('\n\n')
 
 // Рядок про світло — простим текстом під блоком
 const gridText = (g: GridState | null, now: number) =>
-	!g ? '' : g.state === 'ON' ? `💡 Світло є ${duration(now - g.since)} · з ${clock(g.since)}` : `🕯 Без світла ${duration(now - g.since)} · з ${clock(g.since)}`
+	!g ? '' : g.state === 'ON' ? `💡 Світло є ${hhmm((now - g.since) / 60_000)} · з ${clock(g.since)}` : `🕯 Без світла ${hhmm((now - g.since) / 60_000)} · з ${clock(g.since)}`
 
 // Детальна картка однієї станції: усе звичайним текстом, світло — окремим рядком знизу
 // mode — іконка замість 🔌 у «Макс. вхід»: хто ним зараз керує (🤖 авто / ✋ ручне)
@@ -665,7 +667,7 @@ function autoRules(d: Device, r: Reading | undefined, g: GridState | null, manua
 	// ліміт заряду нижче порогу правила — до нього заряд не дійде
 	const cap = r?.maxChg
 	const dead = cap !== undefined ? rules.filter((x) => x.set.acMax !== undefined && (x.socAtLeast ?? 0) >= cap) : []
-	const capNote = dead.length ? `\n<i>Ліміт заряду ${cap}% — правила від ${Math.min(...dead.map((x) => x.socAtLeast ?? 0))}% не знадобляться</i>` : ''
+	const capNote = dead.length ? `\n<i>Ліміт ${cap}%: правила від ${Math.min(...dead.map((x) => x.socAtLeast ?? 0))}% зайві</i>` : ''
 	return `${head}
 ${lines.join('\n')}${capNote}`
 }
@@ -767,21 +769,18 @@ async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<s
 			await telegram(env, `${head}\n\n${table(devs, readings, online)}`, { chatId, replaceKey: 'last:grid' }).catch((e) => console.error('grid push', chatId, e))
 		}
 	}
+	// підсумок за сьогодні — як у «📈 Статистика» (без «найчастіше»: за один день воно нічого не каже)
+	const today = async () => {
+		const S = await statsData(env)
+		const lines = S.summary(dayStart(now), now).filter((l) => !l.startsWith('🕐'))
+		return `\n\n📈 <b>Сьогодні</b>\n${lines.join('\n')}`
+	}
 	if (cur === 'OFF') {
-		// поточне відключення щойно почалось — рахуємо лише завершені сьогодні і додаємо його номером
-		const day = await outagesIn(env, dayStart(now), now, false)
-		const nth = day.count + 1
-		const before = day.ms ? ` · всього ${duration(day.ms)} без світла` : '' // включно з нічним хвостом з учора
-		await send(
-			`<b>🕯 Світло пішло</b>   <i>${clock(now)}</i>\n💡 Було ${duration(now - prev.since)}\n📈 Сьогодні: ${nth}-е відключення${before}${await prevOutageLine(env)}`,
-		)
+		await send(`<b>🕯 Світло пішло</b>   <i>${clock(now)}</i>\n💡 Було ${duration(now - prev.since)}${await today()}${await prevOutageLine(env)}`)
 		return 'gridOff'
 	}
 	await logOutage(env, prev.since, now)
-	const day = await outagesIn(env, dayStart(now), now)
-	await send(
-		`<b>💡 Світло повернулось</b>   <i>${clock(now)}</i>\n🕯 Не було ${duration(now - prev.since)}\n📈 Сьогодні: ${fmtOut(day)}${await prevOutageLine(env, true)}`,
-	)
+	await send(`<b>💡 Світло повернулось</b>   <i>${clock(now)}</i>\n🕯 Не було ${duration(now - prev.since)}${await today()}`)
 	return 'gridOn'
 }
 
@@ -812,28 +811,6 @@ const dayStart = (t: number) => {
 }
 const dateLabel = (t: number) => new Date(t).toLocaleDateString('uk-UA', { timeZone: TIMEZONE, day: '2-digit', month: '2-digit' })
 
-// Скільки разів і скільки часу не було світла в інтервалі [a, b)
-async function outagesIn(env: Env, a: number, b: number, includeCurrent = true) {
-	const log = (await env.POWER_KV.get<Outage[]>('outlog', 'json')) ?? []
-	const grid = await env.POWER_KV.get<GridState>('grid', 'json')
-	const all = [...log]
-	if (includeCurrent && grid?.state === 'OFF') all.push({ from: grid.since, to: Date.now() }) // поточне відключення
-	// count — відключення, що ПОЧАЛИСЬ у [a, b) (кожне рахується рівно один раз, у день початку);
-	// ms — фактичний час без світла в [a, b), включно з «хвостом» відключення, що почалось раніше (carryMs)
-	let count = 0,
-		ms = 0,
-		carryMs = 0
-	for (const o of all) {
-		const x = Math.max(o.from, a),
-			y = Math.min(o.to, b)
-		if (y <= x) continue
-		ms += y - x
-		if (o.from >= a) count++
-		else carryMs += y - x
-	}
-	return { count, ms, carryMs }
-}
-
 // «⏮ Попереднє: 2 год 5 хв (09:10–11:15)»; якщо не сьогодні — з датою
 async function prevOutageLine(env: Env, skipLast = false) {
 	const log = (await env.POWER_KV.get<Outage[]>('outlog', 'json')) ?? []
@@ -846,11 +823,6 @@ async function prevOutageLine(env: Env, skipLast = false) {
 
 const times = (n: number) =>
 	n % 10 === 1 && n % 100 !== 11 ? 'раз' : [2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100) ? 'рази' : 'разів'
-const fmtOut = (o: { count: number; ms: number; carryMs: number }) => {
-	if (!o.ms) return 'без відключень ✨'
-	const carry = o.carryMs ? ` (${o.count ? 'з них ' + duration(o.carryMs) + ' — ' : ''}нічне зі вчора)` : ''
-	return `${o.count} ${times(o.count)} · ${duration(o.ms)} без світла${carry}`
-}
 
 // ── Розділ «📈 Статистика»: тиждень / місяць / календар / день ──
 // callback_data: st:w:<зсув> тиждень · st:m:<зсув> місяць · st:c:<зсув> календар місяця · st:d:<рік>-<міс>-<день> день
@@ -917,15 +889,20 @@ async function statsData(env: Env) {
 		const span = end - Math.max(a, trackFrom)
 		if (span <= 0) return ['<i>немає даних</i>']
 		if (!o.ms) return ['Без відключень ✨']
-		const lines = [`Разом: ${o.count ? `${o.count} ${times(o.count)} · ` : ''}${duration(o.ms)}${o.count ? '' : ' (з попереднього дня)'} · світло ${Math.max(0, Math.round(100 - (o.ms / span) * 100))}% часу`]
+		// кожен показник — окремим рядком
+		const lines = [
+			...(o.count ? [`🔢 Відключень: ${o.count}`] : []),
+			`🕯 Без світла: ${duration(o.ms)}${o.count ? '' : ' (з учора)'}`,
+			`🔆 Зі світлом: ${Math.max(0, Math.round(100 - (o.ms / span) * 100))}% часу`,
+		]
 		const started = all.filter((x) => x.from >= a && x.from < end)
 		const longest = [...started].sort((x, y) => y.to - y.from - (x.to - x.from))[0]
 		if (longest && started.length > 1) {
 			const cur = grid?.state === 'OFF' && longest.from === grid.since
-			lines.push(`Найдовше: ${duration(longest.to - longest.from)} · ${dateLabel(longest.from)} ${clock(longest.from)}–${cur ? 'досі' : clock(longest.to)}`)
+			lines.push(`⏱ Найдовше: ${duration(longest.to - longest.from)}${end - a > 86400_000 + 3600_000 ? ` · ${dateLabel(longest.from)}` : ''}${cur ? ' (триває)' : ''}`)
 		}
 		const done = started.filter((x) => !(grid?.state === 'OFF' && x.from === grid.since))
-		if (done.length >= 2) lines.push(`Середнє: ${duration(done.reduce((s, x) => s + x.to - x.from, 0) / done.length)}`)
+		if (done.length >= 2) lines.push(`➗ Середнє: ${duration(done.reduce((s, x) => s + x.to - x.from, 0) / done.length)}`)
 		if (done.length >= 3) {
 			// хвилини без світла за годинами доби → найгірше 3-годинне вікно
 			const byHour = new Array(24).fill(0)
@@ -939,7 +916,7 @@ async function statsData(env: Env) {
 			const win = (h: number) => byHour[h] + byHour[(h + 1) % 24] + byHour[(h + 2) % 24]
 			let best = 0
 			for (let h = 1; h < 24; h++) if (win(h) > win(best)) best = h
-			lines.push(`Найчастіше без світла: ${pad2(best)}:00–${pad2((best + 3) % 24)}:00`)
+			lines.push(`🕐 Найчастіше: ${pad2(best)}:00–${pad2((best + 3) % 24)}:00`)
 		}
 		return lines
 	}
@@ -1037,7 +1014,7 @@ async function statsView(env: Env, data: string): Promise<{ text: string; markup
 		const grid: object[][] = [['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Нд'].map((x) => btn(x, 'noop'))]
 		for (let i = 0; i < days.length; i += 7) grid.push(days.slice(i, i + 7))
 		const title = `${MONTHS[p.m]} ${p.y}`
-		const text = `📅 <b>Календар</b> · ${title}\n\n<b>•</b> — були відключення. Оберіть день.\n\n${S.summary(a, b)[0]}`
+		const text = `📅 <b>Календар</b> · ${title}\n\n<b>•</b> — були відключення\n\n${S.summary(a, b).slice(0, 3).join('\n')}`
 		const markup = { inline_keyboard: [arrows('c', off, title, a > trackFrom), ...grid, NAV_BOTTOM(`st:m:${off}`)] }
 		return { text, markup }
 	}
@@ -1230,24 +1207,18 @@ async function screenText(line1: string, groupDev: Device, v: View | null, readi
 		content = await withAuto(groupDev)
 	}
 	// без верхнього рядка-статусу і без підпису «оновлюється щохвилини»: час оновлення — у заголовку картки
-	return padWidth(content)
+	return content
 }
 
-// Telegram Desktop розтягує повідомлення з кнопками на всю ширину, якщо текст вужчий за клавіатуру.
-// Добиваємо останній рядок невидимими символами (U+2800) до мінімальної ширини — на телефоні нічого не змінюється
-const MIN_LINE = 36
+// Однакова ширина «екрана» на всіх переходах: Telegram Desktop підганяє бульбашку під найширший рядок
+// (а якщо текст вужчий за кнопки — розтягує на всю ширину). Тому в кінець завжди йде невидимий рядок
+// фіксованої ширини (SCREEN_WIDTH символів U+2800), а всі рядки екранів — коротші за нього. На телефоні непомітно
 function padWidth(html: string) {
-	const plain = (l: string) => l.replace(/<[^>]+>/g, '').replace(/&[a-z]+;/g, '_')
-	const lines = html.split('\n')
-	const widest = Math.max(...lines.map((l) => [...plain(l)].length))
-	if (widest >= MIN_LINE) return html
-	const last = lines.length - 1
-	lines[last] += DIVIDER.repeat(MIN_LINE - [...plain(lines[last])].length)
-	return lines.join('\n')
+	return `${html}\n${DIVIDER.repeat(SCREEN_WIDTH)}`
 }
 
 async function editPinned(env: Env, chatId: string | number, pin: Pin, text: string, markup: object) {
-	await tgCall(env, 'editMessageText', { chat_id: chatId, message_id: pin.messageId, text, parse_mode: 'HTML', reply_markup: markup }).catch(async (e) => {
+	await tgCall(env, 'editMessageText', { chat_id: chatId, message_id: pin.messageId, text: padWidth(text), parse_mode: 'HTML', reply_markup: markup }).catch(async (e) => {
 		const err = String(e)
 		if (err.includes('message is not modified')) return
 		console.error('pin', chatId, err)
@@ -1321,7 +1292,7 @@ async function pinCommand(env: Env, chatId: number | string, arg: string | undef
 	const r = readings.get(d.sn)
 	const msg = await tgCall(env, 'sendMessage', {
 		chat_id: chatId,
-		text: await screenText(pinFirstLine(d, r, online.get(d.sn)!, g, now), d, null, readings, online, g, now),
+		text: padWidth(await screenText(pinFirstLine(d, r, online.get(d.sn)!, g, now), d, null, readings, online, g, now)),
 		parse_mode: 'HTML',
 		disable_notification: true,
 		reply_markup: KEYBOARD,
@@ -1476,7 +1447,7 @@ async function pinnedCallback(env: Env, cb: any, chatId: number | string, pin: P
 	// Миттєвий відгук: одразу міняємо кнопки (і показуємо «завантажую», якщо буде інший вміст), дані — слідом
 	const instant = (markup: object, loading?: string) =>
 		loading
-			? tgCall(env, 'editMessageText', { chat_id: chatId, message_id: pin.messageId, text: `⏳ ${esc(loading)} — завантажую…`, parse_mode: 'HTML', reply_markup: markup }).catch(() => {})
+			? tgCall(env, 'editMessageText', { chat_id: chatId, message_id: pin.messageId, text: padWidth(`⏳ ${esc(loading)}…`), parse_mode: 'HTML', reply_markup: markup }).catch(() => {})
 			: tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: pin.messageId, reply_markup: markup }).catch(() => {})
 	const nameOf = (cmd: string) => DEVICES.find((x) => x.cmd === cmd)?.name ?? cmd
 	if (data === 'noop') return answer()
@@ -1511,7 +1482,7 @@ async function pinnedCallback(env: Env, cb: any, chatId: number | string, pin: P
 		const action = ACTIONS[actionId]
 		if (!d || !action || action.for !== d.via) return answer()
 		await answer()
-		await instant(deviceKeyboard(d), `${d.name}: надсилаю «${action.label}»`)
+		await instant(deviceKeyboard(d), `${d.name}: ${action.label}`)
 		const note = await applyAction(env, d, action)
 		if (!note.startsWith('✅')) await new Promise((r) => setTimeout(r, 2000))
 		return showInPinned(env, chatId, pin, { dev: d.cmd, note, menu: `dev:${d.cmd}` })
@@ -1543,8 +1514,8 @@ async function applyAction(env: Env, d: Device, action: Action): Promise<string>
 		const rules = AUTOMATIONS.filter((r) => r.cmd === d.cmd || r.cmd === '*')
 		const conflicts = rules.some((r) => (acMax !== undefined && r.set.acMax !== undefined) || (maxChg !== undefined && r.set.maxChg !== undefined))
 		if (conflicts) await setManual(env, d.sn)
-		const what = `${d.name}: ${action.group.replace(/^\S+\s/, '').toLowerCase()} ${action.label}`
-		return confirmed ? `✅ ${what}` : `📤 ${what} — надіслано, станція не підтвердила. Перевір у застосунку`
+		const what = `${d.name}: ${action.group.replace(/^\S+\s/, '').toLowerCase().replace('вхідна потужність', 'вхід')} ${action.label}`
+		return confirmed ? `✅ ${what}` : `📤 ${what}\nнадіслано, без підтвердження`
 	} catch (e) {
 		console.error('set', e)
 		return `⚠️ Не вдалося: ${String(e).replace(/^Error:\s*/, '').slice(0, 150)}`
