@@ -16,7 +16,7 @@ type Env = {
 	DEVICE_SNS: string // {"marinka": "D3M1…", "kate": "R655…"} — серійники не зберігаються в репо
 }
 
-import { API, DEVICES, GRID_SOURCE, MQTT_WAIT_MS, OFFLINE_ALERT_MIN, QUIET_FROM, QUIET_TO, RESET_GAP, THRESHOLDS, TIMEZONE, type Device } from './config'
+import { API, AUTOMATIONS, DEVICES, GRID_SOURCE, MQTT_WAIT_MS, OFFLINE_ALERT_MIN, QUIET_FROM, QUIET_TO, RESET_GAP, THRESHOLDS, TIMEZONE, type Device } from './config'
 
 // Підставляємо серійники з секрету DEVICE_SNS (за cmd станції)
 function initDevices(env: Env) {
@@ -348,7 +348,10 @@ const KEYBOARD = {
 	inline_keyboard: [
 		[{ text: '📊 Усі станції', callback_data: 'status' }],
 		DEVICES.map((d) => ({ text: d.name, callback_data: d.cmd })),
-		[{ text: '⚙️ Керування', callback_data: 'menu:control' }],
+		[
+			{ text: '📈 Статистика', callback_data: 'stats' },
+			{ text: '⚙️ Керування', callback_data: 'menu:control' },
+		],
 	],
 }
 
@@ -394,7 +397,7 @@ const isQuiet = () => {
 	return QUIET_FROM < QUIET_TO ? h >= QUIET_FROM && h < QUIET_TO : h >= QUIET_FROM || h < QUIET_TO
 }
 
-type SendOpts = { chatId?: string | number; loud?: boolean; keyboard?: boolean }
+type SendOpts = { chatId?: string | number; loud?: boolean; keyboard?: boolean; silent?: boolean }
 
 // HTML-повідомлення; уночі — без звуку (якщо не loud); кнопки лише на панелі стану
 // Явний роздільник у кінці кожного повідомлення, щоб сусідні не зливались
@@ -415,7 +418,7 @@ async function telegram(env: Env, text: string, o: SendOpts = {}) {
 				text: `${text}\n${DIVIDER}`,
 				parse_mode: 'HTML',
 				link_preview_options: { is_disabled: true },
-				disable_notification: !o.loud && isQuiet(),
+				disable_notification: o.silent || (!o.loud && isQuiet()),
 				...(o.keyboard ? { reply_markup: KEYBOARD } : {}),
 			}),
 		),
@@ -531,12 +534,12 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 
 	if (!isOnline) {
 		st.offlineSince ??= now
-		if (!st.offlineAlerted && now - st.offlineSince >= OFFLINE_ALERT_MIN * 60000) {
+		if (OFFLINE_ALERT_MIN > 0 && !st.offlineAlerted && now - st.offlineSince >= OFFLINE_ALERT_MIN * 60000) {
 			await telegram(env, `⚠️ <b>${esc(dev.name)} — немає зв'язку</b>\nВже ${duration(now - st.offlineSince)}. Сповіщення про заряд не працюють.`)
 			st.offlineAlerted = true
 		}
 	} else {
-		if (st.offlineAlerted) await telegram(env, `✅ <b>${esc(dev.name)}</b> знову на зв'язку`)
+		if (st.offlineAlerted && OFFLINE_ALERT_MIN > 0) await telegram(env, `✅ <b>${esc(dev.name)}</b> знову на зв'язку`)
 		st.offlineSince = null
 		st.offlineAlerted = false
 
@@ -557,18 +560,96 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 	if (JSON.stringify(st) !== before) await env.POWER_KV.put(kvKey, JSON.stringify(st))
 }
 
-async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<string, boolean>) {
+// Повертає подію 'gridOn' / 'gridOff', якщо стан світла щойно змінився
+async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<string, boolean>): Promise<'gridOn' | 'gridOff' | null> {
 	const src = readings.get(gridSn())
-	if (!src || src.gridIn === null) return // невідомо — нічого не міняємо
+	if (!src || src.gridIn === null) return null // невідомо — нічого не міняємо
 	const now = Date.now()
 	const cur: GridState['state'] = src.gridIn ? 'ON' : 'OFF'
 	const prev = await env.POWER_KV.get<GridState>('grid', 'json')
-	if (prev?.state === cur) return
+	if (prev?.state === cur) return null
 	await env.POWER_KV.put('grid', JSON.stringify({ state: cur, since: now }))
-	if (!prev) return // перший запуск — просто запам'ятали
+	if (!prev) return null // перший запуск — просто запам'ятали
 	const t = table(DEVICES, readings, online)
-	if (cur === 'OFF') await telegram(env, `<b>🕯 Світло пішло</b>   <i>${clock(now)}</i>\n\n${t}`)
-	else await telegram(env, `<b>💡 Світло повернулось</b> · не було ${duration(now - prev.since)}   <i>${clock(now)}</i>\n\n${t}`)
+	if (cur === 'OFF') {
+		const day = await outagesIn(env, dayStart(now), now)
+		await telegram(
+			env,
+			`<b>🕯 Світло пішло</b>   <i>${clock(now)}</i>\n💡 Було ${duration(now - prev.since)}\n📈 Сьогодні: ${fmtOut(day)}\n\n${t}`,
+		)
+		return 'gridOff'
+	}
+	await logOutage(env, prev.since, now)
+	const day = await outagesIn(env, dayStart(now), now)
+	await telegram(
+		env,
+		`<b>💡 Світло повернулось</b>   <i>${clock(now)}</i>\n🕯 Не було ${duration(now - prev.since)}\n📈 Сьогодні: ${fmtOut(day)}\n\n${t}`,
+	)
+	return 'gridOn'
+}
+
+// ── Статистика відключень ───────────────────────────────────────
+// Лог завершених відключень у KV (1 запис на подію), зберігаємо 35 днів
+type Outage = { from: number; to: number }
+async function logOutage(env: Env, from: number, to: number) {
+	const log = (await env.POWER_KV.get<Outage[]>('outlog', 'json')) ?? []
+	log.push({ from, to })
+	const keep = log.filter((o) => o.to > Date.now() - 35 * 86400_000)
+	await env.POWER_KV.put('outlog', JSON.stringify(keep))
+}
+
+// Початок доби за Києвом (з урахуванням літнього/зимового часу)
+const tzOffset = (t: number) => {
+	const p = Object.fromEntries(
+		new Intl.DateTimeFormat('en-GB', { timeZone: TIMEZONE, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+			.formatToParts(new Date(t))
+			.map((x) => [x.type, x.value]),
+	)
+	return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - Math.floor(t / 1000) * 1000
+}
+const dayStart = (t: number) => {
+	const local = t + tzOffset(t)
+	const d = new Date(local)
+	const startLocal = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())
+	return startLocal - tzOffset(startLocal - tzOffset(t))
+}
+const dateLabel = (t: number) => new Date(t).toLocaleDateString('uk-UA', { timeZone: TIMEZONE, day: '2-digit', month: '2-digit' })
+
+// Скільки разів і скільки часу не було світла в інтервалі [a, b)
+async function outagesIn(env: Env, a: number, b: number) {
+	const log = (await env.POWER_KV.get<Outage[]>('outlog', 'json')) ?? []
+	const grid = await env.POWER_KV.get<GridState>('grid', 'json')
+	const all = [...log]
+	if (grid?.state === 'OFF') all.push({ from: grid.since, to: Date.now() }) // поточне відключення
+	let count = 0,
+		ms = 0
+	for (const o of all) {
+		const x = Math.max(o.from, a),
+			y = Math.min(o.to, b)
+		if (y > x) {
+			count++
+			ms += y - x
+		}
+	}
+	return { count, ms }
+}
+
+const fmtOut = (o: { count: number; ms: number }) => (o.count ? `${o.count} раз(и) · ${duration(o.ms)} без світла` : 'без відключень ✨')
+
+async function statsText(env: Env) {
+	const now = Date.now()
+	const today = dayStart(now)
+	const yest = dayStart(today - 1)
+	const week = today - 7 * 86400_000
+	const grid = await env.POWER_KV.get<GridState>('grid', 'json')
+	const nowLine = grid ? (grid.state === 'ON' ? `💡 Зараз світло є ${duration(now - grid.since)}` : `🕯 Зараз світла немає ${duration(now - grid.since)}`) : ''
+	return (
+		`📈 <b>Відключення</b>   <i>${clock(now)}</i>\n\n` +
+		`Сьогодні: ${fmtOut(await outagesIn(env, today, now))}\n` +
+		`Вчора (${dateLabel(yest)}): ${fmtOut(await outagesIn(env, yest, today))}\n` +
+		`За 7 днів: ${fmtOut(await outagesIn(env, week, today))}` +
+		(nowLine ? `\n\n${nowLine}` : '')
+	)
 }
 
 // Меню команд у Telegram будується з config.ts і оновлюється лише при змінах
@@ -576,12 +657,75 @@ async function syncCommands(env: Env) {
 	const commands = [
 		{ command: 'status', description: 'Усі станції: заряд і час роботи' },
 		...DEVICES.map((d) => ({ command: d.cmd, description: d.name })),
+		{ command: 'stats', description: 'Статистика відключень' },
 		{ command: 'help', description: 'Список команд' },
 	]
 	const json = JSON.stringify(commands)
 	if ((await env.POWER_KV.get('commands')) === json) return
 	await tgCall(env, 'setMyCommands', { commands })
 	await env.POWER_KV.put('commands', json)
+}
+
+// ── Автоматизації ───────────────────────────────────────────────
+// Ціль дії: яке значення налаштування вона виставляє
+const actionTarget = (a: Action) => {
+	const f = a.kind === 'mqtt' ? new Map(a.fields) : null
+	return {
+		maxChg: a.kind === 'rest' ? a.params.cfgMaxChgSoc : f?.get(33),
+		acMax: a.kind === 'rest' ? a.params.cfgPlugInInfoAcInChgPowMax : f?.get(54),
+	}
+}
+// Знаходимо в ACTIONS дію потрібного типу станції, що виставляє саме це значення
+const findAction = (d: Device, set: { maxChg?: number; acMax?: number }) =>
+	Object.entries(ACTIONS).find(([, a]) => {
+		if (a.for !== d.via) return false
+		const t = actionTarget(a)
+		return (set.maxChg === undefined || t.maxChg === set.maxChg) && (set.acMax === undefined || t.acMax === set.acMax) && (t.maxChg !== undefined) === (set.maxChg !== undefined)
+	})
+const AUTO_RETRY_MS = 30 * 60_000 // якщо станція не підтвердила — повтор не частіше ніж раз на 30 хв
+
+async function runAutomations(env: Env, readings: Map<string, Reading>, online: Map<string, boolean>, event: 'gridOn' | 'gridOff' | null) {
+	const grid = await env.POWER_KV.get<GridState>('grid', 'json')
+	for (const [i, rule] of AUTOMATIONS.entries()) {
+		if (rule.on && rule.on !== event) continue
+		if (rule.grid && grid?.state !== rule.grid) continue
+		if (rule.gridOnForH && !(grid?.state === 'ON' && Date.now() - grid.since >= rule.gridOnForH * 3600_000)) continue
+		const targets = rule.cmd === '*' ? DEVICES : DEVICES.filter((x) => x.cmd === rule.cmd)
+		for (const d of targets) {
+			const r = readings.get(d.sn)
+			if (!online.get(d.sn) || !r) continue
+			if (rule.socAtLeast !== undefined && r.soc < rule.socAtLeast) continue
+			if (rule.socAtMost !== undefined && r.soc > rule.socAtMost) continue
+			const found = findAction(d, rule.set)
+			if (!found) continue
+			const [actionId, action] = found
+
+			// уже стоїть потрібне значення — нічого не робимо
+			const cur = await getSettings(d.sn)
+			const now = { maxChg: r.maxChg ?? cur?.maxChg, acMax: r.acMax ?? cur?.acMax }
+			const done = (rule.set.maxChg === undefined || now.maxChg === rule.set.maxChg) && (rule.set.acMax === undefined || now.acMax === rule.set.acMax)
+			if (done) continue
+
+			const retryKey = `auto:${i}:${d.cmd}`
+			if (!rule.on) {
+				const last = Number(await env.POWER_KV.get(retryKey))
+				if (last && Date.now() - last < AUTO_RETRY_MS) continue
+			}
+			const confirmed = await runAction(env, d, action).catch((e) => {
+				console.error('auto', d.name, actionId, e)
+				return false
+			})
+			const what = `${action.group.replace(/^\S+\s/, '').toLowerCase()} ${action.label}`
+			const why = rule.note ? ` <i>(${esc(rule.note)})</i>` : ''
+			if (confirmed) {
+				await saveSettings(d.sn, rule.set, true)
+				await telegram(env, `🤖 <b>${esc(d.name)} ${r.soc}%</b> → ${what}${why}`, { silent: true })
+			} else {
+				if (!rule.on) await env.POWER_KV.put(retryKey, String(Date.now()), { expirationTtl: 3600 })
+				await telegram(env, `🤖 ${esc(d.name)} → ${what}${why}: станція не підтвердила${rule.on ? '' : ', повторю за 30 хв'}`, { silent: true })
+			}
+		}
+	}
 }
 
 async function run(env: Env) {
@@ -599,17 +743,19 @@ async function run(env: Env) {
 			console.error(d.name, e)
 		}
 	}
-	await checkGrid(env, readings, online)
+	const event = await checkGrid(env, readings, online)
+	await runAutomations(env, readings, online, event).catch((e) => console.error('automations', e))
 }
 
 // ── Telegram webhook: команди і кнопки ──────────────────────────
 async function helpText() {
 	const list = DEVICES.map((d) => `/${d.cmd} — ${esc(d.name)}`).join('\n')
-	return `<b>🤖 Команди</b>\n/status — усі станції\n${list}\n\nАбо кнопки нижче.`
+	return `<b>🤖 Команди</b>\n/status — усі станції\n${list}\n/stats — статистика відключень\n\nАбо кнопки нижче.`
 }
 
 async function render(env: Env, cmd: string): Promise<Panel | null> {
 	if (cmd === 'help' || cmd === 'start') return { text: await helpText() }
+	if (cmd === 'stats') return { text: await statsText(env) }
 	const devices = cmd === 'status' ? DEVICES : DEVICES.filter((d) => d.cmd === cmd)
 	if (!devices.length) return null
 	try {

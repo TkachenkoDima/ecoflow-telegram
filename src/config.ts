@@ -41,12 +41,36 @@ export const GRID_SOURCE = 'router'
 
 export const THRESHOLDS = [50, 25, 10] // %, сповіщення при розряді
 export const RESET_GAP = 10 // поріг знову активний, коли заряд піднявся на стільки % вище
-export const OFFLINE_ALERT_MIN = 30 // хв без зв'язку → попередження
+export const OFFLINE_ALERT_MIN = 0 // хв без зв'язку → попередження «немає зв'язку» / «знову на зв'язку»; 0 — вимкнено
 
 export const TIMEZONE = 'Europe/Kyiv'
 export const QUIET_FROM = 0 // тихий режим: повідомлення без звуку (крім найнижчого порогу)
 export const QUIET_TO = 8
 
 // EU-акаунти: api-e.ecoflow.com; US/інші: api.ecoflow.com
+// ── Автоматизації: перевіряються щохвилини ──
+// cmd — станція ('*' — усі); set — що виставити (ліміт заряду %, макс. вхід Вт).
+// Умови (усі вказані мають виконатись):
+//   socAtLeast / socAtMost — заряд станції; grid — 'ON'|'OFF' зараз; gridOnForH — світло є вже N год;
+//   on — подія: 'gridOn' (світло повернулось) / 'gridOff' (світло пішло) — спрацьовує лише в момент події.
+// Команда надсилається, лише якщо поточне значення інше, — не щохвилини.
+export type Automation = {
+	cmd: string
+	set: { maxChg?: number; acMax?: number }
+	socAtLeast?: number
+	socAtMost?: number
+	grid?: 'ON' | 'OFF'
+	gridOnForH?: number
+	on?: 'gridOn' | 'gridOff'
+	note?: string // підпис у повідомленні
+}
+export const AUTOMATIONS: Automation[] = [
+	// Розумна зарядка Маринки: порожня — швидко, майже повна — дбайливо
+	{ cmd: 'marinka', socAtMost: 30, grid: 'ON', set: { acMax: 2000 }, note: 'швидка зарядка' },
+	{ cmd: 'marinka', socAtLeast: 80, set: { acMax: 500 }, note: 'дбайлива зарядка' },
+	// Світло повернулось — швидко заряджаємо Маринку (якщо ще не майже повна)
+	{ cmd: 'marinka', on: 'gridOn', socAtMost: 79, set: { acMax: 2000 }, note: 'світло повернулось' },
+]
+
 export const API = 'https://api-e.ecoflow.com'
 export const MQTT_WAIT_MS = 15_000 // River 3 шле BMS-пакет кожні ~10 с
