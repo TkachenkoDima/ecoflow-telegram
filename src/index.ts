@@ -16,7 +16,7 @@ type Env = {
 	DEVICE_SNS: string // {"marinka": "D3M1…", "kate": "R655…"} — серійники не зберігаються в репо
 }
 
-import { API, AUTOMATIONS, DEVICES, PIN_TO_TOP, PUSH_TTL_MIN, GRID_SOURCE, MQTT_WAIT_MS, OFFLINE_ALERT_MIN, QUIET_FROM, QUIET_TO, RESET_GAP, THRESHOLDS, TIMEZONE, type Device } from './config'
+import { API, AUTOMATIONS, DEVICES, PIN_TO_TOP, PUSH_TTL_MIN, GRID_SOURCE, MQTT_WAIT_MS, OFFLINE_ALERT_MIN, QUIET_FROM, QUIET_TO, RESET_GAP, THRESHOLDS, TIMEZONE, type Automation, type Device } from './config'
 
 // Підставляємо серійники з секрету DEVICE_SNS (за cmd станції)
 function initDevices(env: Env) {
@@ -354,6 +354,88 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, 
 	return { online, readings, errors }
 }
 
+// ── Знімок даних (кеш) ──────────────────────────────────────────
+// Cron щохвилини читає всі станції — зберігаємо результат, і натискання кнопок малюють екран
+// миттєво з нього, без MQTT (3–10 с). Наживо читаємо лише якщо знімок старший за SNAP_FRESH_MS.
+// Три рівні: пам'ять воркера → Cache API дата-центру (безкоштовно, без лімітів) → KV (раз на 10 хв, ~144 записи/добу)
+type Snap = { at: number; online: Record<string, boolean>; devs: Record<string, { r: Reading; at: number }> }
+const SNAP_FRESH_MS = 3 * 60_000
+const SNAP_KV_EVERY_MS = 10 * 60_000
+const SNAP_URL = 'https://snap.internal/v1'
+let memSnap: Snap | null = null
+
+async function loadSnap(env: Env): Promise<Snap | null> {
+	// пам'ять воркера — якщо зовсім свіжа; інакше беремо новіший з кешу дата-центру (його оновлює cron)
+	if (memSnap && Date.now() - memSnap.at < 60_000) return memSnap
+	const newer = (x: Snap | null) => {
+		if (x && (!memSnap || x.at > memSnap.at)) memSnap = x
+	}
+	try {
+		const hit = await caches.default.match(SNAP_URL)
+		if (hit) newer(await hit.json<Snap>())
+	} catch {}
+	if (!memSnap || Date.now() - memSnap.at > SNAP_FRESH_MS) {
+		const kv = await env.POWER_KV.get<Snap>('snap', 'json')
+		if (kv && (!memSnap || kv.at > memSnap.at)) {
+			newer(kv)
+			await putSnapCache(kv)
+		}
+	}
+	return memSnap
+}
+async function putSnapCache(s: Snap) {
+	try {
+		await caches.default.put(SNAP_URL, new Response(JSON.stringify(s), { headers: { 'Cache-Control': 'max-age=86400' } }))
+	} catch {}
+}
+async function saveSnap(env: Env, online: Map<string, boolean>, readings: Map<string, Reading>, fromCron = false) {
+	const prev = await loadSnap(env)
+	const now = Date.now()
+	const s: Snap = { at: now, online: Object.fromEntries(online), devs: { ...(prev?.devs ?? {}) } }
+	for (const [sn, r] of readings) s.devs[sn] = { r: JSON.parse(JSON.stringify(r)), at: now }
+	for (const [sn, on] of online) if (!on) delete s.devs[sn] // офлайн — старі цифри не показуємо
+	memSnap = s
+	await putSnapCache(s)
+	if (fromCron) {
+		const last = Number((await env.POWER_KV.get('snap:at')) ?? 0)
+		if (now - last >= SNAP_KV_EVERY_MS) {
+			await env.POWER_KV.put('snap', JSON.stringify(s))
+			await env.POWER_KV.put('snap:at', String(now), { expirationTtl: 86400 })
+		}
+	}
+}
+
+// Дані для екрана: зі знімка, якщо свіжий; інакше — наживо (і оновлюємо знімок)
+async function readCached(env: Env, devices: Device[], detailed: boolean) {
+	const snap = await loadSnap(env)
+	const now = Date.now()
+	const fresh =
+		snap &&
+		now - snap.at < SNAP_FRESH_MS &&
+		devices.every((d) => (snap.online[d.sn] ? !!snap.devs[d.sn] && now - snap.devs[d.sn].at < SNAP_FRESH_MS : snap.online[d.sn] === false))
+	if (!fresh) {
+		const res = await readAll(env, devices, detailed)
+		await saveSnap(env, res.online, res.readings).catch(() => {})
+		return res
+	}
+	const online = new Map(DEVICES.map((d) => [d.sn, !!snap.online[d.sn]]))
+	const readings = new Map<string, Reading>()
+	for (const d of devices) {
+		const e = snap.devs[d.sn]
+		if (!e) continue
+		const r: Reading = JSON.parse(JSON.stringify(e.r))
+		// щойно змінене кнопкою — показуємо нове значення, а не зі знімка
+		const c = await getSettings(d.sn)
+		if (c?.cmdAt !== undefined && now - c.cmdAt < RECENT_CMD_MS) {
+			if (c.maxChg !== undefined) r.maxChg = c.maxChg
+			if (c.acMax !== undefined) r.acMax = c.acMax
+			if (c.minDsg !== undefined) r.minDsg = c.minDsg
+		}
+		readings.set(d.sn, r)
+	}
+	return { online, readings, errors: [] as string[] }
+}
+
 // ── Telegram ────────────────────────────────────────────────────
 // Головні кнопки: стан + перехід у «папку» керування
 const KEYBOARD = {
@@ -555,8 +637,47 @@ const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState
 	return `${socIcon(r.soc)} ${head}\n<code>${bar(r.soc)}</code>  <b>${r.soc}%</b>\n${time}${load}${lim}${foot}`
 }
 
+// Опис автоматики станції: які правила, коли спрацьовують, яке діє зараз
+function autoRules(d: Device, r: Reading | undefined, g: GridState | null, manualSince?: number) {
+	const rules = AUTOMATIONS.filter((x) => x.cmd === d.cmd || x.cmd === '*')
+	if (!rules.length) return ''
+	const range = (a?: number, b?: number) => `${a ?? 0}–${b ?? 100}%`
+	const when = (x: Automation) =>
+		[
+			range(x.socAtLeast, x.socAtMost),
+			x.grid === 'ON' ? 'є світло' : x.grid === 'OFF' ? 'без світла' : '',
+			x.gridOnForH ? `світло ≥ ${x.gridOnForH} год` : '',
+			x.on === 'gridOn' ? 'коли світло з\'явилось' : x.on === 'gridOff' ? 'коли світло зникло' : '',
+		]
+			.filter(Boolean)
+			.join(', ')
+	const what = (x: Automation) =>
+		[x.set.acMax !== undefined ? `вхід ${x.set.acMax >= 1000 ? x.set.acMax / 1000 + ' кВт' : x.set.acMax + ' Вт'}` : '', x.set.maxChg !== undefined ? `ліміт заряду ${x.set.maxChg}%` : '']
+			.filter(Boolean)
+			.join(', ')
+	const active = (x: Automation) =>
+		!!r &&
+		!x.on &&
+		(x.socAtLeast === undefined || r.soc >= x.socAtLeast) &&
+		(x.socAtMost === undefined || r.soc <= x.socAtMost) &&
+		(!x.grid || g?.state === x.grid) &&
+		(!x.gridOnForH || (g?.state === 'ON' && Date.now() - g.since >= x.gridOnForH * 3600_000))
+	const lines = rules.map((x) => {
+		const on = !manualSince && active(x)
+		const line = `${on ? '▸' : '·'} ${when(x)} → ${what(x)}${x.note ? ` <i>(${esc(x.note)})</i>` : ''}`
+		return on ? `<b>${line}</b>` : line
+	})
+	const head = manualSince
+		? `✋ <b>Ручне керування</b> з ${clock(manualSince)} — правила на паузі до «🤖 Авто»:`
+		: rules.some(active)
+			? '🤖 <b>Авто</b> — діє виділене правило:'
+			: '🤖 <b>Авто</b> — зараз жодне правило не діє:'
+	return `${head}
+${lines.join('\n')}`
+}
+
 async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel> {
-	const { online, readings, errors } = await readAll(env, devices, devices.length === 1)
+	const { online, readings, errors } = await readCached(env, devices, devices.length === 1)
 	const grid = await env.POWER_KV.get<GridState>('grid', 'json')
 	const now = Date.now()
 	// якщо дані не прийшли — показуємо причину, а не просто «немає даних»
@@ -564,12 +685,8 @@ async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel
 	if (devices.length === 1) {
 		const d = devices[0]
 		const m = await getManual(env, d.sn)
-		const hasAuto = AUTOMATIONS.some((r) => r.cmd === d.cmd || r.cmd === '*')
-		const manualLine = m
-			? `\n\n✋ Ручне керування з ${clock(m.since)} — автоматика вимкнена до «🤖 Авто»`
-			: hasAuto
-				? '\n\n🤖 Авто'
-				: ''
+		const rules = autoRules(d, readings.get(d.sn), grid, m?.since)
+		const manualLine = rules ? `\n\n${rules}` : ''
 		return { text: card(d, readings.get(d.sn), online.get(d.sn)!, grid, now) + manualLine + errs, device: d }
 	}
 	const g_ = gridText(grid, now)
@@ -881,13 +998,17 @@ const mergeSettings = async (r: Reading | undefined, sn: string) => {
 async function screenText(line1: string, groupDev: Device, v: View | null, readings: Map<string, Reading>, online: Map<string, boolean>, g: GridState | null, now: number) {
 	let content: string
 	const shown = v?.dev ? DEVICES.find((x) => x.cmd === v.dev) : undefined
+	const withAuto = async (d: Device) => {
+		const rules = autoRules(d, readings.get(d.sn), g, (await getManual(settingsEnv, d.sn))?.since)
+		return card(d, readings.get(d.sn), online.get(d.sn)!, g, now) + (rules ? `\n\n${rules}` : '')
+	}
 	if (shown) {
 		await mergeSettings(readings.get(shown.sn), shown.sn)
-		content = (v?.note ? `${esc(v.note)}\n\n` : '') + card(shown, readings.get(shown.sn), online.get(shown.sn)!, g, now)
+		content = (v?.note ? `${esc(v.note)}\n\n` : '') + (await withAuto(shown))
 	} else if (v?.body) content = v.body
 	else {
 		await mergeSettings(readings.get(groupDev.sn), groupDev.sn)
-		content = card(groupDev, readings.get(groupDev.sn), online.get(groupDev.sn)!, g, now)
+		content = await withAuto(groupDev)
 	}
 	// підпис «оновлюється щохвилини» — лише на «живих» картках
 	const footer = v?.body && !shown ? '' : `\n\n<i>Оновлюється щохвилини · ${clock(now)}</i>`
@@ -937,7 +1058,7 @@ async function showInPinned(
 	const d = DEVICES.find((x) => x.cmd === pin.cmd)!
 	const shown = v.dev ? DEVICES.find((x) => x.cmd === v.dev) : undefined
 	const need = [d, ...(shown && shown !== d ? [shown] : [])]
-	const { online, readings } = await readAll(env, need, true)
+	const { online, readings } = await readCached(env, need, true)
 	const g = await env.POWER_KV.get<GridState>('grid', 'json')
 	const now = Date.now()
 	const line1 = pinFirstLine(d, readings.get(d.sn), online.get(d.sn)!, g, now)
@@ -981,6 +1102,7 @@ async function pinCommand(env: Env, chatId: number | string, arg: string | undef
 async function run(env: Env) {
 	await syncCommands(env).catch((e) => console.error('commands', e))
 	const { online, readings } = await readAll(env, DEVICES, false, true)
+	await saveSnap(env, online, readings, true).catch((e) => console.error('snap', e))
 	if (!(await env.POWER_KV.get('started:v3'))) {
 		const text = `📡 <b>Моніторинг EcoFlow запущено</b>\nПороги ${THRESHOLDS.join(' · ')}% · тиша ${QUIET_FROM}:00–${QUIET_TO}:00\n\n${table(DEVICES, readings, online)}`
 		for (const id of chatIds(env)) await sendPanel(env, id, { text }).catch((e) => console.error('start', id, e))
@@ -1103,13 +1225,31 @@ const labelFor = (data: string) =>
 
 async function pinnedCallback(env: Env, cb: any, chatId: number | string, pin: Pin, data: string) {
 	const answer = (text?: string) => tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text }).catch(() => {})
+	// Миттєвий відгук: одразу міняємо кнопки (і показуємо «завантажую», якщо буде інший вміст), дані — слідом
+	const line1 = esc(String(cb.message?.text ?? '').split('\n')[0])
+	const instant = (markup: object, loading?: string) =>
+		loading
+			? tgCall(env, 'editMessageText', { chat_id: chatId, message_id: pin.messageId, text: `${line1}\n\n⏳ ${esc(loading)} — завантажую…`, parse_mode: 'HTML', reply_markup: markup }).catch(() => {})
+			: tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: pin.messageId, reply_markup: markup }).catch(() => {})
+	const nameOf = (cmd: string) => DEVICES.find((x) => x.cmd === cmd)?.name ?? cmd
 	if (data === 'noop') return answer()
 	if (data.startsWith('menu:')) {
 		await answer()
-		if (data === 'menu:main') return showInPinned(env, chatId, pin, { home: true })
-		if (data === 'menu:control') return showInPinned(env, chatId, pin, { menu: 'control' })
-		// Керування → станція: одразу показуємо її «живу» картку
+		if (data === 'menu:main') {
+			await instant(KEYBOARD)
+			return showInPinned(env, chatId, pin, { home: true })
+		}
+		if (data === 'menu:control') {
+			// вміст не змінюється — лише кнопки, без читання даних
+			await instant(CONTROL_KEYBOARD)
+			const prev = await getView(env, chatId)
+			await saveView(env, chatId, { ...(prev ?? { at: Date.now() }), menu: 'control' })
+			return
+		}
+		// Керування → станція: одразу її кнопки + «завантажую», потім «жива» картка
 		const cmd = data.slice(9)
+		const dev = DEVICES.find((x) => x.cmd === cmd)
+		if (dev) await instant(deviceKeyboard(dev), nameOf(cmd))
 		return showInPinned(env, chatId, pin, { dev: cmd, label: cmd, menu: `dev:${cmd}` })
 	}
 	if (data.startsWith('auto:')) {
@@ -1123,12 +1263,15 @@ async function pinnedCallback(env: Env, cb: any, chatId: number | string, pin: P
 		const d = DEVICES.find((x) => x.cmd === cmd)
 		const action = ACTIONS[actionId]
 		if (!d || !action || action.for !== d.via) return answer()
-		await answer('Надсилаю команду…')
+		await answer()
+		await instant(deviceKeyboard(d), `${d.name}: надсилаю «${action.label}»`)
 		const note = await applyAction(env, d, action)
 		if (!note.startsWith('✅')) await new Promise((r) => setTimeout(r, 2000))
 		return showInPinned(env, chatId, pin, { dev: d.cmd, note, menu: `dev:${d.cmd}` })
 	}
-	await answer('Оновлюю…')
+	await answer()
+	const prevMenu = (await getView(env, chatId))?.menu
+	await instant(menuMarkup(prevMenu), labelFor(data))
 	// кнопка станції — «жива» картка; інше (усі станції, статистика) — статичний знімок
 	if (DEVICES.some((x) => x.cmd === data)) return showInPinned(env, chatId, pin, { dev: data })
 	const panel = await render(env, data)
