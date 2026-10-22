@@ -1227,10 +1227,8 @@ async function screenText(line1: string, groupDev: Device, v: View | null, readi
 		await mergeSettings(readings.get(groupDev.sn), groupDev.sn)
 		content = await withAuto(groupDev)
 	}
-	// підпис «оновлюється щохвилини» — лише на «живих» картках
-	const footer = v?.body && !shown ? '' : `\n\n<i>Оновлюється щохвилини · ${clock(now)}</i>`
-	// окремий верхній рядок-статус прибрано: картка й так починається з назви і %
-	return `${content}${footer}`
+	// без верхнього рядка-статусу і без підпису «оновлюється щохвилини»: час оновлення — у заголовку картки
+	return content
 }
 
 async function editPinned(env: Env, chatId: string | number, pin: Pin, text: string, markup: object) {
