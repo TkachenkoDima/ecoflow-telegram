@@ -575,7 +575,7 @@ async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<s
 		// поточне відключення щойно почалось — рахуємо лише завершені сьогодні і додаємо його номером
 		const day = await outagesIn(env, dayStart(now), now, false)
 		const nth = day.count + 1
-		const before = day.count ? ` · всього ${duration(day.ms)} без світла` : ''
+		const before = day.ms ? ` · всього ${duration(day.ms)} без світла` : '' // включно з нічним хвостом з учора
 		await telegram(
 			env,
 			`<b>🕯 Світло пішло</b>   <i>${clock(now)}</i>\n💡 Було ${duration(now - prev.since)}\n📈 Сьогодні: ${nth}-е відключення${before}${await prevOutageLine(env)}\n\n${t}`,
@@ -624,17 +624,20 @@ async function outagesIn(env: Env, a: number, b: number, includeCurrent = true) 
 	const grid = await env.POWER_KV.get<GridState>('grid', 'json')
 	const all = [...log]
 	if (includeCurrent && grid?.state === 'OFF') all.push({ from: grid.since, to: Date.now() }) // поточне відключення
+	// count — відключення, що ПОЧАЛИСЬ у [a, b) (кожне рахується рівно один раз, у день початку);
+	// ms — фактичний час без світла в [a, b), включно з «хвостом» відключення, що почалось раніше (carryMs)
 	let count = 0,
-		ms = 0
+		ms = 0,
+		carryMs = 0
 	for (const o of all) {
 		const x = Math.max(o.from, a),
 			y = Math.min(o.to, b)
-		if (y > x) {
-			count++
-			ms += y - x
-		}
+		if (y <= x) continue
+		ms += y - x
+		if (o.from >= a) count++
+		else carryMs += y - x
 	}
-	return { count, ms }
+	return { count, ms, carryMs }
 }
 
 // «⏮ Попереднє: 2 год 5 хв (09:10–11:15)»; якщо не сьогодні — з датою
@@ -647,21 +650,26 @@ async function prevOutageLine(env: Env, skipLast = false) {
 	return `\n⏮ Попереднє: ${duration(o.to - o.from)} (${when})`
 }
 
-const times = (n: number) => (n % 10 === 1 && n % 100 !== 11 ? 'раз' : 'рази')
-const fmtOut = (o: { count: number; ms: number }) => (o.count ? `${o.count} ${times(o.count)} · ${duration(o.ms)} без світла` : 'без відключень ✨')
+const times = (n: number) =>
+	n % 10 === 1 && n % 100 !== 11 ? 'раз' : [2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100) ? 'рази' : 'разів'
+const fmtOut = (o: { count: number; ms: number; carryMs: number }) => {
+	if (!o.ms) return 'без відключень ✨'
+	const carry = o.carryMs ? ` (${o.count ? 'з них ' + duration(o.carryMs) + ' — ' : ''}нічне зі вчора)` : ''
+	return `${o.count} ${times(o.count)} · ${duration(o.ms)} без світла${carry}`
+}
 
 async function statsText(env: Env) {
 	const now = Date.now()
 	const today = dayStart(now)
 	const yest = dayStart(today - 1)
-	const week = today - 7 * 86400_000
+	const week = dayStart(today - 6 * 86400_000 + 3600_000) // 7 днів, включно з сьогодні
 	const grid = await env.POWER_KV.get<GridState>('grid', 'json')
 	const nowLine = grid ? (grid.state === 'ON' ? `💡 Зараз світло є ${duration(now - grid.since)}` : `🕯 Зараз світла немає ${duration(now - grid.since)}`) : ''
 	return (
 		`📈 <b>Відключення</b>   <i>${clock(now)}</i>\n\n` +
 		`Сьогодні: ${fmtOut(await outagesIn(env, today, now))}\n` +
 		`Вчора (${dateLabel(yest)}): ${fmtOut(await outagesIn(env, yest, today))}\n` +
-		`За 7 днів: ${fmtOut(await outagesIn(env, week, today))}` +
+		`За 7 днів: ${fmtOut(await outagesIn(env, week, now))}` +
 		(nowLine ? `\n\n${nowLine}` : '')
 	)
 }
