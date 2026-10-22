@@ -642,17 +642,11 @@ function autoRules(d: Device, r: Reading | undefined, g: GridState | null, manua
 	const rules = AUTOMATIONS.filter((x) => x.cmd === d.cmd || x.cmd === '*')
 	if (!rules.length) return ''
 	const range = (a?: number, b?: number) => `${a ?? 0}–${b ?? 100}%`
+	// коротко: лише діапазон заряду → що виставляє; чинне зараз — жирним
 	const when = (x: Automation) =>
-		[
-			range(x.socAtLeast, x.socAtMost),
-			x.grid === 'ON' ? 'є світло' : x.grid === 'OFF' ? 'без світла' : '',
-			x.gridOnForH ? `світло ≥ ${x.gridOnForH} год` : '',
-			x.on === 'gridOn' ? 'коли світло з\'явилось' : x.on === 'gridOff' ? 'коли світло зникло' : '',
-		]
-			.filter(Boolean)
-			.join(', ')
+		x.on ? (x.on === 'gridOn' ? 'світло з\'явилось' : 'світло зникло') : range(x.socAtLeast, x.socAtMost)
 	const what = (x: Automation) =>
-		[x.set.acMax !== undefined ? `вхід ${x.set.acMax >= 1000 ? x.set.acMax / 1000 + ' кВт' : x.set.acMax + ' Вт'}` : '', x.set.maxChg !== undefined ? `ліміт заряду ${x.set.maxChg}%` : '']
+		[x.set.acMax !== undefined ? `вхід ${x.set.acMax >= 1000 ? x.set.acMax / 1000 + ' кВт' : x.set.acMax + ' Вт'}` : '', x.set.maxChg !== undefined ? `ліміт ${x.set.maxChg}%` : '']
 			.filter(Boolean)
 			.join(', ')
 	const active = (x: Automation) =>
@@ -663,15 +657,10 @@ function autoRules(d: Device, r: Reading | undefined, g: GridState | null, manua
 		(!x.grid || g?.state === x.grid) &&
 		(!x.gridOnForH || (g?.state === 'ON' && Date.now() - g.since >= x.gridOnForH * 3600_000))
 	const lines = rules.map((x) => {
-		const on = !manualSince && active(x)
-		const line = `${on ? '▸' : '·'} ${when(x)} → ${what(x)}${x.note ? ` <i>(${esc(x.note)})</i>` : ''}`
-		return on ? `<b>${line}</b>` : line
+		const line = `${when(x)} → ${what(x)}`
+		return !manualSince && active(x) ? `<b>${line}</b>` : line
 	})
-	const head = manualSince
-		? `✋ <b>Ручне керування</b> з ${clock(manualSince)} — правила на паузі до «🤖 Авто»:`
-		: rules.some(active)
-			? '🤖 <b>Авто</b> — діє виділене правило:'
-			: '🤖 <b>Авто</b> — зараз жодне правило не діє:'
+	const head = manualSince ? `✋ Ручне з ${clock(manualSince)} — до «🤖 Авто»` : '🤖 Авто'
 	return `${head}
 ${lines.join('\n')}`
 }
@@ -998,8 +987,10 @@ const mergeSettings = async (r: Reading | undefined, sn: string) => {
 async function screenText(line1: string, groupDev: Device, v: View | null, readings: Map<string, Reading>, online: Map<string, boolean>, g: GridState | null, now: number) {
 	let content: string
 	const shown = v?.dev ? DEVICES.find((x) => x.cmd === v.dev) : undefined
+	// правила автоматики — лише в «Керування → станція», на головному екрані не потрібні
+	const inControl = !!v?.menu?.startsWith('dev:')
 	const withAuto = async (d: Device) => {
-		const rules = autoRules(d, readings.get(d.sn), g, (await getManual(settingsEnv, d.sn))?.since)
+		const rules = inControl ? autoRules(d, readings.get(d.sn), g, (await getManual(settingsEnv, d.sn))?.since) : ''
 		return card(d, readings.get(d.sn), online.get(d.sn)!, g, now) + (rules ? `\n\n${rules}` : '')
 	}
 	if (shown) {
