@@ -518,7 +518,12 @@ async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel
 	if (devices.length === 1) {
 		const d = devices[0]
 		const m = await getManual(env, d.sn)
-		const manualLine = m ? `\n\n✋ Ручне керування з ${clock(m.since)} — автоматика вимкнена до «🤖 Авто»` : ''
+		const hasAuto = AUTOMATIONS.some((r) => r.cmd === d.cmd || r.cmd === '*')
+		const manualLine = m
+			? `\n\n✋ Ручне керування з ${clock(m.since)} — автоматика вимкнена до «🤖 Авто»`
+			: hasAuto
+				? '\n\n🤖 Авто'
+				: ''
 		return { text: card(d, readings.get(d.sn), online.get(d.sn)!, grid, now) + manualLine + errs, device: d }
 	}
 	const g_ = gridText(grid, now)
@@ -768,7 +773,7 @@ async function runAutomations(env: Env, readings: Map<string, Reading>, online: 
 			const why = rule.note ? ` <i>(${esc(rule.note)})</i>` : ''
 			if (confirmed) {
 				await saveSettings(d.sn, rule.set, true)
-				await telegram(env, `🤖 <b>${esc(d.name)} ${r.soc}%</b> → ${what}${why}`, { silent: true })
+				console.log('auto', d.name, r.soc, what) // успіх — без повідомлення, видно в картці станції
 			} else {
 				if (!rule.on) await env.POWER_KV.put(retryKey, String(Date.now()), { expirationTtl: 3600 })
 				await telegram(env, `🤖 ${esc(d.name)} → ${what}${why}: станція не підтвердила${rule.on ? '' : ', повторю за 30 хв'}`, { silent: true })
