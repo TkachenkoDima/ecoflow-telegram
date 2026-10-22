@@ -958,12 +958,21 @@ async function statsView(env: Env, data: string): Promise<{ text: string; markup
 		const o = S.inRange(a, end)
 		return `${label}  ${offBar(o.ms, end - a)}  ${o.ms ? (o.count ? o.count + ' · ' : '') + hm(o.ms) : '✨'}`
 	}
-	const modeRow = (k: 'w' | 'm') => [btn(k === 'w' ? '✓ Тиждень' : 'Тиждень', 'st:w:0'), btn(k === 'm' ? '✓ Місяць' : 'Місяць', 'st:m:0')]
-	const arrows = (k: string, off: number, label: string, canBack: boolean) => [
-		canBack ? btn('◀', `st:${k}:${off - 1}`) : blank(),
-		btn(label, 'noop'),
-		off < 0 ? btn('▶', `st:${k}:${off + 1}`) : blank(),
+	const today = ymd(now)
+	const todayArg = `${today.y}-${today.m + 1}-${today.d}`
+	const modeRow = (k: 'd' | 'w' | 'm') => [
+		btn(k === 'd' ? '✓ День' : 'День', `st:t:${todayArg}`),
+		btn(k === 'w' ? '✓ Тиждень' : 'Тиждень', 'st:w:0'),
+		btn(k === 'm' ? '✓ Місяць' : 'Місяць', 'st:m:0'),
 	]
+	// недоступні стрілки не показуємо (без порожніх кнопок)
+	const arrowRow = (label: string, prevData: string | null, nextData: string | null) => [
+		...(prevData ? [btn('◀', prevData)] : []),
+		btn(label, 'noop'),
+		...(nextData ? [btn('▶', nextData)] : []),
+	]
+	const arrows = (k: string, off: number, label: string, canBack: boolean) =>
+		arrowRow(label, canBack ? `st:${k}:${off - 1}` : null, off < 0 ? `st:${k}:${off + 1}` : null)
 
 	if (kind === 'w' || kind === 'm') {
 		const off = Math.min(0, Number(arg) || 0)
@@ -1048,18 +1057,22 @@ async function statsView(env: Env, data: string): Promise<{ text: string; markup
 	const body =
 		end <= trackFrom
 			? '<i>немає даних</i>'
-			: `<code>${line}</code>\n<code>0     6     12    18   </code>\n\n${list.length ? list.join('\n') : 'Без відключень ✨'}\n\n${S.summary(a, b).join('\n')}`
-	const text = `📈 <b>${WD[ymd(a).wd]} ${dateLabel(a)}</b>\n\n${body}`
+			: `<code>${line}</code>\n<code>0     6     12    18   </code>\n\n${list.length ? `${list.join('\n')}\n\n${S.summary(a, b).join('\n')}` : 'Без відключень ✨'}`
+	const isToday = a === dayStart(now)
+	const text = `📈 <b>День</b> · ${WD[ymd(a).wd]} ${dateLabel(a)}${isToday ? ' (сьогодні)' : ''}\n\n${body}` + (isToday && nowLine ? `\n\n${nowLine}` : '')
 	const prev = ymd(a - 1),
 		next = ymd(b)
+	const top = kind === 't'
 	const markup = {
 		inline_keyboard: [
-			[
-				b - 86400_000 > trackFrom ? btn('◀', `st:d:${prev.y}-${prev.m + 1}-${prev.d}`) : blank(),
-				btn(dateLabel(a), 'noop'),
-				b < now ? btn('▶', `st:d:${next.y}-${next.m + 1}-${next.d}`) : blank(),
-			],
-			NAV_BOTTOM(`st:c:${monthOffsetOf(a, now)}`),
+			...(top ? [modeRow('d')] : []),
+			arrowRow(
+				dateLabel(a),
+				a > trackFrom ? `st:${kind}:${prev.y}-${prev.m + 1}-${prev.d}` : null,
+				b < now ? `st:${kind}:${next.y}-${next.m + 1}-${next.d}` : null,
+			),
+			...(top ? [[btn('📅 Календар', `st:c:${monthOffsetOf(a, now)}`)]] : []),
+			NAV_BOTTOM(top ? 'menu:main' : `st:c:${monthOffsetOf(a, now)}`),
 		],
 	}
 	return { text, markup }
