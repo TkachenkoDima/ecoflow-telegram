@@ -65,12 +65,15 @@ export type Automation = {
 	note?: string // підпис у повідомленні
 }
 export const AUTOMATIONS: Automation[] = [
-	// Розумна зарядка Маринки: порожня — швидко, майже повна — дбайливо
-	{ cmd: 'marinka', socAtMost: 30, grid: 'ON', set: { acMax: 2000 }, note: 'швидка зарядка' },
-	{ cmd: 'marinka', socAtLeast: 80, set: { acMax: 500 }, note: 'дбайлива зарядка' },
-	// Світло повернулось — швидко заряджаємо Маринку (якщо ще не майже повна)
-	{ cmd: 'marinka', on: 'gridOn', socAtMost: 79, set: { acMax: 2000 }, note: 'світло повернулось' },
+	// Зарядка Маринки (з дод. батареєю, 4 кВт·год) у сезон жорстких відключень:
+	// швидко до 80%, далі м'якше; 500 Вт працює, лише якщо ліміт заряду піднято вище 90%
+	{ cmd: 'marinka', grid: 'ON', socAtMost: 79, set: { acMax: 2000 }, note: 'швидка зарядка' },
+	{ cmd: 'marinka', grid: 'ON', socAtLeast: 80, socAtMost: 89, set: { acMax: 1000 }, note: 'м\'якше після 80%' },
+	{ cmd: 'marinka', socAtLeast: 90, set: { acMax: 500 }, note: 'дбайливо на верхніх %' },
 ]
 
 export const API = 'https://api-e.ecoflow.com'
+// Ручне керування з бота пріоритетніше за автоматизації: після дії з «Керування» станція в ручному режимі,
+// доки в її меню не натиснуть «🤖 Авто»
+
 export const MQTT_WAIT_MS = 15_000 // River 3 шле BMS-пакет кожні ~10 с

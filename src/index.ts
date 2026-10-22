@@ -33,7 +33,7 @@ function initDevices(env: Env) {
 }
 const gridSn = () => DEVICES.find((d) => d.cmd === GRID_SOURCE)?.sn ?? ''
 
-type Reading = { soc: number; remMin: number | null; loadW: number | null; gridIn: boolean | null; maxChg?: number; acMax?: number }
+type Reading = { soc: number; remMin: number | null; loadW: number | null; gridIn: boolean | null; maxChg?: number; acMax?: number; minDsg?: number }
 type DeviceState = { notified: number[]; offlineSince: number | null; offlineAlerted: boolean }
 type GridState = { state: 'ON' | 'OFF'; since: number }
 
@@ -61,12 +61,14 @@ async function readRest(env: Env, sn: string): Promise<Reading> {
 	const loadW = Number(q.powOutSumW ?? 0)
 	const acIn = Number(q.powGetAcIn ?? 0)
 	const maxChg = Number(q.cmsMaxChgSoc)
+	const minDsg = Number(q.cmsMinDsgSoc)
 	return {
 		soc,
 		loadW,
 		gridIn: acIn > 0,
 		remMin: loadW > 0 && acIn === 0 ? Number(q.cmsDsgRemTime) : null,
 		maxChg: Number.isFinite(maxChg) ? maxChg : undefined,
+		minDsg: Number.isFinite(minDsg) ? minDsg : undefined,
 	}
 }
 
@@ -106,13 +108,19 @@ type Action = { label: string; group: string; for: Device['via'] } & (
 const ACTIONS: Record<string, Action> = {
 	// DELTA 3 (офіційний API)
 	max80: { label: '80%', group: '🔝 Ліміт заряду', for: 'rest', kind: 'rest', params: { cfgMaxChgSoc: 80 } },
+	max90: { label: '90%', group: '🔝 Ліміт заряду', for: 'rest', kind: 'rest', params: { cfgMaxChgSoc: 90 } },
 	max100: { label: '100%', group: '🔝 Ліміт заряду', for: 'rest', kind: 'rest', params: { cfgMaxChgSoc: 100 } },
+	min5: { label: '5%', group: '🔻 Мін. розряд', for: 'rest', kind: 'rest', params: { cfgMinDsgSoc: 5 } },
+	min10: { label: '10%', group: '🔻 Мін. розряд', for: 'rest', kind: 'rest', params: { cfgMinDsgSoc: 10 } },
 	ac500: { label: '500 Вт', group: '🔌 Вхідна потужність', for: 'rest', kind: 'mqtt', fields: [[54, 500], [125, 0]] }, // API ігнорує; 125=0 — «застосувати»
 	ac1000: { label: '1 кВт', group: '🔌 Вхідна потужність', for: 'rest', kind: 'mqtt', fields: [[54, 1000], [125, 0]] }, // API ігнорує; 125=0 — «застосувати»
 	ac2000: { label: '2 кВт', group: '🔌 Вхідна потужність', for: 'rest', kind: 'mqtt', fields: [[54, 2000], [125, 0]] }, // API ігнорує; 125=0 — «застосувати»
 	// River 3 (MQTT; макс. вхід від мережі ~305 Вт)
 	rmax80: { label: '80%', group: '🔝 Ліміт заряду', for: 'mqtt', kind: 'mqtt', fields: [[33, 80]] },
+	rmax90: { label: '90%', group: '🔝 Ліміт заряду', for: 'mqtt', kind: 'mqtt', fields: [[33, 90]] },
 	rmax100: { label: '100%', group: '🔝 Ліміт заряду', for: 'mqtt', kind: 'mqtt', fields: [[33, 100]] },
+	rmin5: { label: '5%', group: '🔻 Мін. розряд', for: 'mqtt', kind: 'mqtt', fields: [[34, 5]] },
+	rmin10: { label: '10%', group: '🔻 Мін. розряд', for: 'mqtt', kind: 'mqtt', fields: [[34, 10]] },
 	rac100: { label: '100 Вт', group: '🔌 Вхідна потужність', for: 'mqtt', kind: 'mqtt', fields: [[54, 100]] },
 	rac200: { label: '200 Вт', group: '🔌 Вхідна потужність', for: 'mqtt', kind: 'mqtt', fields: [[54, 200]] },
 	rac300: { label: '300 Вт', group: '🔌 Вхідна потужність', for: 'mqtt', kind: 'mqtt', fields: [[54, 300]] },
@@ -176,7 +184,7 @@ async function appAuth(env: Env): Promise<AppAuth> {
 
 // ── Налаштування станцій (ліміт заряду, макс. вхід) у KV — спільні для всіх дата-центрів Cloudflare ──
 // Запис лише коли значення змінилось або минула година (≈ до 72 записів/добу на 3 станції — далеко від ліміту 1000)
-type Settings = { maxChg?: number; acMax?: number; at: number; cmdAt?: number } // cmdAt — коли змінено командою бота
+type Settings = { maxChg?: number; acMax?: number; minDsg?: number; at: number; cmdAt?: number } // cmdAt — коли змінено командою бота
 const RECENT_CMD_MS = 10 * 60_000
 const SETTINGS_FRESH_MS = 60 * 60_000
 let settingsEnv: Env // KV доступний лише через env — запам'ятовуємо на час запиту
@@ -185,16 +193,17 @@ async function getSettings(sn: string): Promise<Settings | null> {
 	if (!settingsCache.has(sn)) settingsCache.set(sn, await settingsEnv.POWER_KV.get<Settings>(`settings:${sn}`, 'json'))
 	return settingsCache.get(sn)!
 }
-async function saveSettings(sn: string, upd: { maxChg?: number; acMax?: number }, byCommand = false) {
-	if (upd.maxChg === undefined && upd.acMax === undefined) return
+async function saveSettings(sn: string, upd: { maxChg?: number; acMax?: number; minDsg?: number }, byCommand = false) {
+	if (upd.maxChg === undefined && upd.acMax === undefined && upd.minDsg === undefined) return
 	const prev = await getSettings(sn)
 	const next: Settings = {
 		maxChg: upd.maxChg ?? prev?.maxChg,
 		acMax: upd.acMax ?? prev?.acMax,
+		minDsg: upd.minDsg ?? prev?.minDsg,
 		at: Date.now(),
 		cmdAt: byCommand ? Date.now() : prev?.cmdAt,
 	}
-	const changed = !prev || prev.maxChg !== next.maxChg || prev.acMax !== next.acMax
+	const changed = !prev || prev.maxChg !== next.maxChg || prev.acMax !== next.acMax || prev.minDsg !== next.minDsg
 	if (!byCommand && !changed && Date.now() - prev.at < SETTINGS_FRESH_MS) return
 	settingsCache.set(sn, next)
 	await settingsEnv.POWER_KV.put(`settings:${sn}`, JSON.stringify(next))
@@ -253,7 +262,7 @@ async function readMqtt(
 		throw e
 	}
 	// усе, що побачили з налаштувань, — у кеш
-	await Promise.all([...parts].map(([sn, p]) => saveSettings(sn, { maxChg: restOnly.includes(sn) ? undefined : p.maxChg, acMax: p.acMax })))
+	await Promise.all([...parts].map(([sn, p]) => saveSettings(sn, { maxChg: restOnly.includes(sn) ? undefined : p.maxChg, acMax: p.acMax, minDsg: restOnly.includes(sn) ? undefined : p.minDsg })))
 	for (const [sn, p] of parts) {
 		if (p.soc === undefined || restOnly.includes(sn)) continue
 		const discharging = (p.battOutW ?? 0) > 5 && (p.battInW ?? 0) === 0
@@ -266,6 +275,7 @@ async function readMqtt(
 			gridIn,
 			maxChg: p.maxChg,
 			acMax: p.acMax,
+			minDsg: p.minDsg,
 		})
 	}
 	return { result, parts }
@@ -288,7 +298,8 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, 
 			const c = await getSettings(d.sn)
 			const recent = c?.cmdAt !== undefined && Date.now() - c.cmdAt < RECENT_CMD_MS
 			if (recent && c?.maxChg !== undefined) rd.maxChg = c.maxChg
-			else await saveSettings(d.sn, { maxChg: rd.maxChg })
+			if (recent && c?.minDsg !== undefined) rd.minDsg = c.minDsg
+			if (!recent) await saveSettings(d.sn, { maxChg: rd.maxChg, minDsg: rd.minDsg })
 			readings.set(d.sn, rd)
 		} catch (e) {
 			errors.push(`${d.name}: ${e}`)
@@ -336,6 +347,7 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, 
 			if (rd && c) {
 				rd.maxChg ??= c.maxChg
 				rd.acMax ??= c.acMax
+				rd.minDsg ??= c.minDsg
 			}
 		}
 	for (const e of errors) console.error(e)
@@ -363,6 +375,14 @@ const CONTROL_KEYBOARD = {
 	],
 }
 // …потім усі команди станції, згруповані рядками
+// ── Ручний режим: автоматизації не чіпають станцію ──
+// Безстроково — доки не натиснуть «🤖 Авто»
+type Manual = { since: number }
+const manualKey = (sn: string) => `manual:${sn}`
+const getManual = (env: Env, sn: string) => env.POWER_KV.get<Manual>(manualKey(sn), 'json')
+const setManual = (env: Env, sn: string) => env.POWER_KV.put(manualKey(sn), JSON.stringify({ since: Date.now() }))
+const clearManual = (env: Env, sn: string) => env.POWER_KV.delete(manualKey(sn))
+
 const deviceKeyboard = (d: Device) => {
 	const groups = new Map<string, { text: string; callback_data: string }[]>()
 	for (const [id, a] of Object.entries(ACTIONS)) {
@@ -373,6 +393,7 @@ const deviceKeyboard = (d: Device) => {
 	return {
 		inline_keyboard: [
 			...[...groups].flatMap(([g, row]) => [[{ text: `${g} · ${d.name}`, callback_data: 'noop' }], row]),
+			...(AUTOMATIONS.some((r) => r.cmd === d.cmd || r.cmd === '*') ? [[{ text: '🤖 Авто (скасувати ручне)', callback_data: `auto:${d.cmd}` }]] : []),
 			[
 				{ text: '⬅️ Станції', callback_data: 'menu:control' },
 				{ text: '🏠 Головна', callback_data: 'menu:main' },
@@ -483,7 +504,8 @@ const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState
 	const load = r.loadW !== null ? `\n⚡ Споживання  <b>${r.loadW} Вт</b>` : ''
 	const lim =
 		(r.maxChg !== undefined ? `\n🔝 Ліміт заряду  <b>${r.maxChg}%</b>` : '') +
-		(r.acMax !== undefined ? `\n🔌 Макс. вхід  <b>${r.acMax} Вт</b>` : '')
+		(r.acMax !== undefined ? `\n🔌 Макс. вхід  <b>${r.acMax} Вт</b>` : '') +
+		(r.minDsg !== undefined ? `\n🔻 Мін. розряд  <b>${r.minDsg}%</b>` : '')
 	return `${socIcon(r.soc)} ${head}\n<code>${bar(r.soc)}</code>  <b>${r.soc}%</b>\n${time}${load}${lim}${foot}`
 }
 
@@ -495,7 +517,9 @@ async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel
 	const errs = errors.length ? `\n\n<i>⚠️ ${esc(errors.join('; ').slice(0, 300))}</i>` : ''
 	if (devices.length === 1) {
 		const d = devices[0]
-		return { text: card(d, readings.get(d.sn), online.get(d.sn)!, grid, now) + errs, device: d }
+		const m = await getManual(env, d.sn)
+		const manualLine = m ? `\n\n✋ Ручне керування з ${clock(m.since)} — автоматика вимкнена до «🤖 Авто»` : ''
+		return { text: card(d, readings.get(d.sn), online.get(d.sn)!, grid, now) + manualLine + errs, device: d }
 	}
 	const g_ = gridText(grid, now)
 	const foot = g_ ? `\n\n${g_}` : ''
@@ -708,6 +732,8 @@ const AUTO_RETRY_MS = 30 * 60_000 // якщо станція не підтвер
 
 async function runAutomations(env: Env, readings: Map<string, Reading>, online: Map<string, boolean>, event: 'gridOn' | 'gridOff' | null) {
 	const grid = await env.POWER_KV.get<GridState>('grid', 'json')
+	const manual = new Set<string>()
+	for (const d of DEVICES) if (await getManual(env, d.sn)) manual.add(d.sn)
 	for (const [i, rule] of AUTOMATIONS.entries()) {
 		if (rule.on && rule.on !== event) continue
 		if (rule.grid && grid?.state !== rule.grid) continue
@@ -716,6 +742,7 @@ async function runAutomations(env: Env, readings: Map<string, Reading>, online: 
 		for (const d of targets) {
 			const r = readings.get(d.sn)
 			if (!online.get(d.sn) || !r) continue
+			if (manual.has(d.sn)) continue // ручне керування має пріоритет
 			if (rule.socAtLeast !== undefined && r.soc < rule.socAtLeast) continue
 			if (rule.socAtMost !== undefined && r.soc > rule.socAtMost) continue
 			const found = findAction(d, rule.set)
@@ -803,6 +830,12 @@ async function handleUpdate(env: Env, update: any) {
 			await tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: cb.message.message_id, reply_markup: markup }).catch(() => {})
 			return
 		}
+		if (ours && data.startsWith('auto:')) {
+			const d = DEVICES.find((x) => x.cmd === data.slice(5))
+			if (d) await clearManual(env, d.sn)
+			await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text: d ? `🤖 ${d.name}: автоматизації знову працюють` : '' }).catch(() => {})
+			return
+		}
 		if (ours && data.startsWith('set:')) {
 			const [, cmd, actionId] = data.split(':')
 			const d = DEVICES.find((x) => x.cmd === cmd)
@@ -815,7 +848,10 @@ async function handleUpdate(env: Env, update: any) {
 				const f = action.kind === 'mqtt' ? new Map(action.fields) : null
 				const maxChg = action.kind === 'rest' ? action.params.cfgMaxChgSoc : f?.get(33)
 				const acMax = action.kind === 'rest' ? action.params.cfgPlugInInfoAcInChgPowMax : f?.get(54)
-				if (confirmed) await saveSettings(d.sn, { maxChg, acMax }, true)
+				const minDsg = action.kind === 'rest' ? action.params.cfgMinDsgSoc : f?.get(34)
+				if (confirmed) await saveSettings(d.sn, { maxChg, acMax, minDsg }, true)
+				// ручна дія має пріоритет над автоматизаціями
+				if (AUTOMATIONS.some((r) => r.cmd === d.cmd || r.cmd === '*')) await setManual(env, d.sn)
 				const what = `${d.name}: ${action.group.replace(/^\S+\s/, '').toLowerCase()} ${action.label}`
 				note = confirmed ? `✅ ${what}` : `📤 ${what} — надіслано, станція не підтвердила. Перевір у застосунку`
 			} catch (e) {

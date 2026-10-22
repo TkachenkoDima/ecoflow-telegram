@@ -67,6 +67,7 @@ export type UpsPart = {
 	outSumW?: number // 254/21 поле 4 — загальне споживання
 	maxChg?: number // 254/21 поле 270 — ліміт заряду, %
 	acMax?: number // 254/21 поле 209 — макс. вхідна потужність AC, Вт
+	minDsg?: number // 254/21 поле 271 — мін. розряд, %
 }
 
 export function parseEcoflowPacket(payload: Uint8Array): UpsPart {
@@ -103,6 +104,8 @@ export function parseEcoflowPacket(payload: Uint8Array): UpsPart {
 				ac = num(m, 209)
 			if (mx !== undefined) part.maxChg = mx
 			if (ac !== undefined) part.acMax = ac
+			const mn = num(m, 271)
+			if (mn !== undefined) part.minDsg = mn
 		}
 	}
 	return part
