@@ -681,7 +681,8 @@ async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel
 		const m = await getManual(env, d.sn)
 		const rules = autoRules(d, readings.get(d.sn), grid, m?.since)
 		const manualLine = rules ? `\n\n${rules}` : ''
-		return { text: card(d, readings.get(d.sn), online.get(d.sn)!, grid, now) + manualLine + errs, device: d }
+		const mode = AUTOMATIONS.some((x) => x.cmd === d.cmd || x.cmd === '*') ? (m ? '✋' : '🤖') : ''
+		return { text: card(d, readings.get(d.sn), online.get(d.sn)!, grid, now, mode) + manualLine + errs, device: d }
 	}
 	const g_ = gridText(grid, now)
 	const foot = g_ ? `\n\n${g_}` : ''
@@ -1214,8 +1215,8 @@ async function screenText(line1: string, groupDev: Device, v: View | null, readi
 		const hasAuto = AUTOMATIONS.some((x) => x.cmd === d.cmd || x.cmd === '*')
 		const manual = hasAuto ? await getManual(settingsEnv, d.sn) : null
 		const rules = inControl ? autoRules(d, readings.get(d.sn), g, manual?.since) : ''
-		// на головному — лише позначка режиму біля «Макс. вхід»; в «Керування» — повний блок правил
-		const mode = hasAuto && !inControl ? (manual ? '✋' : '🤖') : ''
+		// іконка режиму в «Макс. вхід» — скрізь; в «Керування» ще й повний блок правил
+		const mode = hasAuto ? (manual ? '✋' : '🤖') : ''
 		return card(d, readings.get(d.sn), online.get(d.sn)!, g, now, mode) + (rules ? `\n\n${rules}` : '')
 	}
 	if (shown) {
