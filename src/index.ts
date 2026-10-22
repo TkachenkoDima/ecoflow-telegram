@@ -834,6 +834,8 @@ async function handleUpdate(env: Env, update: any) {
 			const d = DEVICES.find((x) => x.cmd === data.slice(5))
 			if (d) await clearManual(env, d.sn)
 			await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text: d ? `🤖 ${d.name}: автоматизації знову працюють` : '' }).catch(() => {})
+			// повертаємо головні кнопки — як «🏠 Головна»
+			await tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: cb.message.message_id, reply_markup: KEYBOARD }).catch(() => {})
 			return
 		}
 		if (ours && data.startsWith('set:')) {
