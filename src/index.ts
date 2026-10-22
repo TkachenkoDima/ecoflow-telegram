@@ -661,8 +661,12 @@ function autoRules(d: Device, r: Reading | undefined, g: GridState | null, manua
 		return !manualSince && active(x) ? `<b>${line}</b>` : line
 	})
 	const head = manualSince ? '✋ Ручне' : '🤖 Авто'
+	// ліміт заряду нижче порогу правила — до нього заряд не дійде
+	const cap = r?.maxChg
+	const dead = cap !== undefined ? rules.filter((x) => x.set.acMax !== undefined && (x.socAtLeast ?? 0) >= cap) : []
+	const capNote = dead.length ? `\n<i>Ліміт заряду ${cap}% — правила від ${Math.min(...dead.map((x) => x.socAtLeast ?? 0))}% не знадобляться</i>` : ''
 	return `${head}
-${lines.join('\n')}`
+${lines.join('\n')}${capNote}`
 }
 
 async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel> {
@@ -1515,7 +1519,11 @@ async function applyAction(env: Env, d: Device, action: Action): Promise<string>
 		const acMax = action.kind === 'rest' ? action.params.cfgPlugInInfoAcInChgPowMax : f?.get(54)
 		const minDsg = action.kind === 'rest' ? action.params.cfgMinDsgSoc : f?.get(34)
 		if (confirmed) await saveSettings(d.sn, { maxChg, acMax, minDsg }, true)
-		if (AUTOMATIONS.some((r) => r.cmd === d.cmd || r.cmd === '*')) await setManual(env, d.sn) // ручне — пріоритетніше
+		// ручний режим — лише якщо дія чіпає те, чим керує автоматика (напр. вхід Вт);
+		// ліміти заряду/розряду автоматику не ставлять на паузу
+		const rules = AUTOMATIONS.filter((r) => r.cmd === d.cmd || r.cmd === '*')
+		const conflicts = rules.some((r) => (acMax !== undefined && r.set.acMax !== undefined) || (maxChg !== undefined && r.set.maxChg !== undefined))
+		if (conflicts) await setManual(env, d.sn)
 		const what = `${d.name}: ${action.group.replace(/^\S+\s/, '').toLowerCase()} ${action.label}`
 		return confirmed ? `✅ ${what}` : `📤 ${what} — надіслано, станція не підтвердила. Перевір у застосунку`
 	} catch (e) {
