@@ -16,7 +16,7 @@ type Env = {
 	DEVICE_SNS: string // {"marinka": "D3M1…", "kate": "R655…"} — серійники не зберігаються в репо
 }
 
-import { API, AUTOMATIONS, DEVICES, GRID_SOURCE, MQTT_WAIT_MS, OFFLINE_ALERT_MIN, QUIET_FROM, QUIET_TO, RESET_GAP, THRESHOLDS, TIMEZONE, type Device } from './config'
+import { API, AUTOMATIONS, DEVICES, PIN_TO_TOP, PUSH_TTL_MIN, GRID_SOURCE, MQTT_WAIT_MS, OFFLINE_ALERT_MIN, QUIET_FROM, QUIET_TO, RESET_GAP, THRESHOLDS, TIMEZONE, type Device } from './config'
 
 // Підставляємо серійники з секрету DEVICE_SNS (за cmd станції)
 function initDevices(env: Env) {
@@ -430,6 +430,36 @@ const chatIds = (env: Env) => env.TELEGRAM_CHAT_ID.split(',').map((x) => x.trim(
 const isOurChat = (env: Env, id: unknown) => chatIds(env).includes(String(id))
 
 // Відповідь у конкретний чат (o.chatId) або розсилка в усі групи; збій однієї групи не блокує інші
+// ── Самовидалення пушів ──
+// Черга в KV на групу: [{id, at}] — коли видалити. Cron щохвилини прибирає прострочені.
+type Expiring = { id: number; at: number }
+const ttlKey = (chatId: string | number) => `ttl:${chatId}`
+const deleteAtFor = (now: number) => {
+	if (!isQuiet()) return now + PUSH_TTL_MIN * 60_000
+	// тихий режим: до ранку (QUIET_TO) + PUSH_TTL_MIN
+	let morning = dayStart(now) + QUIET_TO * 3600_000
+	if (morning <= now) morning += 86400_000
+	return morning + PUSH_TTL_MIN * 60_000
+}
+async function scheduleDelete(env: Env, chatId: string | number, messageId: number) {
+	const list = (await env.POWER_KV.get<Expiring[]>(ttlKey(chatId), 'json')) ?? []
+	list.push({ id: messageId, at: deleteAtFor(Date.now()) })
+	await env.POWER_KV.put(ttlKey(chatId), JSON.stringify(list))
+}
+async function cleanupExpired(env: Env) {
+	for (const chatId of chatIds(env)) {
+		const list = await env.POWER_KV.get<Expiring[]>(ttlKey(chatId), 'json')
+		if (!list?.length) continue
+		const now = Date.now()
+		const due = list.filter((x) => x.at <= now)
+		if (!due.length) continue
+		for (const x of due) await tgCall(env, 'deleteMessage', { chat_id: chatId, message_id: x.id }).catch(() => {})
+		const rest = list.filter((x) => x.at > now)
+		if (rest.length) await env.POWER_KV.put(ttlKey(chatId), JSON.stringify(rest))
+		else await env.POWER_KV.delete(ttlKey(chatId))
+	}
+}
+
 // «Станція групи» — та, що закріплена через /pin; без /pin група отримує все
 const groupStation = async (env: Env, chatId: string | number) => (await env.POWER_KV.get<{ cmd: string }>(`pin:${chatId}`, 'json'))?.cmd
 
@@ -450,6 +480,7 @@ async function telegram(env: Env, text: string, o: SendOpts = {}) {
 				disable_notification: o.silent || (!o.loud && isQuiet()),
 				...(o.keyboard ? { reply_markup: KEYBOARD } : {}),
 			})
+			if (msg?.message_id) await scheduleDelete(env, chat_id, msg.message_id)
 			// схема «лише останнє»: прибираємо попередній пуш цього ж типу
 			if (o.replaceKey && msg?.message_id) {
 				const key = `${o.replaceKey}:${chat_id}`
@@ -893,7 +924,10 @@ async function showInPinned(env: Env, chatId: string | number, pin: Pin, line1: 
 
 async function pinCommand(env: Env, chatId: number | string, arg: string | undefined): Promise<string> {
 	const old = await env.POWER_KV.get<Pin>(pinKey(chatId), 'json')
-	if (old) await tgCall(env, 'unpinChatMessage', { chat_id: chatId, message_id: old.messageId }).catch(() => {})
+	if (old) {
+		await tgCall(env, 'unpinChatMessage', { chat_id: chatId, message_id: old.messageId }).catch(() => {})
+		await tgCall(env, 'deleteMessage', { chat_id: chatId, message_id: old.messageId }).catch(() => {}) // старий «екран» більше не потрібен
+	}
 	if (!arg) {
 		await env.POWER_KV.delete(pinKey(chatId))
 		return old ? '📌 Смужку прибрано' : '📌 Закріпленої смужки не було'
@@ -911,12 +945,13 @@ async function pinCommand(env: Env, chatId: number | string, arg: string | undef
 		disable_notification: true,
 		reply_markup: KEYBOARD,
 	})
-	try {
-		await tgCall(env, 'pinChatMessage', { chat_id: chatId, message_id: msg.message_id, disable_notification: true })
-	} catch (e) {
-		console.error('pinChatMessage', e)
-		return '⚠️ Не можу закріпити: зробіть бота адміністратором групи з правом «Закріплювати повідомлення» і повторіть /pin'
-	}
+	if (PIN_TO_TOP)
+		try {
+			await tgCall(env, 'pinChatMessage', { chat_id: chatId, message_id: msg.message_id, disable_notification: true })
+		} catch (e) {
+			console.error('pinChatMessage', e)
+			return '⚠️ Не можу закріпити: зробіть бота адміністратором групи з правом «Закріплювати повідомлення» і повторіть /pin'
+		}
 	await env.POWER_KV.put(pinKey(chatId), JSON.stringify({ cmd: d.cmd, messageId: msg.message_id }))
 	return ''
 }
@@ -939,6 +974,7 @@ async function run(env: Env) {
 	const event = await checkGrid(env, readings, online)
 	await runAutomations(env, readings, online, event).catch((e) => console.error('automations', e))
 	await updatePins(env, readings, online).catch((e) => console.error('pins', e))
+	await cleanupExpired(env).catch((e) => console.error('cleanup', e))
 }
 
 // ── Telegram webhook: команди і кнопки ──────────────────────────
