@@ -673,7 +673,8 @@ function autoRules(d: Device, r: Reading | undefined, g: GridState | null, manua
 	const dead = cap !== undefined ? rules.filter((x) => x.set.acMax !== undefined && (x.socAtLeast ?? 0) >= cap) : []
 	// короткими рядками, щоб не розширювати екран
 	const deadRanges = dead.map((x) => range(x.socAtLeast, x.socAtMost))
-	const capNote = dead.length
+	// у ручному режимі правила й так не працюють — підказка лише заплутує
+	const capNote = dead.length && !manualSince
 		? `\n\n<i>⚠️ Ліміт заряду ${cap}%\nвище заряд не піде,\n${dead.length === 1 ? `правило ${deadRanges[0]} не діє` : `не діють правила:\n${deadRanges.join(', ')}`}</i>`
 		: ''
 	return `${head}
@@ -1208,7 +1209,7 @@ async function screenText(line1: string, groupDev: Device, v: View | null, readi
 	}
 	if (shown) {
 		await mergeSettings(readings.get(shown.sn), shown.sn)
-		content = (v?.note ? `${esc(v.note)}\n\n` : '') + (await withAuto(shown))
+		content = (v?.note ? `${v.note}\n\n` : '') + (await withAuto(shown))
 	} else if (v?.body) content = v.body
 	else {
 		await mergeSettings(readings.get(groupDev.sn), groupDev.sn)
@@ -1402,7 +1403,7 @@ async function handleUpdate(env: Env, update: any) {
 			if (!note.startsWith('✅')) await new Promise((r) => setTimeout(r, 2000))
 			const panel = await render(env, d.cmd)
 			if (panel) {
-				panel.text = `${esc(note)}\n\n${panel.text}`
+				panel.text = `${note}\n\n${panel.text}`
 				await sendPanel(env, chatId, panel)
 			}
 			return
@@ -1453,9 +1454,10 @@ const labelFor = (data: string) =>
 async function pinnedCallback(env: Env, cb: any, chatId: number | string, pin: Pin, data: string) {
 	const answer = (text?: string) => tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text }).catch(() => {})
 	// Миттєвий відгук: одразу міняємо кнопки (і показуємо «завантажую», якщо буде інший вміст), дані — слідом
-	const instant = (markup: object, loading?: string) =>
+	// два короткі рядки (що + дія), щоб не розширювати екран
+	const instant = (markup: object, loading?: string, verb = 'завантажую') =>
 		loading
-			? tgCall(env, 'editMessageText', { chat_id: chatId, message_id: pin.messageId, text: padWidth(`⏳ ${esc(loading)}…`), parse_mode: 'HTML', reply_markup: markup }).catch(() => {})
+			? tgCall(env, 'editMessageText', { chat_id: chatId, message_id: pin.messageId, text: padWidth(`⏳ ${esc(loading)}\n${verb}…`), parse_mode: 'HTML', reply_markup: markup }).catch(() => {})
 			: tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: pin.messageId, reply_markup: markup }).catch(() => {})
 	const nameOf = (cmd: string) => DEVICES.find((x) => x.cmd === cmd)?.name ?? cmd
 	if (data === 'noop') return answer()
@@ -1483,13 +1485,13 @@ async function pinnedCallback(env: Env, cb: any, chatId: number | string, pin: P
 		if (d) await clearManual(env, d.sn)
 		await answer()
 		if (!d) return
-		await instant(KEYBOARD, `${d.name}: авто`)
+		await instant(KEYBOARD, `${d.name}\nавто режим`, 'застосовую правило')
 		// не чекаємо cron — застосовуємо чинне правило одразу
 		const { readings, online } = await readCached(env, [d], false)
 		const g = await env.POWER_KV.get<GridState>('grid', 'json')
 		const rule = AUTOMATIONS.find((x) => (x.cmd === d.cmd || x.cmd === '*') && ruleActive(x, readings.get(d.sn), g))
 		await runAutomations(env, readings, online, null).catch((e) => console.error('automations', e))
-		const note = `🤖 Авто режим\n${rule ? `${ruleWhat(rule)} (${rule.socAtLeast ?? 0}–${rule.socAtMost ?? 100}%)` : 'зараз жодне правило не діє'}`
+		const note = `✅ ${esc(d.name)}\n🤖 авто режим увімкнено\n${rule ? `${ruleWhat(rule).replace('вхід ', 'вхід → ')} (${rule.socAtLeast ?? 0}–${rule.socAtMost ?? 100}%)` : 'правила зараз не діють'}`
 		return showInPinned(env, chatId, pin, { dev: d.cmd, note, menu: 'main' })
 	}
 	if (data.startsWith('set:')) {
@@ -1498,7 +1500,7 @@ async function pinnedCallback(env: Env, cb: any, chatId: number | string, pin: P
 		const action = ACTIONS[actionId]
 		if (!d || !action || action.for !== d.via) return answer()
 		await answer()
-		await instant(deviceKeyboard(d), `${d.name}: ${action.label}`)
+		await instant(deviceKeyboard(d), `${d.name}\n${shortGroup(action)} → ${action.label}`, 'надсилаю')
 		const note = await applyAction(env, d, action)
 		if (!note.startsWith('✅')) await new Promise((r) => setTimeout(r, 2000))
 		return showInPinned(env, chatId, pin, { dev: d.cmd, note, menu: `dev:${d.cmd}` })
@@ -1517,7 +1519,13 @@ async function pinnedCallback(env: Env, cb: any, chatId: number | string, pin: P
 }
 
 // Ручна дія з «Керування»: виконати, запам'ятати, увімкнути ручний режим; повертає текст результату
+// «🔌 Вхідна потужність» → «вхід»: коротка назва налаштування для повідомлень
+const shortGroup = (a: Action) => a.group.replace(/^\S+\s/, '').toLowerCase().replace('вхідна потужність', 'вхід')
+
+// Результат — коротко, кількома рядками (щоб не розширювати екран):
+// ✅ Маринка / ліміт заряду → 80% / застосовано (+ ✋ автоматика на паузі, якщо дія її вимкнула)
 async function applyAction(env: Env, d: Device, action: Action): Promise<string> {
+	const what = `${esc(d.name)}\n${shortGroup(action)} → ${action.label}`
 	try {
 		const confirmed = await runAction(env, d, action)
 		const f = action.kind === 'mqtt' ? new Map(action.fields) : null
@@ -1530,11 +1538,11 @@ async function applyAction(env: Env, d: Device, action: Action): Promise<string>
 		const rules = AUTOMATIONS.filter((r) => r.cmd === d.cmd || r.cmd === '*')
 		const conflicts = rules.some((r) => (acMax !== undefined && r.set.acMax !== undefined) || (maxChg !== undefined && r.set.maxChg !== undefined))
 		if (conflicts) await setManual(env, d.sn)
-		const what = `${d.name}: ${action.group.replace(/^\S+\s/, '').toLowerCase().replace('вхідна потужність', 'вхід')} ${action.label}`
-		return confirmed ? `✅ ${what}` : `📤 ${what}\nнадіслано, без підтвердження`
+		const pause = conflicts ? '\n✋ автоматика на паузі' : ''
+		return confirmed ? `✅ ${what}\nзастосовано${pause}` : `📤 ${what}\nнадіслано, станція\nне підтвердила${pause}`
 	} catch (e) {
 		console.error('set', e)
-		return `⚠️ Не вдалося: ${String(e).replace(/^Error:\s*/, '').slice(0, 150)}`
+		return `⚠️ ${what}\nне вдалося:\n${esc(String(e).replace(/^Error:\s*/, '').slice(0, 60))}`
 	}
 }
 
