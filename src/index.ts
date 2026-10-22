@@ -837,10 +837,9 @@ const pinFirstLine = (d: Device, r: Reading | undefined, isOnline: boolean, g: G
 }
 
 const pinBody = (line1: string, body: string, v: View | null, d: Device, now: number) => {
-	const footer = v?.body
-		? `<i>👁 ${esc(v.label ?? '')} · о ${clock(v.at + VIEW_TTL_S * 1000)} повернусь до «${esc(d.name)}»</i>`
-		: `<i>Оновлюється щохвилини · ${clock(now)}</i>`
-	return `${line1}\n\n${v?.body ?? body}\n\n${footer}`
+	// для відкритого перегляду (інша станція, статистика…) підпису немає — через 3 хв екран тихо повертається до станції групи
+	const footer = v?.body ? '' : `\n\n<i>Оновлюється щохвилини · ${clock(now)}</i>`
+	return `${line1}\n\n${v?.body ?? body}${footer}`
 }
 
 async function editPinned(env: Env, chatId: string | number, pin: Pin, text: string, markup: object) {
