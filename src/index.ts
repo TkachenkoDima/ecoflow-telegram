@@ -584,7 +584,7 @@ const hhmm = (minutes: number) => {
 }
 const duration = (ms: number) => {
 	const m = Math.floor(ms / 60000)
-	return m < 60 ? `${m} хв` : `${Math.floor(m / 60)} год ${m % 60} хв`
+	return m < 60 ? `${m} хв` : `${Math.floor(m / 60)} год${m % 60 ? ` ${m % 60} хв` : ''}`
 }
 const clock = (t: number, sec = false) =>
 	new Date(t).toLocaleTimeString('uk-UA', { timeZone: TIMEZONE, hour: '2-digit', minute: '2-digit', ...(sec ? { second: '2-digit' } : {}) })
@@ -595,7 +595,7 @@ const bar = (soc: number) => {
 }
 
 
-type Panel = { text: string; device?: Device }
+type Panel = { text: string; device?: Device; markup?: object }
 
 // Стан станції одним рядком: «⏳ 04:01 · ⚡ 58 Вт» / «🔌 від мережі»
 const stateLine = (r: Reading) => {
@@ -701,7 +701,7 @@ async function sendPanel(env: Env, chatId: string | number, p: Panel, markup: ob
 		parse_mode: 'HTML',
 		link_preview_options: { is_disabled: true },
 		disable_notification: true, // відповідь на дію — без звуку
-		reply_markup: markup,
+		reply_markup: p.markup ?? markup,
 	})
 	if (prev && prev !== msg?.message_id && !(await isPinnedMsg(env, chatId, prev))) await removeMsg(env, chatId, prev)
 	if (msg?.message_id) await env.POWER_KV.put(panelKey(chatId), String(msg.message_id))
@@ -780,12 +780,12 @@ async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<s
 }
 
 // ── Статистика відключень ───────────────────────────────────────
-// Лог завершених відключень у KV (1 запис на подію), зберігаємо 35 днів
+// Лог завершених відключень у KV (1 запис на подію), зберігаємо ~рік (≈40 байт на подію)
 type Outage = { from: number; to: number }
 async function logOutage(env: Env, from: number, to: number) {
 	const log = (await env.POWER_KV.get<Outage[]>('outlog', 'json')) ?? []
 	log.push({ from, to })
-	const keep = log.filter((o) => o.to > Date.now() - 35 * 86400_000)
+	const keep = log.filter((o) => o.to > Date.now() - 400 * 86400_000)
 	await env.POWER_KV.put('outlog', JSON.stringify(keep))
 }
 
@@ -846,20 +846,223 @@ const fmtOut = (o: { count: number; ms: number; carryMs: number }) => {
 	return `${o.count} ${times(o.count)} · ${duration(o.ms)} без світла${carry}`
 }
 
-async function statsText(env: Env) {
+// ── Розділ «📈 Статистика»: тиждень / місяць / календар / день ──
+// callback_data: st:w:<зсув> тиждень · st:m:<зсув> місяць · st:c:<зсув> календар місяця · st:d:<рік>-<міс>-<день> день
+// Зсув — 0 поточний, -1 попередній… «Назад»: день → календар → місяць → головна; тиждень/місяць → головна
+const MONTHS = ['Січень', 'Лютий', 'Березень', 'Квітень', 'Травень', 'Червень', 'Липень', 'Серпень', 'Вересень', 'Жовтень', 'Листопад', 'Грудень']
+const WD = ['Нд', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб']
+// місцева (Київ) дата → мітка часу початку цього дня; Date.UTC сам переносить «32 жовтня» → 1 листопада
+const localDay = (y: number, m: number, d: number) => {
+	const g = Date.UTC(y, m, d)
+	return g - tzOffset(g - tzOffset(g))
+}
+const ymd = (t: number) => {
+	const d = new Date(t + tzOffset(t))
+	return { y: d.getUTCFullYear(), m: d.getUTCMonth(), d: d.getUTCDate(), wd: d.getUTCDay() }
+}
+const weekStart = (off: number, now: number) => {
+	const n = ymd(now)
+	return localDay(n.y, n.m, n.d - ((n.wd + 6) % 7) + 7 * off)
+}
+const monthStart = (off: number, now: number) => {
+	const n = ymd(now)
+	return localDay(n.y, n.m + off, 1)
+}
+const monthOffsetOf = (t: number, now: number) => {
+	const a = ymd(t),
+		b = ymd(now)
+	return (a.y - b.y) * 12 + (a.m - b.m)
+}
+const hm = (ms: number) => {
+	const m = Math.round(ms / 60_000)
+	return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}`
+}
+const pad2 = (n: number) => String(n).padStart(2, '0')
+// смужка частки часу без світла: 8 клітинок = 100%
+const offBar = (ms: number, span: number) => {
+	const c = ms ? Math.min(8, Math.max(1, Math.round((ms / span) * 8))) : 0
+	return `<code>${'▰'.repeat(c)}${'▱'.repeat(8 - c)}</code>`
+}
+
+async function statsData(env: Env) {
 	const now = Date.now()
-	const today = dayStart(now)
-	const yest = dayStart(today - 1)
-	const week = dayStart(today - 6 * 86400_000 + 3600_000) // 7 днів, включно з сьогодні
 	const grid = await env.POWER_KV.get<GridState>('grid', 'json')
-	const nowLine = grid ? (grid.state === 'ON' ? `💡 Зараз світло є ${duration(now - grid.since)}` : `🕯 Зараз світла немає ${duration(now - grid.since)}`) : ''
-	return (
-		`📈 <b>Відключення</b>   <i>${clock(now)}</i>\n\n` +
-		`Сьогодні: ${fmtOut(await outagesIn(env, today, now))}\n` +
-		`Вчора (${dateLabel(yest)}): ${fmtOut(await outagesIn(env, yest, today))}\n` +
-		`За 7 днів: ${fmtOut(await outagesIn(env, week, now))}` +
-		(nowLine ? `\n\n${nowLine}` : '')
-	)
+	const log = (await env.POWER_KV.get<Outage[]>('outlog', 'json')) ?? []
+	const all: Outage[] = [...log, ...(grid?.state === 'OFF' ? [{ from: grid.since, to: now }] : [])]
+	// з якого моменту бот веде лог — раніше даних немає (а не «без відключень»)
+	const started = Number((await env.POWER_KV.get('started:v3')) ?? now)
+	const trackFrom = Math.min(started, all[0]?.from ?? now, grid?.since ?? now)
+	const inRange = (a: number, b: number) => {
+		let count = 0,
+			ms = 0
+		for (const o of all) {
+			const x = Math.max(o.from, a),
+				y = Math.min(o.to, b)
+			if (y <= x) continue
+			ms += y - x
+			if (o.from >= a) count++
+		}
+		return { count, ms }
+	}
+	// підсумок періоду: разом, частка зі світлом, найдовше, середнє, найчастіші години
+	const summary = (a: number, b: number) => {
+		const end = Math.min(b, now)
+		const o = inRange(a, end)
+		const span = end - Math.max(a, trackFrom)
+		if (span <= 0) return ['<i>немає даних</i>']
+		if (!o.ms) return ['Без відключень ✨']
+		const lines = [`Разом: ${o.count ? `${o.count} ${times(o.count)} · ` : ''}${duration(o.ms)}${o.count ? '' : ' (з попереднього дня)'} · світло ${Math.max(0, Math.round(100 - (o.ms / span) * 100))}% часу`]
+		const started = all.filter((x) => x.from >= a && x.from < end)
+		const longest = [...started].sort((x, y) => y.to - y.from - (x.to - x.from))[0]
+		if (longest && started.length > 1) {
+			const cur = grid?.state === 'OFF' && longest.from === grid.since
+			lines.push(`Найдовше: ${duration(longest.to - longest.from)} · ${dateLabel(longest.from)} ${clock(longest.from)}–${cur ? 'досі' : clock(longest.to)}`)
+		}
+		const done = started.filter((x) => !(grid?.state === 'OFF' && x.from === grid.since))
+		if (done.length >= 2) lines.push(`Середнє: ${duration(done.reduce((s, x) => s + x.to - x.from, 0) / done.length)}`)
+		if (done.length >= 3) {
+			// хвилини без світла за годинами доби → найгірше 3-годинне вікно
+			const byHour = new Array(24).fill(0)
+			for (const x of all) {
+				const f = Math.max(x.from, a),
+					t2 = Math.min(x.to, end)
+				if (t2 <= f) continue
+				const off = tzOffset(f)
+				for (let t = f; t < t2; t += 5 * 60_000) byHour[new Date(t + off).getUTCHours()] += 5
+			}
+			const win = (h: number) => byHour[h] + byHour[(h + 1) % 24] + byHour[(h + 2) % 24]
+			let best = 0
+			for (let h = 1; h < 24; h++) if (win(h) > win(best)) best = h
+			lines.push(`Найчастіше без світла: ${pad2(best)}:00–${pad2((best + 3) % 24)}:00`)
+		}
+		return lines
+	}
+	return { now, grid, all, trackFrom, inRange, summary }
+}
+
+const NAV_BOTTOM = (back: string) => [
+	{ text: '⬅️ Назад', callback_data: back },
+	{ text: '🏠 Головна', callback_data: 'menu:main' },
+]
+const btn = (text: string, data: string) => ({ text, callback_data: data })
+const blank = () => btn(DIVIDER, 'noop')
+
+async function statsView(env: Env, data: string): Promise<{ text: string; markup: object }> {
+	const S = await statsData(env)
+	const { now, trackFrom } = S
+	const [, kind, arg = '0'] = data === 'stats' ? ['st', 'w', '0'] : data.split(':')
+	const nowLine = S.grid ? (S.grid.state === 'ON' ? `💡 Зараз світло є ${duration(now - S.grid.since)}` : `🕯 Зараз світла немає ${duration(now - S.grid.since)}`) : ''
+	const dayRow = (a: number, b: number, label: string) => {
+		const end = Math.min(b, now)
+		if (end <= trackFrom) return `${label}  —`
+		const o = S.inRange(a, end)
+		return `${label}  ${offBar(o.ms, end - a)}  ${o.ms ? (o.count ? o.count + ' · ' : '') + hm(o.ms) : '✨'}`
+	}
+	const modeRow = (k: 'w' | 'm') => [btn(k === 'w' ? '✓ Тиждень' : 'Тиждень', 'st:w:0'), btn(k === 'm' ? '✓ Місяць' : 'Місяць', 'st:m:0')]
+	const arrows = (k: string, off: number, label: string, canBack: boolean) => [
+		canBack ? btn('◀', `st:${k}:${off - 1}`) : blank(),
+		btn(label, 'noop'),
+		off < 0 ? btn('▶', `st:${k}:${off + 1}`) : blank(),
+	]
+
+	if (kind === 'w' || kind === 'm') {
+		const off = Math.min(0, Number(arg) || 0)
+		const a = kind === 'w' ? weekStart(off, now) : monthStart(off, now)
+		const b = kind === 'w' ? weekStart(off + 1, now) : monthStart(off + 1, now)
+		const title = kind === 'w' ? `${dateLabel(a)}–${dateLabel(b - 1)}` : `${MONTHS[ymd(a).m]} ${ymd(a).y}`
+		const rows: string[] = []
+		if (kind === 'w') {
+			for (let i = 0, t = a; i < 7 && t < now; i++) {
+				const next = localDay(ymd(a).y, ymd(a).m, ymd(a).d + i + 1)
+				rows.push(dayRow(t, next, `${WD[ymd(t).wd]} ${dateLabel(t)}`))
+				t = next
+			}
+		} else {
+			// по тижнях (пн–нд), обрізаних межами місяця
+			let t = a
+			while (t < b && t < now) {
+				const p = ymd(t)
+				const next = Math.min(b, localDay(p.y, p.m, p.d + 7 - ((p.wd + 6) % 7)))
+				rows.push(dayRow(t, next, `${pad2(p.d)}–${pad2(ymd(next - 1).d)}`))
+				t = next
+			}
+		}
+		const cur = off === 0
+		const text =
+			`📈 <b>${kind === 'w' ? 'Тиждень' : 'Місяць'}</b> · ${title}\n\n${rows.join('\n')}\n\n${S.summary(a, b).join('\n')}` + (cur && nowLine ? `\n\n${nowLine}` : '')
+		const markup = {
+			inline_keyboard: [
+				modeRow(kind),
+				arrows(kind, off, title, a > trackFrom),
+				[btn('📅 Календар', `st:c:${monthOffsetOf(a, now)}`)],
+				NAV_BOTTOM('menu:main'),
+			],
+		}
+		return { text, markup }
+	}
+
+	if (kind === 'c') {
+		const off = Math.min(0, Number(arg) || 0)
+		const a = monthStart(off, now)
+		const b = monthStart(off + 1, now)
+		const p = ymd(a)
+		const days: Array<{ text: string; callback_data: string }> = []
+		for (let i = 0; i < (p.wd + 6) % 7; i++) days.push(blank())
+		for (let t = a, d = 1; t < b; d++, t = localDay(p.y, p.m, d)) {
+			const next = localDay(p.y, p.m, d + 1)
+			if (t > now || next <= trackFrom) days.push(btn(String(d), 'noop')) // майбутнє / до початку логу — без дії
+			else {
+				const o = S.inRange(t, Math.min(next, now))
+				days.push(btn(o.ms ? `${d}•` : String(d), `st:d:${p.y}-${p.m + 1}-${d}`))
+			}
+		}
+		while (days.length % 7) days.push(blank())
+		const grid: object[][] = [['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Нд'].map((x) => btn(x, 'noop'))]
+		for (let i = 0; i < days.length; i += 7) grid.push(days.slice(i, i + 7))
+		const title = `${MONTHS[p.m]} ${p.y}`
+		const text = `📅 <b>Календар</b> · ${title}\n\n<b>•</b> — були відключення. Оберіть день.\n\n${S.summary(a, b)[0]}`
+		const markup = { inline_keyboard: [arrows('c', off, title, a > trackFrom), ...grid, NAV_BOTTOM(`st:m:${off}`)] }
+		return { text, markup }
+	}
+
+	// день
+	const [y, m, d] = arg.split('-').map(Number)
+	const a = localDay(y, m - 1, d)
+	const b = localDay(y, m - 1, d + 1)
+	const end = Math.min(b, now)
+	const list = S.all
+		.filter((o) => o.to > a && o.from < end)
+		.map((o) => {
+			const ongoing = S.grid?.state === 'OFF' && o.from === S.grid.since
+			const f = o.from < a ? `${clock(o.from)} ${dateLabel(o.from)}` : clock(o.from)
+			const t = ongoing ? 'досі' : o.to > b ? `${clock(o.to)} ${dateLabel(o.to)}` : clock(o.to)
+			return `${f}–${t} · ${duration(o.to - o.from)}`
+		})
+	// таймлайн доби: 24 клітинки по годині (▰ — без світла ≥ 30 хв цієї години)
+	let line = ''
+	for (let h = 0; h < 24; h++) {
+		const ha = a + h * 3600_000,
+			hb = ha + 3600_000
+		line += ha >= now ? '·' : S.inRange(ha, Math.min(hb, now)).ms >= 30 * 60_000 ? '▰' : '▱'
+	}
+	const body =
+		end <= trackFrom
+			? '<i>немає даних</i>'
+			: `<code>${line}</code>\n<code>0     6     12    18   </code>\n\n${list.length ? list.join('\n') : 'Без відключень ✨'}\n\n${S.summary(a, b).join('\n')}`
+	const text = `📈 <b>${WD[ymd(a).wd]} ${dateLabel(a)}</b>\n\n${body}`
+	const prev = ymd(a - 1),
+		next = ymd(b)
+	const markup = {
+		inline_keyboard: [
+			[
+				b - 86400_000 > trackFrom ? btn('◀', `st:d:${prev.y}-${prev.m + 1}-${prev.d}`) : blank(),
+				btn(dateLabel(a), 'noop'),
+				b < now ? btn('▶', `st:d:${next.y}-${next.m + 1}-${next.d}`) : blank(),
+			],
+			NAV_BOTTOM(`st:c:${monthOffsetOf(a, now)}`),
+		],
+	}
+	return { text, markup }
 }
 
 // Меню команд у Telegram будується з config.ts і оновлюється лише при змінах
@@ -954,7 +1157,7 @@ const isPinnedMsg = async (env: Env, chatId: string | number, messageId: number)
 // Стан «екрана» в закріпленому: що показано і яке меню кнопок. Живе VIEW_TTL_S, потім — картка станції групи
 // body — статичний вміст (усі станції, статистика); dev — «жива» картка цієї станції (оновлюється щохвилини);
 // note — рядок результату над карткою (напр. «✅ Router: ліміт 90%»)
-type View = { body?: string; dev?: string; note?: string; label?: string; menu?: string; at: number }
+type View = { body?: string; dev?: string; note?: string; label?: string; menu?: string; markup?: object; at: number }
 const VIEW_TTL_S = 180
 const viewKey = (chatId: string | number) => `view:${chatId}`
 const getView = (env: Env, chatId: string | number) => env.POWER_KV.get<View>(viewKey(chatId), 'json')
@@ -1027,7 +1230,7 @@ async function updatePins(env: Env, readings: Map<string, Reading>, online: Map<
 		if (!d) continue
 		const v = await getView(env, chatId)
 		const line1 = pinFirstLine(d, readings.get(d.sn), online.get(d.sn)!, g, now)
-		await editPinned(env, chatId, pin, await screenText(line1, d, v, readings, online, g, now), menuMarkup(v?.menu))
+		await editPinned(env, chatId, pin, await screenText(line1, d, v, readings, online, g, now), v?.markup ?? menuMarkup(v?.menu))
 	}
 }
 
@@ -1042,7 +1245,7 @@ async function showInPinned(
 	const content = upd.body !== undefined || upd.dev !== undefined
 	const v: View = content
 		? { body: upd.body, dev: upd.dev, note: upd.note, label: upd.label, menu: upd.menu ?? prev?.menu, at: Date.now() }
-		: { ...(prev ?? { at: Date.now() }), menu: upd.menu ?? prev?.menu }
+		: { ...(prev ?? { at: Date.now() }), menu: upd.menu ?? prev?.menu, markup: undefined }
 	const isDefault = !v.body && !v.dev && (!v.menu || v.menu === 'main')
 	if (isDefault) await env.POWER_KV.delete(viewKey(chatId))
 	else await saveView(env, chatId, v)
@@ -1055,6 +1258,13 @@ async function showInPinned(
 	const now = Date.now()
 	const line1 = pinFirstLine(d, readings.get(d.sn), online.get(d.sn)!, g, now)
 	await editPinned(env, chatId, pin, await screenText(line1, d, isDefault ? null : v, readings, online, g, now), menuMarkup(v.menu))
+}
+
+// Розділ статистики в «екрані»: свій текст і свої кнопки (поки відкритий — cron їх не чіпає)
+async function pinnedStats(env: Env, chatId: string | number, pin: Pin, data: string) {
+	const { text, markup } = await statsView(env, data)
+	await saveView(env, chatId, { body: text, markup, menu: 'stats', at: Date.now() })
+	await editPinned(env, chatId, pin, text, markup)
 }
 
 async function pinCommand(env: Env, chatId: number | string, arg: string | undefined): Promise<string> {
@@ -1121,7 +1331,10 @@ async function helpText() {
 
 async function render(env: Env, cmd: string): Promise<Panel | null> {
 	if (cmd === 'help' || cmd === 'start') return { text: await helpText() }
-	if (cmd === 'stats') return { text: await statsText(env) }
+	if (cmd === 'stats') {
+		const v = await statsView(env, 'stats')
+		return { text: v.text, markup: v.markup }
+	}
 	const devices = cmd === 'status' ? DEVICES : DEVICES.filter((d) => d.cmd === cmd)
 	if (!devices.length) return null
 	try {
@@ -1179,6 +1392,12 @@ async function handleUpdate(env: Env, update: any) {
 			}
 			return
 		}
+		if (ours && data.startsWith('st:')) {
+			await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id }).catch(() => {})
+			const v = await statsView(env, data)
+			await tgCall(env, 'editMessageText', { chat_id: chatId, message_id: cb.message.message_id, text: `${v.text}\n${DIVIDER}`, parse_mode: 'HTML', reply_markup: v.markup }).catch(() => {})
+			return
+		}
 		await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text: ours ? 'Оновлюю…' : undefined }).catch(() => {})
 		if (!ours) return
 		const panel = await render(env, data)
@@ -1207,6 +1426,7 @@ async function handleUpdate(env: Env, update: any) {
 	if (!panel) return
 	await removeUserMsg(env, msg)
 	const pin = await env.POWER_KV.get<Pin>(pinKey(msg.chat.id), 'json')
+	if (pin && cmd === 'stats') return pinnedStats(env, msg.chat.id, pin, 'stats')
 	if (pin) return showInPinned(env, msg.chat.id, pin, DEVICES.some((x) => x.cmd === cmd) ? { dev: cmd } : { body: panel.text, label: labelFor(cmd) })
 	await sendPanel(env, msg.chat.id, panel)
 }
@@ -1259,6 +1479,10 @@ async function pinnedCallback(env: Env, cb: any, chatId: number | string, pin: P
 		const note = await applyAction(env, d, action)
 		if (!note.startsWith('✅')) await new Promise((r) => setTimeout(r, 2000))
 		return showInPinned(env, chatId, pin, { dev: d.cmd, note, menu: `dev:${d.cmd}` })
+	}
+	if (data === 'stats' || data.startsWith('st:')) {
+		await answer()
+		return pinnedStats(env, chatId, pin, data)
 	}
 	await answer()
 	const prevMenu = (await getView(env, chatId))?.menu
