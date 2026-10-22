@@ -621,7 +621,8 @@ const gridText = (g: GridState | null, now: number) =>
 	!g ? '' : g.state === 'ON' ? `💡 Світло є з ${clock(g.since)}` : `🕯 Без світла ${duration(now - g.since)} · з ${clock(g.since)}`
 
 // Детальна картка однієї станції: усе звичайним текстом, світло — окремим рядком знизу
-const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState | null, now: number) => {
+// mode — іконка замість 🔌 у «Макс. вхід»: хто ним зараз керує (🤖 авто / ✋ ручне)
+const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState | null, now: number, mode = '') => {
 	const head = `<b>${esc(d.name)}</b>   <i>${clock(now)}</i>`
 	const g_ = gridText(g, now)
 	const foot = g_ ? `\n\n${g_}` : ''
@@ -632,7 +633,7 @@ const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState
 	const load = r.loadW !== null ? `\n⚡ Споживання  <b>${r.loadW} Вт</b>` : ''
 	const lim =
 		(r.maxChg !== undefined ? `\n🔝 Ліміт заряду  <b>${r.maxChg}%</b>` : '') +
-		(r.acMax !== undefined ? `\n🔌 Макс. вхід  <b>${r.acMax} Вт</b>` : '') +
+		(r.acMax !== undefined ? `\n${mode || '🔌'} Макс. вхід  <b>${r.acMax} Вт</b>` : '') +
 		(r.minDsg !== undefined ? `\n🔻 Мін. розряд  <b>${r.minDsg}%</b>` : '')
 	return `${socIcon(r.soc)} ${head}\n<code>${bar(r.soc)}</code>  <b>${r.soc}%</b>\n${time}${load}${lim}${foot}`
 }
@@ -1210,8 +1211,12 @@ async function screenText(line1: string, groupDev: Device, v: View | null, readi
 	// правила автоматики — лише в «Керування → станція», на головному екрані не потрібні
 	const inControl = !!v?.menu?.startsWith('dev:')
 	const withAuto = async (d: Device) => {
-		const rules = inControl ? autoRules(d, readings.get(d.sn), g, (await getManual(settingsEnv, d.sn))?.since) : ''
-		return card(d, readings.get(d.sn), online.get(d.sn)!, g, now) + (rules ? `\n\n${rules}` : '')
+		const hasAuto = AUTOMATIONS.some((x) => x.cmd === d.cmd || x.cmd === '*')
+		const manual = hasAuto ? await getManual(settingsEnv, d.sn) : null
+		const rules = inControl ? autoRules(d, readings.get(d.sn), g, manual?.since) : ''
+		// на головному — лише позначка режиму біля «Макс. вхід»; в «Керування» — повний блок правил
+		const mode = hasAuto && !inControl ? (manual ? '✋' : '🤖') : ''
+		return card(d, readings.get(d.sn), online.get(d.sn)!, g, now, mode) + (rules ? `\n\n${rules}` : '')
 	}
 	if (shown) {
 		await mergeSettings(readings.get(shown.sn), shown.sn)
