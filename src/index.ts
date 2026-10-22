@@ -618,7 +618,7 @@ const table = (devices: Device[], readings: Map<string, Reading>, online: Map<st
 
 // Рядок про світло — простим текстом під блоком
 const gridText = (g: GridState | null, now: number) =>
-	!g ? '' : g.state === 'ON' ? `💡 Світло є з ${clock(g.since)}` : `🕯 Без світла ${duration(now - g.since)} · з ${clock(g.since)}`
+	!g ? '' : g.state === 'ON' ? `💡 Світло є ${duration(now - g.since)} · з ${clock(g.since)}` : `🕯 Без світла ${duration(now - g.since)} · з ${clock(g.since)}`
 
 // Детальна картка однієї станції: усе звичайним текстом, світло — окремим рядком знизу
 // mode — іконка замість 🔌 у «Макс. вхід»: хто ним зараз керує (🤖 авто / ✋ ручне)
@@ -956,7 +956,9 @@ const blank = () => btn(DIVIDER, 'noop')
 async function statsView(env: Env, data: string): Promise<{ text: string; markup: object }> {
 	const S = await statsData(env)
 	const { now, trackFrom } = S
-	const [, kind, arg = '0'] = data === 'stats' ? ['st', 'w', '0'] : data.split(':')
+	// «📈 Статистика» за замовчуванням відкриває сьогоднішній день
+	const t0 = ymd(now)
+	const [, kind, arg = '0'] = data === 'stats' ? ['st', 't', `${t0.y}-${t0.m + 1}-${t0.d}`] : data.split(':')
 	const nowLine = S.grid ? (S.grid.state === 'ON' ? `💡 Зараз світло є ${duration(now - S.grid.since)}` : `🕯 Зараз світла немає ${duration(now - S.grid.since)}`) : ''
 	const dayRow = (a: number, b: number, label: string) => {
 		const end = Math.min(b, now)
@@ -1228,7 +1230,20 @@ async function screenText(line1: string, groupDev: Device, v: View | null, readi
 		content = await withAuto(groupDev)
 	}
 	// без верхнього рядка-статусу і без підпису «оновлюється щохвилини»: час оновлення — у заголовку картки
-	return content
+	return padWidth(content)
+}
+
+// Telegram Desktop розтягує повідомлення з кнопками на всю ширину, якщо текст вужчий за клавіатуру.
+// Добиваємо останній рядок невидимими символами (U+2800) до мінімальної ширини — на телефоні нічого не змінюється
+const MIN_LINE = 36
+function padWidth(html: string) {
+	const plain = (l: string) => l.replace(/<[^>]+>/g, '').replace(/&[a-z]+;/g, '_')
+	const lines = html.split('\n')
+	const widest = Math.max(...lines.map((l) => [...plain(l)].length))
+	if (widest >= MIN_LINE) return html
+	const last = lines.length - 1
+	lines[last] += DIVIDER.repeat(MIN_LINE - [...plain(lines[last])].length)
+	return lines.join('\n')
 }
 
 async function editPinned(env: Env, chatId: string | number, pin: Pin, text: string, markup: object) {
