@@ -1003,7 +1003,8 @@ async function screenText(line1: string, groupDev: Device, v: View | null, readi
 	}
 	// підпис «оновлюється щохвилини» — лише на «живих» картках
 	const footer = v?.body && !shown ? '' : `\n\n<i>Оновлюється щохвилини · ${clock(now)}</i>`
-	return `${line1}\n\n${content}${footer}`
+	// окремий верхній рядок-статус прибрано: картка й так починається з назви і %
+	return `${content}${footer}`
 }
 
 async function editPinned(env: Env, chatId: string | number, pin: Pin, text: string, markup: object) {
@@ -1217,10 +1218,9 @@ const labelFor = (data: string) =>
 async function pinnedCallback(env: Env, cb: any, chatId: number | string, pin: Pin, data: string) {
 	const answer = (text?: string) => tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text }).catch(() => {})
 	// Миттєвий відгук: одразу міняємо кнопки (і показуємо «завантажую», якщо буде інший вміст), дані — слідом
-	const line1 = esc(String(cb.message?.text ?? '').split('\n')[0])
 	const instant = (markup: object, loading?: string) =>
 		loading
-			? tgCall(env, 'editMessageText', { chat_id: chatId, message_id: pin.messageId, text: `${line1}\n\n⏳ ${esc(loading)} — завантажую…`, parse_mode: 'HTML', reply_markup: markup }).catch(() => {})
+			? tgCall(env, 'editMessageText', { chat_id: chatId, message_id: pin.messageId, text: `⏳ ${esc(loading)} — завантажую…`, parse_mode: 'HTML', reply_markup: markup }).catch(() => {})
 			: tgCall(env, 'editMessageReplyMarkup', { chat_id: chatId, message_id: pin.messageId, reply_markup: markup }).catch(() => {})
 	const nameOf = (cmd: string) => DEVICES.find((x) => x.cmd === cmd)?.name ?? cmd
 	if (data === 'noop') return answer()
