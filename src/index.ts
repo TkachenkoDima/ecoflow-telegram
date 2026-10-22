@@ -846,7 +846,9 @@ const isPinnedMsg = async (env: Env, chatId: string | number, messageId: number)
 	(await env.POWER_KV.get<Pin>(pinKey(chatId), 'json'))?.messageId === messageId
 
 // Стан «екрана» в закріпленому: що показано і яке меню кнопок. Живе VIEW_TTL_S, потім — картка станції групи
-type View = { body?: string; label?: string; menu?: string; at: number }
+// body — статичний вміст (усі станції, статистика); dev — «жива» картка цієї станції (оновлюється щохвилини);
+// note — рядок результату над карткою (напр. «✅ Router: ліміт 90%»)
+type View = { body?: string; dev?: string; note?: string; label?: string; menu?: string; at: number }
 const VIEW_TTL_S = 180
 const viewKey = (chatId: string | number) => `view:${chatId}`
 const getView = (env: Env, chatId: string | number) => env.POWER_KV.get<View>(viewKey(chatId), 'json')
@@ -867,10 +869,29 @@ const pinFirstLine = (d: Device, r: Reading | undefined, isOnline: boolean, g: G
 	return esc(first + light)
 }
 
-const pinBody = (line1: string, body: string, v: View | null, d: Device, now: number) => {
-	// для відкритого перегляду (інша станція, статистика…) підпису немає — через 3 хв екран тихо повертається до станції групи
-	const footer = v?.body ? '' : `\n\n<i>Оновлюється щохвилини · ${clock(now)}</i>`
-	return `${line1}\n\n${v?.body ?? body}${footer}`
+// Що показати під смужкою: відкритий перегляд (жива картка іншої станції / статичний вміст) або картку станції групи
+const mergeSettings = async (r: Reading | undefined, sn: string) => {
+	const c = r ? await getSettings(sn) : null
+	if (r && c) {
+		r.maxChg ??= c.maxChg
+		r.acMax ??= c.acMax
+		r.minDsg ??= c.minDsg
+	}
+}
+async function screenText(line1: string, groupDev: Device, v: View | null, readings: Map<string, Reading>, online: Map<string, boolean>, g: GridState | null, now: number) {
+	let content: string
+	const shown = v?.dev ? DEVICES.find((x) => x.cmd === v.dev) : undefined
+	if (shown) {
+		await mergeSettings(readings.get(shown.sn), shown.sn)
+		content = (v?.note ? `${esc(v.note)}\n\n` : '') + card(shown, readings.get(shown.sn), online.get(shown.sn)!, g, now)
+	} else if (v?.body) content = v.body
+	else {
+		await mergeSettings(readings.get(groupDev.sn), groupDev.sn)
+		content = card(groupDev, readings.get(groupDev.sn), online.get(groupDev.sn)!, g, now)
+	}
+	// підпис «оновлюється щохвилини» — лише на «живих» картках
+	const footer = v?.body && !shown ? '' : `\n\n<i>Оновлюється щохвилини · ${clock(now)}</i>`
+	return `${line1}\n\n${content}${footer}`
 }
 
 async function editPinned(env: Env, chatId: string | number, pin: Pin, text: string, markup: object) {
@@ -891,35 +912,36 @@ async function updatePins(env: Env, readings: Map<string, Reading>, online: Map<
 		if (!pin) continue
 		const d = DEVICES.find((x) => x.cmd === pin.cmd)
 		if (!d) continue
-		const r = readings.get(d.sn)
-		const c = r ? await getSettings(d.sn) : null
-		if (r && c) {
-			r.maxChg ??= c.maxChg
-			r.acMax ??= c.acMax
-			r.minDsg ??= c.minDsg
-		}
 		const v = await getView(env, chatId)
-		const line1 = pinFirstLine(d, r, online.get(d.sn)!, g, now)
-		await editPinned(env, chatId, pin, pinBody(line1, card(d, r, online.get(d.sn)!, g, now), v, d, now), menuMarkup(v?.menu))
+		const line1 = pinFirstLine(d, readings.get(d.sn), online.get(d.sn)!, g, now)
+		await editPinned(env, chatId, pin, await screenText(line1, d, v, readings, online, g, now), menuMarkup(v?.menu))
 	}
 }
 
-// Натискання в закріпленому: показуємо результат прямо в ньому (новіх повідомлень немає)
-async function showInPinned(env: Env, chatId: string | number, pin: Pin, line1: string, upd: { body?: string; label?: string; menu?: string; home?: boolean }) {
-	const prev = upd.home ? null : await getView(env, chatId) // «Головна» — скидаємо все до картки станції групи
-	const v: View = { body: upd.body ?? prev?.body, label: upd.label ?? prev?.label, menu: upd.menu ?? prev?.menu, at: upd.body ? Date.now() : (prev?.at ?? Date.now()) }
-	if (!v.body && (!v.menu || v.menu === 'main')) await env.POWER_KV.delete(viewKey(chatId))
+// Натискання на екрані: показуємо результат прямо в ньому (нових повідомлень немає)
+async function showInPinned(
+	env: Env,
+	chatId: string | number,
+	pin: Pin,
+	upd: { body?: string; dev?: string; note?: string; label?: string; menu?: string; home?: boolean },
+) {
+	const prev = upd.home ? null : await getView(env, chatId) // «Головна» — скидаємо все до станції групи
+	const content = upd.body !== undefined || upd.dev !== undefined
+	const v: View = content
+		? { body: upd.body, dev: upd.dev, note: upd.note, label: upd.label, menu: upd.menu ?? prev?.menu, at: Date.now() }
+		: { ...(prev ?? { at: Date.now() }), menu: upd.menu ?? prev?.menu }
+	const isDefault = !v.body && !v.dev && (!v.menu || v.menu === 'main')
+	if (isDefault) await env.POWER_KV.delete(viewKey(chatId))
 	else await saveView(env, chatId, v)
+
 	const d = DEVICES.find((x) => x.cmd === pin.cmd)!
+	const shown = v.dev ? DEVICES.find((x) => x.cmd === v.dev) : undefined
+	const need = [d, ...(shown && shown !== d ? [shown] : [])]
+	const { online, readings } = await readAll(env, need, true)
+	const g = await env.POWER_KV.get<GridState>('grid', 'json')
 	const now = Date.now()
-	let body = ''
-	if (!v.body || !line1) {
-		const { online, readings } = await readAll(env, [d], true)
-		const g = await env.POWER_KV.get<GridState>('grid', 'json')
-		body = card(d, readings.get(d.sn), online.get(d.sn)!, g, now)
-		line1 = pinFirstLine(d, readings.get(d.sn), online.get(d.sn)!, g, now)
-	}
-	await editPinned(env, chatId, pin, pinBody(line1, body, v.body ? v : null, d, now), menuMarkup(v.menu))
+	const line1 = pinFirstLine(d, readings.get(d.sn), online.get(d.sn)!, g, now)
+	await editPinned(env, chatId, pin, await screenText(line1, d, isDefault ? null : v, readings, online, g, now), menuMarkup(v.menu))
 }
 
 async function pinCommand(env: Env, chatId: number | string, arg: string | undefined): Promise<string> {
@@ -940,7 +962,7 @@ async function pinCommand(env: Env, chatId: number | string, arg: string | undef
 	const r = readings.get(d.sn)
 	const msg = await tgCall(env, 'sendMessage', {
 		chat_id: chatId,
-		text: pinBody(pinFirstLine(d, r, online.get(d.sn)!, g, now), card(d, r, online.get(d.sn)!, g, now), null, d, now),
+		text: await screenText(pinFirstLine(d, r, online.get(d.sn)!, g, now), d, null, readings, online, g, now),
 		parse_mode: 'HTML',
 		disable_notification: true,
 		reply_markup: KEYBOARD,
@@ -1071,7 +1093,7 @@ async function handleUpdate(env: Env, update: any) {
 	if (!panel) return
 	await removeUserMsg(env, msg)
 	const pin = await env.POWER_KV.get<Pin>(pinKey(msg.chat.id), 'json')
-	if (pin) return showInPinned(env, msg.chat.id, pin, '', { body: panel.text, label: labelFor(cmd) })
+	if (pin) return showInPinned(env, msg.chat.id, pin, DEVICES.some((x) => x.cmd === cmd) ? { dev: cmd } : { body: panel.text, label: labelFor(cmd) })
 	await sendPanel(env, msg.chat.id, panel)
 }
 
@@ -1080,19 +1102,21 @@ const labelFor = (data: string) =>
 	data === 'status' ? 'Усі станції' : data === 'stats' ? 'Статистика' : data === 'help' ? 'Команди' : (DEVICES.find((d) => d.cmd === data)?.name ?? data)
 
 async function pinnedCallback(env: Env, cb: any, chatId: number | string, pin: Pin, data: string) {
-	const line1 = esc(String(cb.message?.text ?? '').split('\n')[0]) // поточна смужка — до наступного оновлення
 	const answer = (text?: string) => tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id, text }).catch(() => {})
 	if (data === 'noop') return answer()
 	if (data.startsWith('menu:')) {
 		await answer()
-		const menu = data === 'menu:main' ? 'main' : data === 'menu:control' ? 'control' : `dev:${data.slice(9)}`
-		return showInPinned(env, chatId, pin, line1, { menu, home: menu === 'main' })
+		if (data === 'menu:main') return showInPinned(env, chatId, pin, { home: true })
+		if (data === 'menu:control') return showInPinned(env, chatId, pin, { menu: 'control' })
+		// Керування → станція: одразу показуємо її «живу» картку
+		const cmd = data.slice(9)
+		return showInPinned(env, chatId, pin, { dev: cmd, label: cmd, menu: `dev:${cmd}` })
 	}
 	if (data.startsWith('auto:')) {
 		const d = DEVICES.find((x) => x.cmd === data.slice(5))
 		if (d) await clearManual(env, d.sn)
 		await answer(d ? `🤖 ${d.name}: автоматизації знову працюють` : '')
-		return showInPinned(env, chatId, pin, line1, { menu: 'main' })
+		return d ? showInPinned(env, chatId, pin, { dev: d.cmd, note: `🤖 ${d.name}: автоматика знову керує`, menu: 'main' }) : undefined
 	}
 	if (data.startsWith('set:')) {
 		const [, cmd, actionId] = data.split(':')
@@ -1102,12 +1126,13 @@ async function pinnedCallback(env: Env, cb: any, chatId: number | string, pin: P
 		await answer('Надсилаю команду…')
 		const note = await applyAction(env, d, action)
 		if (!note.startsWith('✅')) await new Promise((r) => setTimeout(r, 2000))
-		const panel = await render(env, d.cmd)
-		return showInPinned(env, chatId, pin, line1, { body: `${esc(note)}\n\n${panel?.text ?? ''}`, label: d.name, menu: `dev:${d.cmd}` })
+		return showInPinned(env, chatId, pin, { dev: d.cmd, note, menu: `dev:${d.cmd}` })
 	}
 	await answer('Оновлюю…')
+	// кнопка станції — «жива» картка; інше (усі станції, статистика) — статичний знімок
+	if (DEVICES.some((x) => x.cmd === data)) return showInPinned(env, chatId, pin, { dev: data })
 	const panel = await render(env, data)
-	if (panel) await showInPinned(env, chatId, pin, line1, { body: panel.text, label: labelFor(data) })
+	if (panel) await showInPinned(env, chatId, pin, { body: panel.text, label: labelFor(data) })
 }
 
 // Ручна дія з «Керування»: виконати, запам'ятати, увімкнути ручний режим; повертає текст результату
