@@ -585,9 +585,11 @@ const hhmm = (minutes: number) => {
 const duration = (ms: number) => {
 	const m = Math.floor(ms / 60000)
 	if (m >= 1440) {
-		// від доби — дні, години й хвилини
+		// від доби — дні, години й хвилини: 1 день, 2 дні, 5 днів, 21 день
+		const dd = Math.floor(m / 1440)
 		const h = Math.floor((m % 1440) / 60)
-		return `${Math.floor(m / 1440)} д${h ? ` ${h} год` : ''}${m % 60 ? ` ${m % 60} хв` : ''}`
+		const word = dd % 10 === 1 && dd % 100 !== 11 ? 'день' : [2, 3, 4].includes(dd % 10) && ![12, 13, 14].includes(dd % 100) ? 'дні' : 'днів'
+		return [`${dd} ${word}`, h ? `${h} год` : '', m % 60 ? `${m % 60} хв` : ''].filter(Boolean).join(', ')
 	}
 	return m < 60 ? `${m} хв` : `${Math.floor(m / 60)} год${m % 60 ? ` ${m % 60} хв` : ''}`
 }
@@ -625,12 +627,15 @@ const table = (devices: Device[], readings: Map<string, Reading>, online: Map<st
 
 // Рядок про світло — простим текстом під блоком
 // Сьогодні: «💡 Світло є 01:16 · з 14:47»; якщо почалось в інший день — з датою, двома рядками:
-// «💡 Світло є 3 д 2 год» / «з 23.10, 13:38»
+// «💡 Світло є 3 дні, 2 год, 15 хв» / «усього 74 год 15 хв» / «з 23.10, 13:38»
 const gridText = (g: GridState | null, now: number) => {
 	if (!g) return ''
 	const head = g.state === 'ON' ? '💡 Світло є' : '🕯 Без світла'
 	if (dayStart(g.since) === dayStart(now)) return `${head} ${hhmm((now - g.since) / 60_000)} · з ${clock(g.since)}`
-	return `${head} ${duration(now - g.since)}\nз ${dateLabel(g.since)}, ${clock(g.since)}`
+	// + загальна кількість годин: «усього 75 год 27 хв»
+	const tm = Math.floor((now - g.since) / 60_000)
+	const total = tm >= 1440 ? `\nусього ${Math.floor(tm / 60)} год${tm % 60 ? ` ${tm % 60} хв` : ''}` : '' // до доби — дублювало б
+	return `${head} ${duration(now - g.since)}${total}\nз ${dateLabel(g.since)}, ${clock(g.since)}`
 }
 
 // Детальна картка однієї станції: усе звичайним текстом, світло — окремим рядком знизу
@@ -957,7 +962,10 @@ async function statsView(env: Env, data: string): Promise<{ text: string; markup
 	// «📈 Статистика» за замовчуванням відкриває сьогоднішній день
 	const t0 = ymd(now)
 	const [, kind, arg = '0'] = data === 'stats' ? ['st', 't', `${t0.y}-${t0.m + 1}-${t0.d}`] : data.split(':')
-	const nowLine = S.grid ? (S.grid.state === 'ON' ? `💡 Зараз світло є ${duration(now - S.grid.since)}` : `🕯 Зараз світла немає ${duration(now - S.grid.since)}`) : ''
+	// від доби тривалість — окремим рядком, щоб не розширювати екран
+	const nowDur = S.grid ? duration(now - S.grid.since) : ''
+	const nowSep = S.grid && now - S.grid.since >= 86400_000 ? '\n' : ' '
+	const nowLine = S.grid ? (S.grid.state === 'ON' ? `💡 Зараз світло є${nowSep}${nowDur}` : `🕯 Зараз світла немає${nowSep}${nowDur}`) : ''
 	const dayRow = (a: number, b: number, label: string) => {
 		const end = Math.min(b, now)
 		if (end <= trackFrom) return `${label}  —`
