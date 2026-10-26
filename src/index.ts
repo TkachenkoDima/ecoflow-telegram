@@ -584,6 +584,11 @@ const hhmm = (minutes: number) => {
 }
 const duration = (ms: number) => {
 	const m = Math.floor(ms / 60000)
+	if (m >= 1440) {
+		// від доби — дні, години й хвилини
+		const h = Math.floor((m % 1440) / 60)
+		return `${Math.floor(m / 1440)} д${h ? ` ${h} год` : ''}${m % 60 ? ` ${m % 60} хв` : ''}`
+	}
 	return m < 60 ? `${m} хв` : `${Math.floor(m / 60)} год${m % 60 ? ` ${m % 60} хв` : ''}`
 }
 const clock = (t: number, sec = false) =>
@@ -619,8 +624,14 @@ const table = (devices: Device[], readings: Map<string, Reading>, online: Map<st
 		.join('\n\n')
 
 // Рядок про світло — простим текстом під блоком
-const gridText = (g: GridState | null, now: number) =>
-	!g ? '' : g.state === 'ON' ? `💡 Світло є ${hhmm((now - g.since) / 60_000)} · з ${clock(g.since)}` : `🕯 Без світла ${hhmm((now - g.since) / 60_000)} · з ${clock(g.since)}`
+// Сьогодні: «💡 Світло є 01:16 · з 14:47»; якщо почалось в інший день — з датою, двома рядками:
+// «💡 Світло є 3 д 2 год» / «з 23.10, 13:38»
+const gridText = (g: GridState | null, now: number) => {
+	if (!g) return ''
+	const head = g.state === 'ON' ? '💡 Світло є' : '🕯 Без світла'
+	if (dayStart(g.since) === dayStart(now)) return `${head} ${hhmm((now - g.since) / 60_000)} · з ${clock(g.since)}`
+	return `${head} ${duration(now - g.since)}\nз ${dateLabel(g.since)}, ${clock(g.since)}`
+}
 
 // Детальна картка однієї станції: усе звичайним текстом, світло — окремим рядком знизу
 // mode — іконка замість 🔌 у «Макс. вхід»: хто ним зараз керує (🤖 авто / ✋ ручне)
