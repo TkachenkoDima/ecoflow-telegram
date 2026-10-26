@@ -962,10 +962,8 @@ async function statsView(env: Env, data: string): Promise<{ text: string; markup
 	// «📈 Статистика» за замовчуванням відкриває сьогоднішній день
 	const t0 = ymd(now)
 	const [, kind, arg = '0'] = data === 'stats' ? ['st', 't', `${t0.y}-${t0.m + 1}-${t0.d}`] : data.split(':')
-	// від доби тривалість — окремим рядком, щоб не розширювати екран
-	const nowDur = S.grid ? duration(now - S.grid.since) : ''
-	const nowSep = S.grid && now - S.grid.since >= 86400_000 ? '\n' : ' '
-	const nowLine = S.grid ? (S.grid.state === 'ON' ? `💡 Зараз світло є${nowSep}${nowDur}` : `🕯 Зараз світла немає${nowSep}${nowDur}`) : ''
+	// той самий рядок про світло, що й у картці станції (з «усього» і датою, якщо почалось не сьогодні)
+	const nowLine = gridText(S.grid, now)
 	const dayRow = (a: number, b: number, label: string) => {
 		const end = Math.min(b, now)
 		if (end <= trackFrom) return `${label}  —`
