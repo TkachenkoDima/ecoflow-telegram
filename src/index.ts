@@ -263,7 +263,7 @@ async function readMqtt(
 		throw e
 	}
 	// усе, що побачили з налаштувань, — у кеш
-	await Promise.all([...parts].map(([sn, p]) => saveSettings(sn, { maxChg: restOnly.includes(sn) ? undefined : p.maxChg, acMax: p.acMax, minDsg: restOnly.includes(sn) ? undefined : p.minDsg })))
+	await Promise.all([...parts].map(([sn, p]) => saveSettings(sn, { maxChg: restOnly.includes(sn) ? undefined : p.maxChg, acMax: p.acMax, minDsg: restOnly.includes(sn) ? undefined : p.minDsg }).catch((e) => console.error('settings', sn, e))))
 	for (const [sn, p] of parts) {
 		if (p.soc === undefined || restOnly.includes(sn)) continue
 		const discharging = (p.battOutW ?? 0) > 5 && (p.battInW ?? 0) === 0
@@ -302,7 +302,7 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, 
 			const recent = c?.cmdAt !== undefined && Date.now() - c.cmdAt < RECENT_CMD_MS
 			if (recent && c?.maxChg !== undefined) rd.maxChg = c.maxChg
 			if (recent && c?.minDsg !== undefined) rd.minDsg = c.minDsg
-			if (!recent) await saveSettings(d.sn, { maxChg: rd.maxChg, minDsg: rd.minDsg })
+			if (!recent) await saveSettings(d.sn, { maxChg: rd.maxChg, minDsg: rd.minDsg }).catch((e) => console.error('settings', d.name, e))
 			readings.set(d.sn, rd)
 		} catch (e) {
 			errors.push(`${d.name}: ${e}`)
@@ -753,6 +753,8 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 	const now = Date.now()
 
 	if (!isOnline) {
+		// сповіщення про офлайн вимкнені — нічого не записуємо (станція, що сідає, «моргає» й палила б ліміт записів KV)
+		if (OFFLINE_ALERT_MIN <= 0) return
 		st.offlineSince ??= now
 		if (OFFLINE_ALERT_MIN > 0 && !st.offlineAlerted && now - st.offlineSince >= OFFLINE_ALERT_MIN * 60000) {
 			await telegram(env, `⚠️ <b>${esc(dev.name)} — немає зв'язку</b>\nВже ${duration(now - st.offlineSince)}. Сповіщення про заряд не працюють.`)
@@ -1402,7 +1404,7 @@ async function run(env: Env) {
 			console.error(d.name, e)
 		}
 	}
-	const event = await checkGrid(env, readings, online)
+	const event = await checkGrid(env, readings, online).catch((e) => (console.error('grid', e), null))
 	await runAutomations(env, readings, online, event).catch((e) => console.error('automations', e))
 	await updatePins(env, readings, online).catch((e) => console.error('pins', e))
 	await cleanupExpired(env).catch((e) => console.error('cleanup', e))
