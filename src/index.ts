@@ -786,8 +786,10 @@ function gridDecision(readings: Map<string, Reading>, online: Map<string, boolea
 	for (const src of GRID_SOURCES) {
 		const d = DEVICES.find((x) => x.cmd === src.cmd)
 		const r = d ? readings.get(d.sn) : undefined
-		if (!d || !online.get(d.sn) || !r || r.soc <= GRID_MIN_SOC || !r.grid) continue
-		if (src.onlyOn && r.grid !== 'ON') continue
+		if (!d || !online.get(d.sn) || !r || !r.grid) continue
+		// «світло є» (струм на вході) — надійно за будь-якого заряду: розряджений роутер, щойно дали світло, одразу його бачить.
+		// «світла немає» — не від майже розрядженої станції (вона шле уривки) і не від onlyOn-станції
+		if (r.grid === 'OFF' && (src.onlyOn || r.soc <= GRID_MIN_SOC)) continue
 		return r.grid
 	}
 	return null
