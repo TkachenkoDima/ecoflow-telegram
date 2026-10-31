@@ -16,7 +16,7 @@ type Env = {
 	DEVICE_SNS: string // {"marinka": "D3M1…", "kate": "R655…"} — серійники не зберігаються в репо
 }
 
-import { API, AUTOMATIONS, DEVICES, PIN_TO_TOP, PUSH_TTL_MIN, SCREEN_WIDTH, GRID_SOURCE, MQTT_WAIT_MS, OFFLINE_ALERT_MIN, QUIET_FROM, QUIET_TO, RESET_GAP, THRESHOLDS, TIMEZONE, type Automation, type Device } from './config'
+import { API, AUTOMATIONS, DEVICES, PIN_TO_TOP, PUSH_TTL_MIN, SCREEN_WIDTH, GRID_SOURCES, GRID_MIN_SOC, GRID_CONFIRM_MIN, MQTT_WAIT_MS, OFFLINE_ALERT_MIN, QUIET_FROM, QUIET_TO, RESET_GAP, THRESHOLDS, TIMEZONE, type Automation, type Device } from './config'
 
 // Підставляємо серійники з секрету DEVICE_SNS (за cmd станції)
 function initDevices(env: Env) {
@@ -31,9 +31,9 @@ function initDevices(env: Env) {
 		if (!d.sn) throw new Error(`DEVICE_SNS: немає серійника для "${d.cmd}"`)
 	}
 }
-const gridSn = () => DEVICES.find((d) => d.cmd === GRID_SOURCE)?.sn ?? ''
 
-type Reading = { soc: number; remMin: number | null; loadW: number | null; gridIn: boolean | null; maxChg?: number; acMax?: number; minDsg?: number }
+// grid — «свідчення» станції про світло: ON — є струм на вході, OFF — входу немає і батарея розряджається, null — не знає
+type Reading = { soc: number; remMin: number | null; loadW: number | null; gridIn: boolean | null; grid?: 'ON' | 'OFF' | null; maxChg?: number; acMax?: number; minDsg?: number }
 type DeviceState = { notified: number[]; offlineSince: number | null; offlineAlerted: boolean }
 type GridState = { state: 'ON' | 'OFF'; since: number }
 
@@ -66,6 +66,7 @@ async function readRest(env: Env, sn: string): Promise<Reading> {
 		soc,
 		loadW,
 		gridIn: acIn > 0,
+		grid: acIn > 5 ? 'ON' : acIn === 0 && loadW > 5 ? 'OFF' : null,
 		remMin: loadW > 0 && acIn === 0 ? Number(q.cmsDsgRemTime) : null,
 		maxChg: Number.isFinite(maxChg) ? maxChg : undefined,
 		minDsg: Number.isFinite(minDsg) ? minDsg : undefined,
@@ -273,6 +274,8 @@ async function readMqtt(
 			remMin: discharging && p.remMin !== undefined ? p.remMin : null,
 			loadW: p.outSumW !== undefined ? Math.round(p.outSumW) : discharging ? (p.battOutW ?? null) : null,
 			gridIn,
+			// впевнено — лише коли вхід відомий: є струм → ON; нуль і батарея віддає → OFF
+			grid: p.inSumW === undefined ? null : p.inSumW > 5 ? 'ON' : p.inSumW <= 1 && discharging ? 'OFF' : null,
 			maxChg: p.maxChg,
 			acMax: p.acMax,
 			minDsg: p.minDsg,
@@ -778,14 +781,60 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 }
 
 // Повертає подію 'gridOn' / 'gridOff', якщо стан світла щойно змінився
+// Рішення про світло: перша станція з GRID_SOURCES, яка «знає» (онлайн, заряд > GRID_MIN_SOC, впевнене свідчення)
+function gridDecision(readings: Map<string, Reading>, online: Map<string, boolean>): GridState['state'] | null {
+	for (const src of GRID_SOURCES) {
+		const d = DEVICES.find((x) => x.cmd === src.cmd)
+		const r = d ? readings.get(d.sn) : undefined
+		if (!d || !online.get(d.sn) || !r || r.soc <= GRID_MIN_SOC || !r.grid) continue
+		if (src.onlyOn && r.grid !== 'ON') continue
+		return r.grid
+	}
+	return null
+}
+// «Очікує підтвердження» — у Cache API + пам'яті воркера (без записів у KV, навіть якщо щось «скаче»)
+type PendingGrid = { state: GridState['state']; since: number }
+const PENDING_URL = 'https://grid-pending.internal/v1'
+let memPending: PendingGrid | null = null
+async function getPendingGrid(): Promise<PendingGrid | null> {
+	try {
+		const hit = await caches.default.match(PENDING_URL)
+		if (hit) return await hit.json<PendingGrid>()
+	} catch {}
+	return memPending
+}
+async function setPendingGrid(p: PendingGrid | null) {
+	if (!p && !memPending) {
+		try {
+			if (!(await caches.default.match(PENDING_URL))) return
+		} catch {}
+	}
+	memPending = p
+	try {
+		if (p) await caches.default.put(PENDING_URL, new Response(JSON.stringify(p), { headers: { 'Cache-Control': 'max-age=3600' } }))
+		else await caches.default.delete(PENDING_URL)
+	} catch {}
+}
+
 async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<string, boolean>): Promise<'gridOn' | 'gridOff' | null> {
-	const src = readings.get(gridSn())
-	if (!src || src.gridIn === null) return null // невідомо — нічого не міняємо
+	const cur = gridDecision(readings, online)
+	if (!cur) return null // жодна станція не знає — нічого не міняємо
 	const now = Date.now()
-	const cur: GridState['state'] = src.gridIn ? 'ON' : 'OFF'
 	const prev = await env.POWER_KV.get<GridState>('grid', 'json')
-	if (prev?.state === cur) return null
-	await env.POWER_KV.put('grid', JSON.stringify({ state: cur, since: now }))
+	if (prev?.state === cur) {
+		await setPendingGrid(null)
+		return null
+	}
+	// підтвердження: новий стан має протриматись GRID_CONFIRM_MIN хв (очікування — у безкоштовному кеші, не в KV)
+	const pending = await getPendingGrid()
+	if (prev && (!pending || pending.state !== cur)) {
+		await setPendingGrid({ state: cur, since: now })
+		return null
+	}
+	if (prev && pending && now - pending.since < (GRID_CONFIRM_MIN - 1) * 60_000 + 30_000) return null
+	const since = pending?.state === cur ? pending.since : now // з моменту, коли вперше побачили
+	await setPendingGrid(null)
+	await env.POWER_KV.put('grid', JSON.stringify({ state: cur, since }))
 	if (!prev) return null // перший запуск — просто запам'ятали
 	// кожній групі — таблиця лише її станції (або всіх, якщо станцію не закріплено)
 	const send = async (head: string) => {
