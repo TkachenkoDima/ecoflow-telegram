@@ -924,7 +924,8 @@ async function statsData(env: Env) {
 		// кожен показник — окремим рядком
 		const lines = [
 			...(o.count ? [`🔢 Відключень: ${o.count}`] : []),
-			`🕯 Без світла: ${duration(o.ms)}${o.count ? '' : ' (з учора)'}`,
+			// відключення почалось до цього періоду: для доби — «з учора», для тижня/місяця — «почалось раніше»
+			`🕯 Без світла: ${duration(o.ms)}${o.count ? '' : end - a <= 25 * 3600_000 ? ' (з учора)' : ' (почалось раніше)'}`,
 			`🔆 Зі світлом: ${Math.max(0, Math.round(100 - (o.ms / span) * 100))}% часу`,
 		]
 		const started = all.filter((x) => x.from >= a && x.from < end)
