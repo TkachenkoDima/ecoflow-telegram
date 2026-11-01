@@ -357,55 +357,23 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, 
 	return { online, readings, errors }
 }
 
-// ── Знімок даних (кеш) ──────────────────────────────────────────
-// Cron щохвилини читає всі станції — зберігаємо результат, і натискання кнопок малюють екран
-// миттєво з нього, без MQTT (3–10 с). Наживо читаємо лише якщо знімок старший за SNAP_FRESH_MS.
-// Три рівні: пам'ять воркера → Cache API дата-центру (безкоштовно, без лімітів) → KV (раз на 10 хв, ~144 записи/добу)
+// ── Знімок даних (пам'ять воркера) ──────────────────────────────
+// Cron щохвилини читає всі станції — тримаємо результат у пам'яті воркера: якщо натискання кнопки потрапить у той самий
+// екземпляр воркера, екран малюється миттєво, без MQTT. Інакше — читаємо наживо (3–10 с, на екрані «завантажую»).
+// Cache API на *.workers.dev не працює, а KV щохвилини — це 1 440 записів/добу при ліміті 1 000, тому лише пам'ять.
 type Snap = { at: number; online: Record<string, boolean>; devs: Record<string, { r: Reading; at: number }> }
 const SNAP_FRESH_MS = 3 * 60_000
-const SNAP_KV_EVERY_MS = 10 * 60_000
-const SNAP_URL = 'https://snap.internal/v1'
 let memSnap: Snap | null = null
 
-async function loadSnap(env: Env): Promise<Snap | null> {
-	// пам'ять воркера — якщо зовсім свіжа; інакше беремо новіший з кешу дата-центру (його оновлює cron)
-	if (memSnap && Date.now() - memSnap.at < 60_000) return memSnap
-	const newer = (x: Snap | null) => {
-		if (x && (!memSnap || x.at > memSnap.at)) memSnap = x
-	}
-	try {
-		const hit = await caches.default.match(SNAP_URL)
-		if (hit) newer(await hit.json<Snap>())
-	} catch {}
-	if (!memSnap || Date.now() - memSnap.at > SNAP_FRESH_MS) {
-		const kv = await env.POWER_KV.get<Snap>('snap', 'json')
-		if (kv && (!memSnap || kv.at > memSnap.at)) {
-			newer(kv)
-			await putSnapCache(kv)
-		}
-	}
+async function loadSnap(_env: Env): Promise<Snap | null> {
 	return memSnap
 }
-async function putSnapCache(s: Snap) {
-	try {
-		await caches.default.put(SNAP_URL, new Response(JSON.stringify(s), { headers: { 'Cache-Control': 'max-age=86400' } }))
-	} catch {}
-}
-async function saveSnap(env: Env, online: Map<string, boolean>, readings: Map<string, Reading>, fromCron = false) {
-	const prev = await loadSnap(env)
+async function saveSnap(_env: Env, online: Map<string, boolean>, readings: Map<string, Reading>, _fromCron = false) {
 	const now = Date.now()
-	const s: Snap = { at: now, online: Object.fromEntries(online), devs: { ...(prev?.devs ?? {}) } }
+	const s: Snap = { at: now, online: Object.fromEntries(online), devs: { ...(memSnap?.devs ?? {}) } }
 	for (const [sn, r] of readings) s.devs[sn] = { r: JSON.parse(JSON.stringify(r)), at: now }
 	for (const [sn, on] of online) if (!on) delete s.devs[sn] // офлайн — старі цифри не показуємо
 	memSnap = s
-	await putSnapCache(s)
-	if (fromCron) {
-		const last = Number((await env.POWER_KV.get('snap:at')) ?? 0)
-		if (now - last >= SNAP_KV_EVERY_MS) {
-			await env.POWER_KV.put('snap', JSON.stringify(s))
-			await env.POWER_KV.put('snap:at', String(now), { expirationTtl: 86400 })
-		}
-	}
 }
 
 // Дані для екрана: зі знімка, якщо свіжий; інакше — наживо (і оновлюємо знімок)
