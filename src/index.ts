@@ -797,48 +797,30 @@ function gridDecision(readings: Map<string, Reading>, online: Map<string, boolea
 	}
 	return null
 }
-// «Очікує підтвердження» — у Cache API + пам'яті воркера (без записів у KV, навіть якщо щось «скаче»)
+// «Очікує підтвердження» — у KV. (Cache API на *.workers.dev не працює — put нічого не зберігає, а пам'ять воркера між
+// запусками cron не живе; через це підтвердження «зависало» й пуші про світло не приходили.)
+// Запис лише коли з'являється НОВЕ очікування; прибирається само (expirationTtl), без окремих записів
 type PendingGrid = { state: GridState['state']; since: number }
-const PENDING_URL = 'https://grid-pending.internal/v1'
-let memPending: PendingGrid | null = null
-async function getPendingGrid(): Promise<PendingGrid | null> {
-	try {
-		const hit = await caches.default.match(PENDING_URL)
-		if (hit) return await hit.json<PendingGrid>()
-	} catch {}
-	return memPending
-}
-async function setPendingGrid(p: PendingGrid | null) {
-	if (!p && !memPending) {
-		try {
-			if (!(await caches.default.match(PENDING_URL))) return
-		} catch {}
-	}
-	memPending = p
-	try {
-		if (p) await caches.default.put(PENDING_URL, new Response(JSON.stringify(p), { headers: { 'Cache-Control': 'max-age=3600' } }))
-		else await caches.default.delete(PENDING_URL)
-	} catch {}
-}
+const PENDING_KEY = 'grid:pending'
+const getPendingGrid = (env: Env) => env.POWER_KV.get<PendingGrid>(PENDING_KEY, 'json')
+const setPendingGrid = (env: Env, p: PendingGrid) => env.POWER_KV.put(PENDING_KEY, JSON.stringify(p), { expirationTtl: 600 })
 
 async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<string, boolean>): Promise<'gridOn' | 'gridOff' | null> {
 	const cur = gridDecision(readings, online)
 	if (!cur) return null // жодна станція не знає — нічого не міняємо
 	const now = Date.now()
 	const prev = await env.POWER_KV.get<GridState>('grid', 'json')
-	if (prev?.state === cur) {
-		await setPendingGrid(null)
-		return null
-	}
-	// підтвердження: новий стан має протриматись GRID_CONFIRM_MIN хв (очікування — у безкоштовному кеші, не в KV)
-	const pending = await getPendingGrid()
-	if (prev && (!pending || pending.state !== cur)) {
-		await setPendingGrid({ state: cur, since: now })
+	if (prev?.state === cur) return null // очікування (якщо було) зникне саме
+	// підтвердження: новий стан має протриматись GRID_CONFIRM_MIN хв поспіль
+	const raw = prev ? await getPendingGrid(env) : null
+	// застаріле очікування (між ним були інші показання) — не рахується
+	const pending = raw && raw.state === cur && now - raw.since <= (GRID_CONFIRM_MIN + 2) * 60_000 ? raw : null
+	if (prev && !pending) {
+		await setPendingGrid(env, { state: cur, since: now })
 		return null
 	}
 	if (prev && pending && now - pending.since < (GRID_CONFIRM_MIN - 1) * 60_000 + 30_000) return null
-	const since = pending?.state === cur ? pending.since : now // з моменту, коли вперше побачили
-	await setPendingGrid(null)
+	const since = pending ? pending.since : now // з моменту, коли вперше побачили
 	await env.POWER_KV.put('grid', JSON.stringify({ state: cur, since }))
 	if (!prev) return null // перший запуск — просто запам'ятали
 	// кожній групі — таблиця лише її станції (або всіх, якщо станцію не закріплено)
