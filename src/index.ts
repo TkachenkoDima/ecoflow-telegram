@@ -499,6 +499,7 @@ async function tgCall(env: Env, method: string, body: object) {
 
 const kyivHour = () => Number(new Intl.DateTimeFormat('en-GB', { timeZone: TIMEZONE, hour: '2-digit', hourCycle: 'h23' }).format(new Date()))
 const isQuiet = () => {
+	if (QUIET_FROM === QUIET_TO) return false // однакові години — тихий режим вимкнено
 	const h = kyivHour()
 	return QUIET_FROM < QUIET_TO ? h >= QUIET_FROM && h < QUIET_TO : h >= QUIET_FROM || h < QUIET_TO
 }
@@ -851,7 +852,9 @@ async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<s
 	// підсумок за сьогодні — як у «📈 Статистика» (без «найчастіше»: за один день воно нічого не каже)
 	const today = async () => {
 		const S = await statsData(env)
-		const lines = S.summary(dayStart(now), now).filter((l) => !l.startsWith('🕐'))
+		// «Зі світлом: N%» на початку доби нічого не каже (о 02:00 це «0%») — показуємо лише з 06:00
+		const early = now - dayStart(now) < 6 * 3600_000
+		const lines = S.summary(dayStart(now), now).filter((l) => !l.startsWith('🕐') && !(early && l.startsWith('🔆')))
 		return `\n\n📈 <b>Сьогодні</b>\n${lines.join('\n')}`
 	}
 	if (cur === 'OFF') {
@@ -1393,7 +1396,7 @@ async function run(env: Env) {
 	const { online, readings } = await readAll(env, DEVICES, false, true)
 	await saveSnap(env, online, readings, true).catch((e) => console.error('snap', e))
 	if (!(await env.POWER_KV.get('started:v3'))) {
-		const text = `📡 <b>Моніторинг EcoFlow запущено</b>\nПороги ${THRESHOLDS.join(' · ')}% · тиша ${QUIET_FROM}:00–${QUIET_TO}:00\n\n${table(DEVICES, readings, online)}`
+		const text = `📡 <b>Моніторинг EcoFlow запущено</b>\nПороги ${THRESHOLDS.join(' · ')}% ${QUIET_FROM === QUIET_TO ? '' : ` · тиша ${QUIET_FROM}:00–${QUIET_TO}:00`}\n\n${table(DEVICES, readings, online)}`
 		for (const id of chatIds(env)) await sendPanel(env, id, { text }).catch((e) => console.error('start', id, e))
 		await env.POWER_KV.put('started:v3', String(Date.now()))
 	}

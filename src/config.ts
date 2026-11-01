@@ -62,8 +62,9 @@ export const PUSH_TTL_MIN = 3
 export const SCREEN_WIDTH = 23
 
 export const TIMEZONE = 'Europe/Kyiv'
-export const QUIET_FROM = 0 // тихий режим: повідомлення без звуку (крім найнижчого порогу)
-export const QUIET_TO = 8
+// тихий режим: повідомлення без звуку (крім найнижчого порогу); однакові QUIET_FROM і QUIET_TO — вимкнено (напр. 0 і 8 — з 00:00 до 08:00)
+export const QUIET_FROM = 0
+export const QUIET_TO = 0
 
 // EU-акаунти: api-e.ecoflow.com; US/інші: api.ecoflow.com
 // ── Автоматизації: перевіряються щохвилини ──
