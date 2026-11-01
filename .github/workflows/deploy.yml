@@ -46,7 +46,18 @@ jobs:
         run: |
           if [ -z "$WORKER_URL" ]; then echo "Не вдалося визначити URL воркера — задайте змінну репозиторію WORKER_URL"; exit 1; fi
           echo "Webhook → ${WORKER_URL}/telegram"
-          curl -sf "https://api.telegram.org/bot${TOKEN}/setWebhook" \
+          # Telegram обмежує часті setWebhook (429), а вебхук зазвичай уже стоїть на тому ж URL —
+          # тож помилку тут лише показуємо, деплой воркера від неї не залежить
+          RES=$(curl -s "https://api.telegram.org/bot${TOKEN}/setWebhook" \
             --data-urlencode "url=${WORKER_URL}/telegram" \
             --data-urlencode "secret_token=${SECRET}" \
-            --data-urlencode 'allowed_updates=["message","callback_query"]'
+            --data-urlencode 'allowed_updates=["message","callback_query"]')
+          echo "$RES"
+          if ! echo "$RES" | grep -q '"ok":true'; then
+            INFO=$(curl -s "https://api.telegram.org/bot${TOKEN}/getWebhookInfo" | tr -d "\\\\")
+            if echo "$INFO" | grep -q "\"url\":\"${WORKER_URL}/telegram\""; then
+              echo "::warning::setWebhook не вдався, але вебхук уже вказує на ${WORKER_URL}/telegram — усе гаразд"
+            else
+              echo "::error::Вебхук не встановлено: $RES"; exit 1
+            fi
+          fi
