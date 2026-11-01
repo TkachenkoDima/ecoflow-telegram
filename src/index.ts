@@ -16,7 +16,7 @@ type Env = {
 	DEVICE_SNS: string // {"marinka": "D3M1…", "kate": "R655…"} — серійники не зберігаються в репо
 }
 
-import { API, AUTOMATIONS, DEVICES, PIN_TO_TOP, PUSH_TTL_MIN, SCREEN_WIDTH, GRID_SOURCES, GRID_MIN_SOC, GRID_CONFIRM_MIN, MQTT_WAIT_MS, OFFLINE_ALERT_MIN, QUIET_FROM, QUIET_TO, RESET_GAP, THRESHOLDS, TIMEZONE, type Automation, type Device } from './config'
+import { API, AUTOMATIONS, DEVICES, PIN_TO_TOP, PUSH_TTL_MIN, SCREEN_WIDTH, GRID_SOURCES, GRID_CONFIRM_MIN, MQTT_WAIT_MS, OFFLINE_ALERT_MIN, QUIET_FROM, QUIET_TO, RESET_GAP, THRESHOLDS, TIMEZONE, type Automation, type Device } from './config'
 
 // Підставляємо серійники з секрету DEVICE_SNS (за cmd станції)
 function initDevices(env: Env) {
@@ -66,7 +66,7 @@ async function readRest(env: Env, sn: string): Promise<Reading> {
 		soc,
 		loadW,
 		gridIn: acIn > 0,
-		grid: acIn > 5 ? 'ON' : acIn === 0 && loadW > 5 ? 'OFF' : null,
+		grid: acIn > 1 ? 'ON' : 'OFF',
 		remMin: loadW > 0 && acIn === 0 ? Number(q.cmsDsgRemTime) : null,
 		maxChg: Number.isFinite(maxChg) ? maxChg : undefined,
 		minDsg: Number.isFinite(minDsg) ? minDsg : undefined,
@@ -275,7 +275,7 @@ async function readMqtt(
 			loadW: p.outSumW !== undefined ? Math.round(p.outSumW) : discharging ? (p.battOutW ?? null) : null,
 			gridIn,
 			// впевнено — лише коли вхід відомий: є струм → ON; нуль і батарея віддає → OFF
-			grid: p.inSumW === undefined ? null : p.inSumW > 5 ? 'ON' : p.inSumW <= 1 && discharging ? 'OFF' : null,
+			grid: p.inSumW === undefined ? null : p.inSumW > 1 ? 'ON' : 'OFF',
 			maxChg: p.maxChg,
 			acMax: p.acMax,
 			minDsg: p.minDsg,
@@ -752,15 +752,12 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 }
 
 // Повертає подію 'gridOn' / 'gridOff', якщо стан світла щойно змінився
-// Рішення про світло: перша станція з GRID_SOURCES, яка «знає» (онлайн, заряд > GRID_MIN_SOC, впевнене свідчення)
+// Рішення про світло: перша станція з GRID_SOURCES, від якої є дані про вхід (онлайн і вхід був у пакеті)
 function gridDecision(readings: Map<string, Reading>, online: Map<string, boolean>): GridState['state'] | null {
-	for (const src of GRID_SOURCES) {
-		const d = DEVICES.find((x) => x.cmd === src.cmd)
+	for (const cmd of GRID_SOURCES) {
+		const d = DEVICES.find((x) => x.cmd === cmd)
 		const r = d ? readings.get(d.sn) : undefined
 		if (!d || !online.get(d.sn) || !r || !r.grid) continue
-		// «світло є» (струм на вході) — надійно за будь-якого заряду: розряджений роутер, щойно дали світло, одразу його бачить.
-		// «світла немає» — не від майже розрядженої станції (вона шле уривки) і не від onlyOn-станції
-		if (r.grid === 'OFF' && (src.onlyOn || r.soc <= GRID_MIN_SOC)) continue
 		return r.grid
 	}
 	return null
@@ -779,11 +776,12 @@ async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<s
 	const now = Date.now()
 	const prev = await env.POWER_KV.get<GridState>('grid', 'json')
 	if (prev?.state === cur) return null // очікування (якщо було) зникне саме
+	const confirm = GRID_CONFIRM_MIN > 0
 	// підтвердження: новий стан має протриматись GRID_CONFIRM_MIN хв поспіль
-	const raw = prev ? await getPendingGrid(env) : null
+	const raw = prev && confirm ? await getPendingGrid(env) : null
 	// застаріле очікування (між ним були інші показання) — не рахується
 	const pending = raw && raw.state === cur && now - raw.since <= (GRID_CONFIRM_MIN + 2) * 60_000 ? raw : null
-	if (prev && !pending) {
+	if (prev && confirm && !pending) {
 		await setPendingGrid(env, { state: cur, since: now })
 		return null
 	}
