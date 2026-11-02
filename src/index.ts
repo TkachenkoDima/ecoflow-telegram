@@ -215,7 +215,7 @@ async function saveSettings(sn: string, upd: { maxChg?: number; acMax?: number; 
 async function readMqtt(
 	env: Env,
 	sns: string[],
-	o: { settingsFor?: string[]; restSettings?: string[]; timeoutMs?: number } = {},
+	o: { settingsFor?: string[]; restSettings?: string[]; needInput?: string[]; timeoutMs?: number } = {},
 ): Promise<{ result: Map<string, Reading>; parts: Map<string, UpsPart> }> {
 	const result = new Map<string, Reading>()
 	const settingsFor = new Set(o.settingsFor ?? [])
@@ -228,6 +228,7 @@ async function readMqtt(
 		const p = parts.get(sn)!
 		if (restOnly.includes(sn)) return p.acMax !== undefined
 		if (p.soc === undefined) return false
+		if (o.needInput?.includes(sn) && p.inSumW === undefined) return false // датчик світла: потрібен вхід з мережі
 		return !settingsFor.has(sn) || (p.maxChg !== undefined && p.acMax !== undefined)
 	}
 	try {
@@ -326,6 +327,8 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, 
 			const { result: r, parts } = await readMqtt(env, want.map((d) => d.sn), {
 				settingsFor,
 				restSettings: restSet,
+				// cron: від датчика світла чекаємо й пакет із входом з мережі
+				needInput: refresh ? GRID_SOURCES.map((c) => DEVICES.find((x) => x.cmd === c)?.sn ?? '').filter(Boolean) : [],
 				timeoutMs: refresh && (settingsFor.length || restSet.length) ? 25_000 : MQTT_WAIT_MS,
 			})
 			for (const [sn, v] of r) readings.set(sn, v)
@@ -357,54 +360,9 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, 
 	return { online, readings, errors }
 }
 
-// ── Знімок даних (пам'ять воркера) ──────────────────────────────
-// Cron щохвилини читає всі станції — тримаємо результат у пам'яті воркера: якщо натискання кнопки потрапить у той самий
-// екземпляр воркера, екран малюється миттєво, без MQTT. Інакше — читаємо наживо (3–10 с, на екрані «завантажую»).
-// Cache API на *.workers.dev не працює, а KV щохвилини — це 1 440 записів/добу при ліміті 1 000, тому лише пам'ять.
-type Snap = { at: number; online: Record<string, boolean>; devs: Record<string, { r: Reading; at: number }> }
-const SNAP_FRESH_MS = 3 * 60_000
-let memSnap: Snap | null = null
-
-async function loadSnap(_env: Env): Promise<Snap | null> {
-	return memSnap
-}
-async function saveSnap(_env: Env, online: Map<string, boolean>, readings: Map<string, Reading>, _fromCron = false) {
-	const now = Date.now()
-	const s: Snap = { at: now, online: Object.fromEntries(online), devs: { ...(memSnap?.devs ?? {}) } }
-	for (const [sn, r] of readings) s.devs[sn] = { r: JSON.parse(JSON.stringify(r)), at: now }
-	for (const [sn, on] of online) if (!on) delete s.devs[sn] // офлайн — старі цифри не показуємо
-	memSnap = s
-}
-
-// Дані для екрана: зі знімка, якщо свіжий; інакше — наживо (і оновлюємо знімок)
+// Дані для екрана після натискання — завжди свіжі, наживо (без буфера/знімка)
 async function readCached(env: Env, devices: Device[], detailed: boolean) {
-	const snap = await loadSnap(env)
-	const now = Date.now()
-	const fresh =
-		snap &&
-		now - snap.at < SNAP_FRESH_MS &&
-		devices.every((d) => (snap.online[d.sn] ? !!snap.devs[d.sn] && now - snap.devs[d.sn].at < SNAP_FRESH_MS : snap.online[d.sn] === false))
-	if (!fresh) {
-		const res = await readAll(env, devices, detailed)
-		await saveSnap(env, res.online, res.readings).catch(() => {})
-		return res
-	}
-	const online = new Map(DEVICES.map((d) => [d.sn, !!snap.online[d.sn]]))
-	const readings = new Map<string, Reading>()
-	for (const d of devices) {
-		const e = snap.devs[d.sn]
-		if (!e) continue
-		const r: Reading = JSON.parse(JSON.stringify(e.r))
-		// щойно змінене кнопкою — показуємо нове значення, а не зі знімка
-		const c = await getSettings(d.sn)
-		if (c?.cmdAt !== undefined && now - c.cmdAt < RECENT_CMD_MS) {
-			if (c.maxChg !== undefined) r.maxChg = c.maxChg
-			if (c.acMax !== undefined) r.acMax = c.acMax
-			if (c.minDsg !== undefined) r.minDsg = c.minDsg
-		}
-		readings.set(d.sn, r)
-	}
-	return { online, readings, errors: [] as string[] }
+	return readAll(env, devices, detailed)
 }
 
 // ── Telegram ────────────────────────────────────────────────────
@@ -598,12 +556,13 @@ const table = (devices: Device[], readings: Map<string, Reading>, online: Map<st
 		.join('\n\n')
 
 // Рядок про світло — простим текстом під блоком
-// Сьогодні: «💡 Світло є 01:16 · з 14:47»; якщо почалось в інший день — з датою, двома рядками:
+// Сьогодні: «🕯 Без світла 2 год 18 хв» / «з 07:16» (двома рядками — в один не влазить по ширині екрана);
+// якщо почалось в інший день — з датою:
 // «💡 Світло є 3 дні, 2 год, 15 хв» / «усього 74 год 15 хв» / «з 23.10, 13:38»
 const gridText = (g: GridState | null, now: number) => {
 	if (!g) return ''
 	const head = g.state === 'ON' ? '💡 Світло є' : '🕯 Без світла'
-	if (dayStart(g.since) === dayStart(now)) return `${head} ${hhmm((now - g.since) / 60_000)} · з ${clock(g.since)}`
+	if (dayStart(g.since) === dayStart(now)) return `${head} ${duration(now - g.since)}\nз ${clock(g.since)}`
 	// + загальна кількість годин: «усього 75 год 27 хв»
 	const tm = Math.floor((now - g.since) / 60_000)
 	const total = tm >= 1440 ? `\nусього ${Math.floor(tm / 60)} год${tm % 60 ? ` ${tm % 60} хв` : ''}` : '' // до доби — дублювало б
@@ -906,9 +865,8 @@ async function statsData(env: Env) {
 		for (const o of all) {
 			const x = Math.max(o.from, a),
 				y = Math.min(o.to, b)
-			if (y <= x) continue
-			ms += y - x
-			if (o.from >= a) count++
+			if (y > x) ms += y - x
+			if (o.from >= a && (o.from < b || o.from >= now)) count++ // і щойно розпочате (ще 0 хв)
 		}
 		return { count, ms }
 	}
@@ -926,7 +884,7 @@ async function statsData(env: Env) {
 			`🕯 Без світла: ${duration(o.ms)}${o.count ? '' : end - a <= 25 * 3600_000 ? ' (з учора)' : ' (почалось раніше)'}`,
 			`🔆 Зі світлом: ${Math.max(0, Math.round(100 - (o.ms / span) * 100))}% часу`,
 		]
-		const started = all.filter((x) => x.from >= a && x.from < end)
+		const started = all.filter((x) => x.from >= a && x.from <= end && x.from < b)
 		const longest = [...started].sort((x, y) => y.to - y.from - (x.to - x.from))[0]
 		if (longest && started.length > 1) {
 			const cur = grid?.state === 'OFF' && longest.from === grid.since
@@ -1343,7 +1301,6 @@ async function pinCommand(env: Env, chatId: number | string, arg: string | undef
 async function run(env: Env) {
 	await syncCommands(env).catch((e) => console.error('commands', e))
 	const { online, readings } = await readAll(env, DEVICES, false, true)
-	await saveSnap(env, online, readings, true).catch((e) => console.error('snap', e))
 	if (!(await env.POWER_KV.get('started:v3'))) {
 		const text = `📡 <b>Моніторинг EcoFlow запущено</b>\nПороги ${THRESHOLDS.join(' · ')}% ${QUIET_FROM === QUIET_TO ? '' : ` · тиша ${QUIET_FROM}:00–${QUIET_TO}:00`}\n\n${table(DEVICES, readings, online)}`
 		for (const id of chatIds(env)) await sendPanel(env, id, { text }).catch((e) => console.error('start', id, e))
