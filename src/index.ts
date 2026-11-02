@@ -878,11 +878,12 @@ async function statsData(env: Env) {
 		if (span <= 0) return ['<i>немає даних</i>']
 		if (!o.ms) return ['Без відключень ✨']
 		// кожен показник — окремим рядком
+		const offPct = Math.min(100, Math.max(0, Math.round((o.ms / span) * 100)))
 		const lines = [
 			...(o.count ? [`🔢 Відключень: ${o.count}`] : []),
 			// відключення почалось до цього періоду: для доби — «з учора», для тижня/місяця — «почалось раніше»
-			`🔴 Без світла: ${duration(o.ms)}${o.count ? '' : end - a <= 25 * 3600_000 ? ' (з учора)' : ' (почалось раніше)'}`,
-			`🟢 Зі світлом: ${Math.max(0, Math.round(100 - (o.ms / span) * 100))}% часу`,
+			`🔴 Без світла ${duration(o.ms)} · ${offPct}%${o.count ? '' : end - a <= 25 * 3600_000 ? ' (з учора)' : ' (почалось раніше)'}`,
+			`🟢 Зі світлом ${duration(Math.max(0, span - o.ms))} · ${100 - offPct}%`,
 		]
 		const started = all.filter((x) => x.from >= a && x.from <= end && x.from < b)
 		const longest = [...started].sort((x, y) => y.to - y.from - (x.to - x.from))[0]
@@ -926,7 +927,7 @@ async function statsView(env: Env, data: string): Promise<{ text: string; markup
 	const t0 = ymd(now)
 	const [, kind, arg = '0'] = data === 'stats' ? ['st', 't', `${t0.y}-${t0.m + 1}-${t0.d}`] : data.split(':')
 	// той самий рядок про світло, що й у картці станції (з «усього» і датою, якщо почалось не сьогодні)
-	const nowLine = gridText(S.grid, now)
+	const nowLine = S.grid ? `Зараз: ${S.grid.state === 'ON' ? '🟢 світло є' : '🔴 без світла'} з ${dayStart(S.grid.since) === dayStart(now) ? '' : dateLabel(S.grid.since) + ', '}${clock(S.grid.since)}` : ''
 	const dayRow = (a: number, b: number, label: string) => {
 		const end = Math.min(b, now)
 		if (end <= trackFrom) return `${label}  —`
@@ -967,7 +968,7 @@ async function statsView(env: Env, data: string): Promise<{ text: string; markup
 			while (t < b && t < now) {
 				const p = ymd(t)
 				const next = Math.min(b, localDay(p.y, p.m, p.d + 7 - ((p.wd + 6) % 7)))
-				rows.push(dayRow(t, next, `${pad2(p.d)}–${pad2(ymd(next - 1).d)}`))
+				rows.push(dayRow(t, next, p.d === ymd(next - 1).d ? `${pad2(p.d)}` : `${pad2(p.d)}–${pad2(ymd(next - 1).d)}`))
 				t = next
 			}
 		}
@@ -1059,7 +1060,7 @@ async function statsView(env: Env, data: string): Promise<{ text: string; markup
 						(rest.length ? `\n\n${rest.join('\n')}` : '')
 					: '🟢 Без відключень ✨')
 	const isToday = a === dayStart(now)
-	const text = `📈 <b>День</b> · ${WD[ymd(a).wd]} ${dateLabel(a)}${isToday ? ' (сьогодні)' : ''}\n\n${body}` + (isToday && nowLine ? `\n\n${nowLine}` : '')
+	const text = `📈 <b>День</b> · ${WD[ymd(a).wd]} ${dateLabel(a)}${isToday ? ' (сьогодні)' : ''}\n\n${body}`
 	const prev = ymd(a - 1),
 		next = ymd(b)
 	const top = kind === 't'
