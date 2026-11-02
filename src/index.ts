@@ -405,6 +405,7 @@ const deviceKeyboard = (d: Device) => {
 		inline_keyboard: [
 			...[...groups].flatMap(([g, row]) => [[{ text: `${g} · ${d.name}`, callback_data: 'noop' }], row]),
 			...(AUTOMATIONS.some((r) => r.cmd === d.cmd || r.cmd === '*') ? [[{ text: '🤖 Авто (скасувати ручне)', callback_data: `auto:${d.cmd}` }]] : []),
+			[{ text: `🩺 Здоров'я батареї · ${d.name}`, callback_data: `health:${d.cmd}` }],
 			[
 				{ text: '⬅️ Станції', callback_data: 'menu:control' },
 				{ text: '🏠 Головна', callback_data: 'menu:main' },
@@ -1449,6 +1450,12 @@ async function handleUpdate(env: Env, update: any) {
 			}
 			return
 		}
+		if (ours && data.startsWith('health:')) {
+			await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id }).catch(() => {})
+			const d = DEVICES.find((x) => x.cmd === data.slice(7))
+			if (d) await sendPanel(env, chatId, { text: await healthText(env, d).catch((e) => `⚠️ Не вдалося: ${esc(String(e).slice(0, 120))}`) }, deviceKeyboard(d))
+			return
+		}
 		if (ours && data.startsWith('st:')) {
 			await tgCall(env, 'answerCallbackQuery', { callback_query_id: cb.id }).catch(() => {})
 			const v = await statsView(env, data)
@@ -1535,6 +1542,14 @@ async function pinnedCallback(env: Env, cb: any, chatId: number | string, pin: P
 		const note = `✅ ${esc(d.name)}\n🤖 авто режим увімкнено\n${rule ? `${ruleWhat(rule).replace('вхід ', 'вхід → ')} (${rule.socAtLeast ?? 0}–${rule.socAtMost ?? 100}%)` : 'правила зараз не діють'}`
 		return showInPinned(env, chatId, pin, { dev: d.cmd, note, menu: 'main' })
 	}
+	if (data.startsWith('health:')) {
+		const d = DEVICES.find((x) => x.cmd === data.slice(7))
+		await answer()
+		if (!d) return
+		await instant(deviceKeyboard(d), `${d.name}: здоров'я батареї`)
+		const body = await healthText(env, d).catch((e) => `⚠️ Не вдалося: ${esc(String(e).slice(0, 120))}`)
+		return showInPinned(env, chatId, pin, { body, label: d.cmd, menu: `dev:${d.cmd}` })
+	}
 	if (data.startsWith('set:')) {
 		const [, cmd, actionId] = data.split(':')
 		const d = DEVICES.find((x) => x.cmd === cmd)
@@ -1557,6 +1572,42 @@ async function pinnedCallback(env: Env, cb: any, chatId: number | string, pin: P
 	if (DEVICES.some((x) => x.cmd === data)) return showInPinned(env, chatId, pin, { dev: data })
 	const panel = await render(env, data)
 	if (panel) await showInPinned(env, chatId, pin, { body: panel.text, label: labelFor(data) })
+}
+
+// 🩺 Здоров'я батареї: River 3 — з BMS-пакета (MQTT), DELTA 3 — з полів офіційного API
+async function healthText(env: Env, d: Device): Promise<string> {
+	const head = `🩺 <b>${esc(d.name)} · здоров'я батареї</b>\n\n`
+	const list: Array<{ sn: string; online: number }> = await ecoflow(env, '/iot-open/sign/device/list')
+	if (list.find((x) => x.sn === d.sn)?.online !== 1) return `${head}⚫️ Станція офлайн`
+	const rows: string[] = []
+	if (d.via === 'mqtt') {
+		const { parts } = await readMqtt(env, [d.sn])
+		const p = parts.get(d.sn)
+		if (!p || p.soh === undefined) return `${head}Станція не надіслала дані BMS — спробуйте ще раз`
+		rows.push(`💚 Здоров'я (SOH): <b>${p.soh}%</b>`)
+		if (p.fullCap && p.designCap) rows.push(`🔋 Ємність: <b>${((p.fullCap / p.designCap) * 100).toFixed(1)}%</b>\n${(p.fullCap / 1000).toFixed(2)} з ${(p.designCap / 1000).toFixed(2)} А·год`)
+		if (p.cycles !== undefined) rows.push(`🔁 Цикли заряду: <b>${p.cycles}</b>`)
+		if (p.cellMaxMv && p.cellMinMv) rows.push(`⚖️ Розкид комірок: <b>${p.cellMaxMv - p.cellMinMv} мВ</b>\n${p.cellMinMv}–${p.cellMaxMv} мВ`)
+		if (p.tempC !== undefined) rows.push(`🌡 Температура: <b>${p.tempC} °C</b>`)
+	} else {
+		// офіційний API: шукаємо поля за назвою (у різних моделей — різні імена)
+		const q = await ecoflow(env, '/iot-open/sign/device/quota/all', { sn: d.sn })
+		const pick = (re: RegExp) => {
+			const k = Object.keys(q).find((x) => re.test(x) && Number.isFinite(Number(q[x])) && Number(q[x]) > 0)
+			return k ? Number(q[k]) : undefined
+		}
+		const soh = pick(/soh/i),
+			cycles = pick(/cycle/i),
+			design = pick(/designCap/i),
+			full = pick(/fullCap/i),
+			temp = pick(/^bms.*temp$|battTemp|BattTemp/i)
+		if (soh !== undefined) rows.push(`💚 Здоров'я (SOH): <b>${soh}%</b>`)
+		if (full && design) rows.push(`🔋 Ємність: <b>${((full / design) * 100).toFixed(1)}%</b>`)
+		if (cycles !== undefined) rows.push(`🔁 Цикли заряду: <b>${cycles}</b>`)
+		if (temp !== undefined) rows.push(`🌡 Температура: <b>${temp} °C</b>`)
+		if (!rows.length) return `${head}API EcoFlow не віддає для цієї моделі даних про здоров'я батареї`
+	}
+	return `${head}${rows.join('\n')}\n\n<i>SOH і ємність — оцінка BMS станції; 100% — як нова</i>`
 }
 
 // Ручна дія з «Керування»: виконати, запам'ятати, увімкнути ручний режим; повертає текст результату

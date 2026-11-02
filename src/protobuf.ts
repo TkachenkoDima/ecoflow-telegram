@@ -68,6 +68,14 @@ export type UpsPart = {
 	maxChg?: number // 254/21 поле 270 — ліміт заряду, %
 	acMax?: number // 254/21 поле 209 — макс. вхідна потужність AC, Вт
 	minDsg?: number // 254/21 поле 271 — мін. розряд, %
+	// здоров'я батареї (BMS 32/50)
+	soh?: number // поле 15, %
+	cycles?: number // поле 14
+	designCap?: number // поле 11, мА·год (паспортна ємність)
+	fullCap?: number // поле 13, мА·год (поточна повна ємність)
+	cellMaxMv?: number // поле 16
+	cellMinMv?: number // поле 17
+	tempC?: number // поле 9
 }
 
 export function parseEcoflowPacket(payload: Uint8Array): UpsPart {
@@ -95,6 +103,13 @@ export function parseEcoflowPacket(payload: Uint8Array): UpsPart {
 			part.battInW = num(m, 26)
 			part.battOutW = num(m, 27)
 			part.remMin = num(m, 28)
+			part.soh = num(m, 15)
+			part.cycles = num(m, 14)
+			part.designCap = num(m, 11)
+			part.fullCap = num(m, 13)
+			part.cellMaxMv = num(m, 16)
+			part.cellMinMv = num(m, 17)
+			part.tempC = num(m, 9)
 		} else if (cmdFunc === 254 && cmdId === 21) {
 			const inW = num(m, 3),
 				outW = num(m, 4)
