@@ -553,7 +553,7 @@ const table = (devices: Device[], readings: Map<string, Reading>, online: Map<st
 			if (!r) return `❔ ${name} — немає даних`
 			const load = r.loadW !== null ? ` · ⚡ ${r.loadW} Вт` : ''
 			const st = r.remMin !== null ? `⏳ ${hhmm(r.remMin)}` : r.gridIn ? '🔌 від мережі' : '⏳ —'
-			return `${socIcon(r.soc)} ${name}  <b>${r.soc}%</b>${load}\n<code>${bar(r.soc)}</code>  ${st}`
+			return `${socIcon(r.soc)} ${name} <b>${r.soc}%</b>${load}\n<code>${bar(r.soc)}</code> ${st}`
 		})
 		.join('\n\n')
 
@@ -574,19 +574,19 @@ const gridText = (g: GridState | null, now: number) => {
 // Детальна картка однієї станції: усе звичайним текстом, світло — окремим рядком знизу
 // mode — іконка замість 🔌 у «Макс. вхід»: хто ним зараз керує (🤖 авто / ✋ ручне)
 const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState | null, now: number, mode = '') => {
-	const head = `<b>${esc(d.name)}</b>   <i>${clock(now)}</i>`
+	const head = `<b>${esc(d.name)}</b> · <i>${clock(now)}</i>`
 	const g_ = gridText(g, now)
 	const foot = g_ ? `\n\n${g_}` : ''
 	if (!isOnline) return `⚫️ ${head}\nОфлайн${foot}`
 	if (!r) return `❔ ${head}\nНемає даних${foot}`
 	const time =
-		r.remMin !== null ? `⏳ Залишилось  <b>${hhmm(r.remMin)}</b>` : r.gridIn ? `🔌 <b>Від мережі</b>` : `⏳ Залишилось  <b>—</b>`
-	const load = r.loadW !== null ? `\n⚡ Споживання  <b>${r.loadW} Вт</b>` : ''
+		r.remMin !== null ? `⏳ Залишилось <b>${hhmm(r.remMin)}</b>` : r.gridIn ? `🔌 <b>Від мережі</b>` : `⏳ Залишилось <b>—</b>`
+	const load = r.loadW !== null ? `\n⚡ Споживання <b>${r.loadW} Вт</b>` : ''
 	const lim =
-		(r.maxChg !== undefined ? `\n🔝 Ліміт заряду  <b>${r.maxChg}%</b>` : '') +
-		(r.acMax !== undefined ? `\n${mode || '🔌'} Макс. вхід  <b>${r.acMax} Вт</b>` : '') +
-		(r.minDsg !== undefined ? `\n🔻 Мін. розряд  <b>${r.minDsg}%</b>` : '')
-	return `${socIcon(r.soc)} ${head}\n<code>${bar(r.soc)}</code>  <b>${r.soc}%</b>\n${time}${load}${lim}${foot}`
+		(r.maxChg !== undefined ? `\n🔝 Ліміт заряду <b>${r.maxChg}%</b>` : '') +
+		(r.acMax !== undefined ? `\n${mode || '🔌'} Макс. вхід <b>${r.acMax} Вт</b>` : '') +
+		(r.minDsg !== undefined ? `\n🔻 Мін. розряд <b>${r.minDsg}%</b>` : '')
+	return `${socIcon(r.soc)} ${head}\n<code>${bar(r.soc)}</code> <b>${r.soc}%</b>\n${time}${load}${lim}${foot}`
 }
 
 // Чи діє правило зараз (за зарядом і світлом); правила «on: подія» — лише в момент події
@@ -647,7 +647,7 @@ async function statusPanel(env: Env, devices: Device[] = DEVICES): Promise<Panel
 	}
 	const g_ = gridText(grid, now)
 	const foot = g_ ? `\n\n${g_}` : ''
-	return { text: `📊 <b>Станції</b>   <i>${clock(now)}</i>\n\n${table(devices, readings, online)}${foot}${errs}` }
+	return { text: `📊 <b>Станції</b> · <i>${clock(now)}</i>\n\n${table(devices, readings, online)}${foot}${errs}` }
 }
 
 // ── Кнопки лише під останньою панеллю ──
@@ -767,11 +767,11 @@ async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<s
 		return `\n\n📈 <b>Сьогодні</b>\n${lines.join('\n')}`
 	}
 	if (cur === 'OFF') {
-		await send(`<b>🔴 Світло пішло</b>   <i>${clock(now)}</i>\n🟢 Було ${duration(now - prev.since)}${await today()}${await prevOutageLine(env)}`)
+		await send(`<b>🔴 Світло пішло</b> · <i>${clock(now)}</i>\n🟢 Було ${duration(now - prev.since)}${await today()}${await prevOutageLine(env)}`)
 		return 'gridOff'
 	}
 	await logOutage(env, prev.since, now)
-	await send(`<b>🟢 Світло повернулось</b>   <i>${clock(now)}</i>\n🔴 Не було ${duration(now - prev.since)}${await today()}`)
+	await send(`<b>🟢 Світло повернулось</b> · <i>${clock(now)}</i>\n🔴 Не було ${duration(now - prev.since)}${await today()}`)
 	return 'gridOn'
 }
 
@@ -942,7 +942,7 @@ async function statsView(env: Env, data: string): Promise<{ text: string; markup
 	const nowLine = S.grid ? `Зараз: ${S.grid.state === 'ON' ? '🟢 світло є' : '🔴 без світла'} з ${dayStart(S.grid.since) === dayStart(now) ? '' : dateLabel(S.grid.since) + ', '}${clock(S.grid.since)}` : ''
 	const dayRow = (a: number, b: number, label: string) => {
 		const end = Math.min(b, now)
-		if (end <= trackFrom) return `${label}  —`
+		if (end <= trackFrom) return `${label} —`
 		const o = S.inRange(a, end)
 		// 🔴 2:35 ×1 — скільки годин без світла і скільки разів вимикали (×N — лише ті, що почались цього дня/тижня)
 		return `${label} ${offBar(o.ms, end - a)} ${o.ms ? `${o.count ? `×${o.count} · ` : ''}${shortDur(o.ms)}` : '🟢'}`
