@@ -1043,7 +1043,7 @@ async function statsView(env: Env, data: string): Promise<{ text: string; markup
 	if (cur < end) onSegs.push({ s: cur, e: end })
 	const segLine = (x: { s: number; e: number }, note = '') => {
 		const ongoing = x.e >= now
-		return `${hhmmAt(x.s)} → ${ongoing ? 'зараз' : hhmmAt(x.e)} · ${duration(x.e - x.s)}${note}`
+		return `• ${hhmmAt(x.s)} → ${ongoing ? 'зараз' : hhmmAt(x.e)} · ${duration(x.e - x.s)}${note}`
 	}
 	const offLines = offSegs.map((x) =>
 		segLine(x, x.from < a ? ` (з ${dateLabel(x.from)})` : x.to > b && x.e >= b ? ' (далі)' : ''),
