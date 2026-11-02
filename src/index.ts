@@ -405,7 +405,8 @@ const deviceKeyboard = (d: Device) => {
 		inline_keyboard: [
 			...[...groups].flatMap(([g, row]) => [[{ text: `${g} · ${d.name}`, callback_data: 'noop' }], row]),
 			...(AUTOMATIONS.some((r) => r.cmd === d.cmd || r.cmd === '*') ? [[{ text: '🤖 Авто (скасувати ручне)', callback_data: `auto:${d.cmd}` }]] : []),
-			[{ text: `🩺 Здоров'я батареї · ${d.name}`, callback_data: `health:${d.cmd}` }],
+			// здоров'я батареї — лише для MQTT-станцій (River 3): офіційний API DELTA 3 таких даних не віддає
+			...(d.via === 'mqtt' ? [[{ text: `🩺 Здоров'я батареї · ${d.name}`, callback_data: `health:${d.cmd}` }]] : []),
 			[
 				{ text: '⬅️ Станції', callback_data: 'menu:control' },
 				{ text: '🏠 Головна', callback_data: 'menu:main' },
