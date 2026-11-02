@@ -846,9 +846,17 @@ const hm = (ms: number) => {
 }
 const pad2 = (n: number) => String(n).padStart(2, '0')
 // смужка частки часу без світла: 8 клітинок = 100%
+// смужка частки часу ЗІ світлом: ▰ — світло, ▱ — без світла (6 клітинок = 100%; будь-яке відключення — хоч одна ▱)
 const offBar = (ms: number, span: number) => {
-	const c = ms ? Math.min(8, Math.max(1, Math.round((ms / span) * 8))) : 0
-	return `<code>${'▰'.repeat(c)}${'▱'.repeat(8 - c)}</code>`
+	const off = ms ? Math.min(6, Math.max(1, Math.round((ms / span) * 6))) : 0
+	return `<code>${'▰'.repeat(6 - off)}${'▱'.repeat(off)}</code>`
+}
+// коротка тривалість для рядків тижня/місяця: «3год 31хв», «45хв», «2д 21год»
+const shortDur = (ms: number) => {
+	const m = Math.round(ms / 60_000)
+	if (m < 60) return `${m}хв`
+	if (m >= 1440) return `${Math.floor(m / 1440)}д${Math.floor((m % 1440) / 60) ? ` ${Math.floor((m % 1440) / 60)}год` : ''}`
+	return `${Math.floor(m / 60)}год${m % 60 ? ` ${m % 60}хв` : ''}`
 }
 
 async function statsData(env: Env) {
@@ -878,12 +886,14 @@ async function statsData(env: Env) {
 		if (span <= 0) return ['<i>немає даних</i>']
 		if (!o.ms) return ['Без відключень ✨']
 		// кожен показник — окремим рядком
+		// від доби — коротко («4д 14год»), інакше рядок не влазить по ширині екрана
+		const fit = (ms: number) => (ms >= 86400_000 ? shortDur(ms) : duration(ms))
 		const offPct = Math.min(100, Math.max(0, Math.round((o.ms / span) * 100)))
 		const lines = [
 			...(o.count ? [`🔢 Відключень: ${o.count}`] : []),
 			// відключення почалось до цього періоду: для доби — «з учора», для тижня/місяця — «почалось раніше»
-			`🔴 Без світла ${duration(o.ms)} · ${offPct}%${o.count ? '' : end - a <= 25 * 3600_000 ? ' (з учора)' : ' (почалось раніше)'}`,
-			`🟢 Зі світлом ${duration(Math.max(0, span - o.ms))} · ${100 - offPct}%`,
+			`🔴 Без світла ${fit(o.ms)} · ${offPct}%${o.count ? '' : end - a <= 25 * 3600_000 ? ' (з учора)' : ' (почалось раніше)'}`,
+			`🟢 Зі світлом ${fit(Math.max(0, span - o.ms))} · ${100 - offPct}%`,
 		]
 		const started = all.filter((x) => x.from >= a && x.from <= end && x.from < b)
 		const longest = [...started].sort((x, y) => y.to - y.from - (x.to - x.from))[0]
@@ -932,7 +942,8 @@ async function statsView(env: Env, data: string): Promise<{ text: string; markup
 		const end = Math.min(b, now)
 		if (end <= trackFrom) return `${label}  —`
 		const o = S.inRange(a, end)
-		return `${label}  ${offBar(o.ms, end - a)}  ${o.ms ? (o.count ? o.count + ' · ' : '') + hm(o.ms) : '✨'}`
+		// 🔴 2:35 ×1 — скільки годин без світла і скільки разів вимикали (×N — лише ті, що почались цього дня/тижня)
+		return `${label} ${offBar(o.ms, end - a)} ${o.ms ? `${o.count ? `×${o.count} · ` : ''}${shortDur(o.ms)}` : '🟢'}`
 	}
 	const today = ymd(now)
 	const todayArg = `${today.y}-${today.m + 1}-${today.d}`
@@ -974,7 +985,7 @@ async function statsView(env: Env, data: string): Promise<{ text: string; markup
 		}
 		const cur = off === 0
 		const text =
-			`📈 <b>${kind === 'w' ? 'Тиждень' : 'Місяць'}</b> · ${title}\n\n${rows.join('\n')}\n\n${S.summary(a, b).join('\n')}` + (cur && nowLine ? `\n\n${nowLine}` : '')
+			`📈 <b>${kind === 'w' ? 'Тиждень' : 'Місяць'}</b> · ${title}\n<i>▰ є світло · ▱ немає · ×N разів</i>\n\n${rows.join('\n')}\n\n${S.summary(a, b).join('\n')}` + (cur && nowLine ? `\n\n${nowLine}` : '')
 		const markup = {
 			inline_keyboard: [
 				modeRow(kind),
@@ -1043,12 +1054,12 @@ async function statsView(env: Env, data: string): Promise<{ text: string; markup
 	// решта підсумку (кількість, найдовше, середнє, найчастіше) — без «без світла»/«зі світлом», вони вже в заголовках блоків
 	const rest = S.summary(a, b).filter((l) => !l.startsWith('🔴 Без світла') && !l.startsWith('🟢 Зі світлом'))
 	const list = offLines
-	// таймлайн доби: 24 клітинки по годині (▰ — без світла ≥ 30 хв цієї години)
+	// таймлайн доби: 24 клітинки по годині (▰ — світло, ▱ — без світла ≥ 30 хв цієї години)
 	let line = ''
 	for (let h = 0; h < 24; h++) {
 		const ha = a + h * 3600_000,
 			hb = ha + 3600_000
-		line += ha >= now ? '·' : S.inRange(ha, Math.min(hb, now)).ms >= 30 * 60_000 ? '▰' : '▱'
+		line += ha >= now ? '·' : S.inRange(ha, Math.min(hb, now)).ms >= 30 * 60_000 ? '▱' : '▰' // ▰ — було світло, ▱ — не було
 	}
 	const body =
 		end <= trackFrom
@@ -1324,7 +1335,31 @@ async function pinCommand(env: Env, chatId: number | string, arg: string | undef
 	return ''
 }
 
+// Разове прибирання лога: 30.10 розряджений UPS «скакав», і в лог потрапили хибні відключення по 1–2 хв.
+// Склеюємо шматки з паузами < 5 хв і видаляємо залишки < 5 хв за 30.10; виконується один раз (позначка в KV)
+async function cleanupOutlog3010(env: Env) {
+	if (await env.POWER_KV.get('fix:outlog:3010')) return
+	const log = (await env.POWER_KV.get<Outage[]>('outlog', 'json')) ?? []
+	const a = localDay(2026, 9, 30),
+		b = localDay(2026, 9, 31)
+	// хибні «світло з'явилось» на 1–2 хв розрізали одне справжнє відключення на шматки — склеюємо шматки з паузою < 5 хв,
+	// потім прибираємо те, що лишилось коротшим за 5 хв
+	const sorted = [...log].sort((x, y) => x.from - y.from)
+	const merged: Outage[] = []
+	for (const o of sorted) {
+		const last = merged[merged.length - 1]
+		const day30 = o.from >= a && o.from < b
+		if (last && day30 && last.from >= a && last.from < b && o.from - last.to < 5 * 60_000) last.to = Math.max(last.to, o.to)
+		else merged.push({ ...o })
+	}
+	const keep = merged.filter((o) => !(o.from >= a && o.from < b && o.to - o.from < 5 * 60_000))
+	if (keep.length !== log.length) await env.POWER_KV.put('outlog', JSON.stringify(keep))
+	await env.POWER_KV.put('fix:outlog:3010', `${log.length - keep.length}`)
+	console.log('outlog cleanup 30.10: removed', log.length - keep.length)
+}
+
 async function run(env: Env) {
+	await cleanupOutlog3010(env).catch((e) => console.error('cleanup 30.10', e))
 	await syncCommands(env).catch((e) => console.error('commands', e))
 	const { online, readings } = await readAll(env, DEVICES, false, true)
 	if (!(await env.POWER_KV.get('started:v3'))) {
