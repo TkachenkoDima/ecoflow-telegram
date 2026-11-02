@@ -557,18 +557,18 @@ const table = (devices: Device[], readings: Map<string, Reading>, online: Map<st
 		})
 		.join('\n\n')
 
-// Рядок про світло — простим текстом під блоком
-// Сьогодні: «🔴 Без світла 2 год 18 хв» / «з 07:16» (двома рядками — в один не влазить по ширині екрана);
-// якщо почалось в інший день — з датою:
-// «🟢 Світло є 3 дні, 2 год, 15 хв» / «усього 74 год 15 хв» / «з 23.10, 13:38»
+// Рядок про світло: спершу «з якого часу», потім «скільки вже» — кожне повноцінним реченням
+//   🟢 Світло є з 15:17          🔴 Без світла з 23.10, 13:38
+//   ⏱ вже 7 хв                   ⏱ вже 3 дні, 2 год, 15 хв
+//                                (усього 74 год 15 хв)
 const gridText = (g: GridState | null, now: number) => {
 	if (!g) return ''
 	const head = g.state === 'ON' ? '🟢 Світло є' : '🔴 Без світла'
-	if (dayStart(g.since) === dayStart(now)) return `${head} ${duration(now - g.since)}\nз ${clock(g.since)}`
-	// + загальна кількість годин: «усього 75 год 27 хв»
+	const since = dayStart(g.since) === dayStart(now) ? clock(g.since) : `${dateLabel(g.since)}, ${clock(g.since)}`
 	const tm = Math.floor((now - g.since) / 60_000)
-	const total = tm >= 1440 ? `\nусього ${Math.floor(tm / 60)} год${tm % 60 ? ` ${tm % 60} хв` : ''}` : '' // до доби — дублювало б
-	return `${head} ${duration(now - g.since)}${total}\nз ${dateLabel(g.since)}, ${clock(g.since)}`
+	// від доби — ще й загальна кількість годин окремим рядком (в один не влазить по ширині)
+	const total = tm >= 1440 ? `\n(усього ${Math.floor(tm / 60)} год${tm % 60 ? ` ${tm % 60} хв` : ''})` : ''
+	return `${head} з ${since}\n⏱ вже ${duration(now - g.since)}${total}`
 }
 
 // Детальна картка однієї станції: усе звичайним текстом, світло — окремим рядком знизу
