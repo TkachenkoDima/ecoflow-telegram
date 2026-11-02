@@ -556,12 +556,12 @@ const table = (devices: Device[], readings: Map<string, Reading>, online: Map<st
 		.join('\n\n')
 
 // Рядок про світло — простим текстом під блоком
-// Сьогодні: «🕯 Без світла 2 год 18 хв» / «з 07:16» (двома рядками — в один не влазить по ширині екрана);
+// Сьогодні: «🔴 Без світла 2 год 18 хв» / «з 07:16» (двома рядками — в один не влазить по ширині екрана);
 // якщо почалось в інший день — з датою:
-// «💡 Світло є 3 дні, 2 год, 15 хв» / «усього 74 год 15 хв» / «з 23.10, 13:38»
+// «🟢 Світло є 3 дні, 2 год, 15 хв» / «усього 74 год 15 хв» / «з 23.10, 13:38»
 const gridText = (g: GridState | null, now: number) => {
 	if (!g) return ''
-	const head = g.state === 'ON' ? '💡 Світло є' : '🕯 Без світла'
+	const head = g.state === 'ON' ? '🟢 Світло є' : '🔴 Без світла'
 	if (dayStart(g.since) === dayStart(now)) return `${head} ${duration(now - g.since)}\nз ${clock(g.since)}`
 	// + загальна кількість годин: «усього 75 год 27 хв»
 	const tm = Math.floor((now - g.since) / 60_000)
@@ -761,15 +761,15 @@ async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<s
 		const S = await statsData(env)
 		// «Зі світлом: N%» на початку доби нічого не каже (о 02:00 це «0%») — показуємо лише з 06:00
 		const early = now - dayStart(now) < 6 * 3600_000
-		const lines = S.summary(dayStart(now), now).filter((l) => !l.startsWith('🕐') && !(early && l.startsWith('🔆')))
+		const lines = S.summary(dayStart(now), now).filter((l) => !l.startsWith('🕐') && !(early && l.startsWith('🟢 Зі світлом')))
 		return `\n\n📈 <b>Сьогодні</b>\n${lines.join('\n')}`
 	}
 	if (cur === 'OFF') {
-		await send(`<b>🕯 Світло пішло</b>   <i>${clock(now)}</i>\n💡 Було ${duration(now - prev.since)}${await today()}${await prevOutageLine(env)}`)
+		await send(`<b>🔴 Світло пішло</b>   <i>${clock(now)}</i>\n🟢 Було ${duration(now - prev.since)}${await today()}${await prevOutageLine(env)}`)
 		return 'gridOff'
 	}
 	await logOutage(env, prev.since, now)
-	await send(`<b>💡 Світло повернулось</b>   <i>${clock(now)}</i>\n🕯 Не було ${duration(now - prev.since)}${await today()}`)
+	await send(`<b>🟢 Світло повернулось</b>   <i>${clock(now)}</i>\n🔴 Не було ${duration(now - prev.since)}${await today()}`)
 	return 'gridOn'
 }
 
@@ -881,8 +881,8 @@ async function statsData(env: Env) {
 		const lines = [
 			...(o.count ? [`🔢 Відключень: ${o.count}`] : []),
 			// відключення почалось до цього періоду: для доби — «з учора», для тижня/місяця — «почалось раніше»
-			`🕯 Без світла: ${duration(o.ms)}${o.count ? '' : end - a <= 25 * 3600_000 ? ' (з учора)' : ' (почалось раніше)'}`,
-			`🔆 Зі світлом: ${Math.max(0, Math.round(100 - (o.ms / span) * 100))}% часу`,
+			`🔴 Без світла: ${duration(o.ms)}${o.count ? '' : end - a <= 25 * 3600_000 ? ' (з учора)' : ' (почалось раніше)'}`,
+			`🟢 Зі світлом: ${Math.max(0, Math.round(100 - (o.ms / span) * 100))}% часу`,
 		]
 		const started = all.filter((x) => x.from >= a && x.from <= end && x.from < b)
 		const longest = [...started].sort((x, y) => y.to - y.from - (x.to - x.from))[0]
@@ -1014,14 +1014,34 @@ async function statsView(env: Env, data: string): Promise<{ text: string; markup
 	const a = localDay(y, m - 1, d)
 	const b = localDay(y, m - 1, d + 1)
 	const end = Math.min(b, now)
-	const list = S.all
+	// відрізки доби: без світла (з лога) і зі світлом (проміжки між ними), обрізані межами доби
+	const hhmmAt = (t: number) => (t >= b ? '24:00' : clock(t))
+	const offSegs = S.all
 		.filter((o) => o.to > a && o.from < end)
-		.map((o) => {
-			const ongoing = S.grid?.state === 'OFF' && o.from === S.grid.since
-			const f = o.from < a ? `${clock(o.from)} ${dateLabel(o.from)}` : clock(o.from)
-			const t = ongoing ? 'досі' : o.to > b ? `${clock(o.to)} ${dateLabel(o.to)}` : clock(o.to)
-			return `${f}–${t} · ${duration(o.to - o.from)}`
-		})
+		.sort((x, y) => x.from - y.from)
+		.map((o) => ({ s: Math.max(o.from, a), e: Math.min(o.to, end), from: o.from, to: o.to }))
+	const onSegs: Array<{ s: number; e: number }> = []
+	let cur = Math.max(a, trackFrom)
+	for (const x of offSegs) {
+		if (x.s > cur) onSegs.push({ s: cur, e: x.s })
+		cur = Math.max(cur, x.e)
+	}
+	if (cur < end) onSegs.push({ s: cur, e: end })
+	const segLine = (x: { s: number; e: number }, note = '') => {
+		const ongoing = x.e >= now
+		return `${hhmmAt(x.s)} → ${ongoing ? 'зараз' : hhmmAt(x.e)} · ${duration(x.e - x.s)}${note}`
+	}
+	const offLines = offSegs.map((x) =>
+		segLine(x, x.from < a ? ` (з ${dateLabel(x.from)})` : x.to > b && x.e >= b ? ' (далі)' : ''),
+	)
+	const onLines = onSegs.filter((x) => x.e - x.s >= 60_000).map((x) => segLine(x))
+	const offMs = offSegs.reduce((t, x) => t + x.e - x.s, 0)
+	const spanDay = end - Math.max(a, trackFrom)
+	const lightPct = spanDay > 0 ? Math.max(0, Math.round(100 - (offMs / spanDay) * 100)) : 100
+	const onMs = Math.max(0, spanDay - offMs)
+	// решта підсумку (кількість, найдовше, середнє, найчастіше) — без «без світла»/«зі світлом», вони вже в заголовках блоків
+	const rest = S.summary(a, b).filter((l) => !l.startsWith('🔴 Без світла') && !l.startsWith('🟢 Зі світлом'))
+	const list = offLines
 	// таймлайн доби: 24 клітинки по годині (▰ — без світла ≥ 30 хв цієї години)
 	let line = ''
 	for (let h = 0; h < 24; h++) {
@@ -1032,7 +1052,12 @@ async function statsView(env: Env, data: string): Promise<{ text: string; markup
 	const body =
 		end <= trackFrom
 			? '<i>немає даних</i>'
-			: `<code>${line}</code>\n<code>0     6     12    18   </code>\n\n${list.length ? `${list.join('\n')}\n\n${S.summary(a, b).join('\n')}` : 'Без відключень ✨'}`
+			: `<code>${line}</code>\n<code>0     6     12    18   </code>\n\n` +
+				(list.length
+					? `<b>🔴 Без світла</b> ${duration(offMs)} · ${100 - lightPct}%\n${offLines.join('\n')}` +
+						(onLines.length ? `\n\n<b>🟢 Зі світлом</b> ${duration(onMs)} · ${lightPct}%\n${onLines.join('\n')}` : '') +
+						(rest.length ? `\n\n${rest.join('\n')}` : '')
+					: '🟢 Без відключень ✨')
 	const isToday = a === dayStart(now)
 	const text = `📈 <b>День</b> · ${WD[ymd(a).wd]} ${dateLabel(a)}${isToday ? ' (сьогодні)' : ''}\n\n${body}` + (isToday && nowLine ? `\n\n${nowLine}` : '')
 	const prev = ymd(a - 1),
@@ -1162,7 +1187,7 @@ const pinFirstLine = (d: Device, r: Reading | undefined, isOnline: boolean, g: G
 	if (!isOnline) first = `⚫️ ${d.name} офлайн`
 	else if (!r) first = `❔ ${d.name} — немає даних`
 	else first = `${socIcon(r.soc)} ${d.name} ${r.soc}%${r.remMin !== null ? ` · ⏳ ${hhmm(r.remMin)}` : ''}`
-	const light = !g ? '' : g.state === 'ON' ? ' · 💡' : ` · 🕯 ${duration(now - g.since)}`
+	const light = !g ? '' : g.state === 'ON' ? ' · 🟢' : ` · 🔴 ${duration(now - g.since)}`
 	return esc(first + light)
 }
 
