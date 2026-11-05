@@ -246,7 +246,8 @@ const byChat = (env: Env, prefix: string) => Object.fromEntries(chatIds(env).map
 // Запис лише коли значення змінилось або минула година (≈ до 72 записів/добу на 3 станції — далеко від ліміту 1000)
 type Settings = { maxChg?: number; acMax?: number; minDsg?: number; at: number; cmdAt?: number } // cmdAt — коли змінено командою бота
 const RECENT_CMD_MS = 10 * 60_000
-const SETTINGS_FRESH_MS = 60 * 60_000
+// раз на 6 год оновлюємо «живі» налаштування навіть без змін (зміни пишуться одразу) — менше записів KV
+const SETTINGS_FRESH_MS = 6 * 60 * 60_000
 let settingsEnv: Env // KV доступний лише через env — запам'ятовуємо на час запиту
 const settingsCache = new Map<string, Settings | null>() // у межах одного запуску, щоб не читати KV двічі
 async function getSettings(sn: string): Promise<Settings | null> {
@@ -505,7 +506,8 @@ const isOurChat = (env: Env, id: unknown) => chatIds(env).includes(String(id))
 // Відповідь у конкретний чат (o.chatId) або розсилка в усі групи; збій однієї групи не блокує інші
 // ── Самовидалення пушів ──
 // Черга в KV на групу: [{id, at}] — коли видалити. Cron щохвилини прибирає прострочені.
-type Expiring = { id: number; at: number }
+// key — тип пушу для схеми «лише останнє» (новий пуш того ж типу прибирає попередній); окремих ключів last:* більше немає
+type Expiring = { id: number; at: number; key?: string }
 // усі групи — в одному ключі 'ttl' { chatId: [{id, at}] }
 const loadTtl = (env: Env) => mapLoad<Expiring[]>(env, 'ttl', byChat(env, 'ttl'))
 const saveTtl = (env: Env, chatId: string | number, list: Expiring[]) => mapSet<Expiring[]>(env, 'ttl', byChat(env, 'ttl'), String(chatId), list.length ? list : undefined)
@@ -516,22 +518,33 @@ const deleteAtFor = (now: number) => {
 	if (morning <= now) morning += 86400_000
 	return morning + PUSH_TTL_MIN * 60_000
 }
-async function scheduleDelete(env: Env, chatId: string | number, messageId: number) {
-	const list = (await loadTtl(env))[String(chatId)] ?? []
-	list.push({ id: messageId, at: deleteAtFor(Date.now()) })
+// Один запис KV на пуш: черга видалення + «лише останнє» в одному місці
+async function scheduleDelete(env: Env, chatId: string | number, messageId: number, key?: string) {
+	let list = (await loadTtl(env))[String(chatId)] ?? []
+	if (key) {
+		// попередній пуш цього ж типу ще висить (пуші живуть кілька хвилин) — прибираємо його одразу
+		for (const x of list.filter((x) => x.key === key)) await tgCall(env, 'deleteMessage', { chat_id: chatId, message_id: x.id }).catch(() => {})
+		list = list.filter((x) => x.key !== key)
+	}
+	list.push({ id: messageId, at: deleteAtFor(Date.now()), ...(key ? { key } : {}) })
 	await saveTtl(env, chatId, list)
 }
+// Усі групи за один прохід і один запис KV (лише якщо щось видалили)
 async function cleanupExpired(env: Env) {
-	for (const chatId of chatIds(env)) {
-		const list = (await loadTtl(env))[String(chatId)]
-		if (!list?.length) continue
-		const now = Date.now()
+	const map = await loadTtl(env)
+	const now = Date.now()
+	let changed = false
+	for (const chatId of Object.keys(map)) {
+		const list = map[chatId] ?? []
 		const due = list.filter((x) => x.at <= now)
 		if (!due.length) continue
 		for (const x of due) await tgCall(env, 'deleteMessage', { chat_id: chatId, message_id: x.id }).catch(() => {})
 		const rest = list.filter((x) => x.at > now)
-		await saveTtl(env, chatId, rest)
+		if (rest.length) map[chatId] = rest
+		else delete map[chatId]
+		changed = true
 	}
+	if (changed) await env.POWER_KV.put('ttl', JSON.stringify(map))
 }
 
 // «Станція групи» — та, що закріплена через /pin; без /pin група отримує все
@@ -554,16 +567,11 @@ async function telegram(env: Env, text: string, o: SendOpts = {}) {
 				disable_notification: o.silent || (!o.loud && isQuiet()),
 				...(o.keyboard ? { reply_markup: KEYBOARD } : {}),
 			})
-			if (msg?.message_id) await scheduleDelete(env, chat_id, msg.message_id)
-			// схема «лише останнє»: прибираємо попередній пуш цього ж типу
-			if (o.replaceKey && msg?.message_id) {
-				const key = `${o.replaceKey}:${chat_id}`
-				const prev = Number(await env.POWER_KV.get(key))
-				if (prev) await tgCall(env, 'deleteMessage', { chat_id, message_id: prev }).catch(() => {})
-				await env.POWER_KV.put(key, String(msg.message_id))
-			}
+			return { chat_id, id: msg?.message_id as number | undefined }
 		}),
 	)
+	// черга самовидалення + «лише останнє» (o.replaceKey) — по одному запису; послідовно, бо черга всіх груп в одному ключі
+	for (const r of results) if (r.status === 'fulfilled' && r.value.id) await scheduleDelete(env, r.value.chat_id, r.value.id, o.replaceKey)
 	const failed = results.filter((r) => r.status === 'rejected') as PromiseRejectedResult[]
 	for (const f of failed) console.error('telegram', f.reason)
 	if (failed.length === results.length) throw failed[0].reason
