@@ -842,7 +842,7 @@ async function checkGrid(env: Env, readings: Map<string, Reading>, online: Map<s
 		const S = await statsData(env)
 		// «Зі світлом: N%» на початку доби нічого не каже (о 02:00 це «0%») — показуємо лише з 06:00
 		const early = now - dayStart(now) < 6 * 3600_000
-		const lines = S.summary(dayStart(now), now).filter((l) => !l.startsWith('🕐') && !(early && l.startsWith('🟢 Зі світлом')))
+		const lines = S.summary(dayStart(now), S.now + 1).filter((l) => !l.startsWith('🕐') && !(early && l.startsWith('🟢 Зі світлом')))
 		return `\n\n📈 <b>Сьогодні</b>\n${lines.join('\n')}`
 	}
 	if (cur === 'OFF') {
@@ -1453,7 +1453,7 @@ async function run(env: Env) {
 		}
 	}
 	const event = await checkGrid(env, readings, online).catch((e) => (console.error('grid', e), null))
-	if (event === 'gridOff') await fixGrid0511(env).catch((e) => console.error('fix 05.11', e))
+	if (Date.now() < localDay(2026, 10, 6)) await fixGrid0511(env).catch((e) => console.error('fix 05.11', e)) // лише 05.11
 	await runAutomations(env, readings, online, event).catch((e) => console.error('automations', e))
 	await updatePins(env, readings, online).catch((e) => console.error('pins', e))
 	await cleanupExpired(env).catch((e) => console.error('cleanup', e))
