@@ -183,6 +183,65 @@ async function appAuth(env: Env): Promise<AppAuth> {
 	return a
 }
 
+// ── Економія читань KV (ліміт 100 000/добу на весь акаунт) ─────
+// 1) У межах одного запуску (cron чи натискання) кожен ключ читається з KV не більше одного разу:
+//    повторні get беруть значення з пам'яті, put/delete його оновлюють.
+function memoKV(kv: KVNamespace): KVNamespace {
+	const mem = new Map<string, Promise<string | null>>()
+	const raw = (key: string) => {
+		if (!mem.has(key)) mem.set(key, kv.get(key))
+		return mem.get(key)!
+	}
+	const api = {
+		async get(key: string, type?: unknown) {
+			const v = await raw(key)
+			if (v === null) return null
+			return type === 'json' || (type as { type?: string } | undefined)?.type === 'json' ? JSON.parse(v) : v
+		},
+		async put(key: string, value: string, opts?: KVNamespacePutOptions) {
+			mem.set(key, Promise.resolve(String(value)))
+			return kv.put(key, value, opts)
+		},
+		async delete(key: string) {
+			mem.set(key, Promise.resolve(null))
+			return kv.delete(key)
+		},
+	}
+	return api as unknown as KVNamespace
+}
+// 2) Дрібні ключі однієї природи (по станціях / по групах) зберігаються одним об'єктом: 1 читання замість кількох,
+//    і без читань «not found». legacy — старі окремі ключі: при першому зверненні переносимо їх в об'єкт (разово)
+async function mapLoad<T>(env: Env, key: string, legacy: Record<string, string>): Promise<Record<string, T>> {
+	const m = await env.POWER_KV.get<Record<string, T>>(key, 'json')
+	if (m) return m
+	const out: Record<string, T> = {}
+	const found: string[] = []
+	for (const [sub, old] of Object.entries(legacy)) {
+		const v = await env.POWER_KV.get<T>(old, 'json')
+		if (v !== null && v !== undefined) {
+			out[sub] = v
+			found.push(old)
+		}
+	}
+	await env.POWER_KV.put(key, JSON.stringify(out))
+	// старі ключі більше не потрібні (видалення — разово, лише тих, що були)
+	for (const old of found) await env.POWER_KV.delete(old).catch(() => {})
+	return out
+}
+async function mapSet<T>(env: Env, key: string, legacy: Record<string, string>, sub: string, val: T | undefined) {
+	const m = await mapLoad<T>(env, key, legacy)
+	if (val === undefined) {
+		if (!(sub in m)) return
+		delete m[sub]
+	} else {
+		if (JSON.stringify(m[sub]) === JSON.stringify(val)) return
+		m[sub] = val
+	}
+	await env.POWER_KV.put(key, JSON.stringify(m))
+}
+const bySn = (prefix: string) => Object.fromEntries(DEVICES.map((d) => [d.sn, `${prefix}:${d.sn}`]))
+const byChat = (env: Env, prefix: string) => Object.fromEntries(chatIds(env).map((c) => [c, `${prefix}:${c}`]))
+
 // ── Налаштування станцій (ліміт заряду, макс. вхід) у KV — спільні для всіх дата-центрів Cloudflare ──
 // Запис лише коли значення змінилось або минула година (≈ до 72 записів/добу на 3 станції — далеко від ліміту 1000)
 type Settings = { maxChg?: number; acMax?: number; minDsg?: number; at: number; cmdAt?: number } // cmdAt — коли змінено командою бота
@@ -191,7 +250,7 @@ const SETTINGS_FRESH_MS = 60 * 60_000
 let settingsEnv: Env // KV доступний лише через env — запам'ятовуємо на час запиту
 const settingsCache = new Map<string, Settings | null>() // у межах одного запуску, щоб не читати KV двічі
 async function getSettings(sn: string): Promise<Settings | null> {
-	if (!settingsCache.has(sn)) settingsCache.set(sn, await settingsEnv.POWER_KV.get<Settings>(`settings:${sn}`, 'json'))
+	if (!settingsCache.has(sn)) settingsCache.set(sn, (await mapLoad<Settings>(settingsEnv, 'settings', bySn('settings')))[sn] ?? null)
 	return settingsCache.get(sn)!
 }
 async function saveSettings(sn: string, upd: { maxChg?: number; acMax?: number; minDsg?: number }, byCommand = false) {
@@ -207,7 +266,7 @@ async function saveSettings(sn: string, upd: { maxChg?: number; acMax?: number; 
 	const changed = !prev || prev.maxChg !== next.maxChg || prev.acMax !== next.acMax || prev.minDsg !== next.minDsg
 	if (!byCommand && !changed && Date.now() - prev.at < SETTINGS_FRESH_MS) return
 	settingsCache.set(sn, next)
-	await settingsEnv.POWER_KV.put(`settings:${sn}`, JSON.stringify(next))
+	await mapSet(settingsEnv, 'settings', bySn('settings'), sn, next)
 }
 
 // sns — з кого читаємо заряд; settingsFor — у кого ще чекаємо налаштування (повний пакет 254/21:
@@ -389,10 +448,10 @@ const CONTROL_KEYBOARD = {
 // ── Ручний режим: автоматизації не чіпають станцію ──
 // Безстроково — доки не натиснуть «🤖 Авто»
 type Manual = { since: number }
-const manualKey = (sn: string) => `manual:${sn}`
-const getManual = (env: Env, sn: string) => env.POWER_KV.get<Manual>(manualKey(sn), 'json')
-const setManual = (env: Env, sn: string) => env.POWER_KV.put(manualKey(sn), JSON.stringify({ since: Date.now() }))
-const clearManual = (env: Env, sn: string) => env.POWER_KV.delete(manualKey(sn))
+// усі станції — в одному ключі 'manual' { sn: { since } }
+const getManual = async (env: Env, sn: string) => (await mapLoad<Manual>(env, 'manual', bySn('manual')))[sn] ?? null
+const setManual = (env: Env, sn: string) => mapSet<Manual>(env, 'manual', bySn('manual'), sn, { since: Date.now() })
+const clearManual = (env: Env, sn: string) => mapSet<Manual>(env, 'manual', bySn('manual'), sn, undefined)
 
 const deviceKeyboard = (d: Device) => {
 	const groups = new Map<string, { text: string; callback_data: string }[]>()
@@ -447,7 +506,9 @@ const isOurChat = (env: Env, id: unknown) => chatIds(env).includes(String(id))
 // ── Самовидалення пушів ──
 // Черга в KV на групу: [{id, at}] — коли видалити. Cron щохвилини прибирає прострочені.
 type Expiring = { id: number; at: number }
-const ttlKey = (chatId: string | number) => `ttl:${chatId}`
+// усі групи — в одному ключі 'ttl' { chatId: [{id, at}] }
+const loadTtl = (env: Env) => mapLoad<Expiring[]>(env, 'ttl', byChat(env, 'ttl'))
+const saveTtl = (env: Env, chatId: string | number, list: Expiring[]) => mapSet<Expiring[]>(env, 'ttl', byChat(env, 'ttl'), String(chatId), list.length ? list : undefined)
 const deleteAtFor = (now: number) => {
 	if (!isQuiet()) return now + PUSH_TTL_MIN * 60_000
 	// тихий режим: до ранку (QUIET_TO) + PUSH_TTL_MIN
@@ -456,26 +517,25 @@ const deleteAtFor = (now: number) => {
 	return morning + PUSH_TTL_MIN * 60_000
 }
 async function scheduleDelete(env: Env, chatId: string | number, messageId: number) {
-	const list = (await env.POWER_KV.get<Expiring[]>(ttlKey(chatId), 'json')) ?? []
+	const list = (await loadTtl(env))[String(chatId)] ?? []
 	list.push({ id: messageId, at: deleteAtFor(Date.now()) })
-	await env.POWER_KV.put(ttlKey(chatId), JSON.stringify(list))
+	await saveTtl(env, chatId, list)
 }
 async function cleanupExpired(env: Env) {
 	for (const chatId of chatIds(env)) {
-		const list = await env.POWER_KV.get<Expiring[]>(ttlKey(chatId), 'json')
+		const list = (await loadTtl(env))[String(chatId)]
 		if (!list?.length) continue
 		const now = Date.now()
 		const due = list.filter((x) => x.at <= now)
 		if (!due.length) continue
 		for (const x of due) await tgCall(env, 'deleteMessage', { chat_id: chatId, message_id: x.id }).catch(() => {})
 		const rest = list.filter((x) => x.at > now)
-		if (rest.length) await env.POWER_KV.put(ttlKey(chatId), JSON.stringify(rest))
-		else await env.POWER_KV.delete(ttlKey(chatId))
+		await saveTtl(env, chatId, rest)
 	}
 }
 
 // «Станція групи» — та, що закріплена через /pin; без /pin група отримує все
-const groupStation = async (env: Env, chatId: string | number) => (await env.POWER_KV.get<{ cmd: string }>(`pin:${chatId}`, 'json'))?.cmd
+const groupStation = async (env: Env, chatId: string | number) => (await getPin(env, chatId))?.cmd
 
 async function telegram(env: Env, text: string, o: SendOpts = {}) {
 	let targets: (string | number)[] = o.chatId !== undefined ? [o.chatId] : chatIds(env)
@@ -676,9 +736,9 @@ async function sendPanel(env: Env, chatId: string | number, p: Panel, markup: ob
 
 // ── Щохвилинна перевірка ────────────────────────────────────────
 async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading | undefined) {
-	const kvKey = `dev:${dev.sn}`
-	const raw = await env.POWER_KV.get(kvKey)
-	const st: DeviceState = raw ? { ...emptyState(), ...JSON.parse(raw) } : emptyState()
+	// стан усіх станцій — в одному ключі 'devs' { sn: DeviceState }
+	const saved = (await mapLoad<DeviceState>(env, 'devs', bySn('dev')))[dev.sn]
+	const st: DeviceState = saved ? { ...emptyState(), ...saved } : emptyState()
 	const before = JSON.stringify(st)
 	const now = Date.now()
 
@@ -709,7 +769,7 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 			st.notified = st.notified.filter((t) => r.soc < t + RESET_GAP)
 		}
 	}
-	if (JSON.stringify(st) !== before) await env.POWER_KV.put(kvKey, JSON.stringify(st))
+	if (JSON.stringify(st) !== before) await mapSet<DeviceState>(env, 'devs', bySn('dev'), dev.sn, st)
 }
 
 // Повертає подію 'gridOn' / 'gridOff', якщо стан світла щойно змінився
@@ -1177,9 +1237,13 @@ async function runAutomations(env: Env, readings: Map<string, Reading>, online: 
 // /pin <станція> — закріпити, /unpin — прибрати. Перший рядок повідомлення видно у смужці вгорі чату;
 // cron щохвилини редагує його (лише якщо текст змінився — це перевіряє сам Telegram).
 type Pin = { cmd: string; messageId: number }
-const pinKey = (chatId: string | number) => `pin:${chatId}`
-const isPinnedMsg = async (env: Env, chatId: string | number, messageId: number) =>
-	(await env.POWER_KV.get<Pin>(pinKey(chatId), 'json'))?.messageId === messageId
+// усі групи — в одному ключі 'pins' { chatId: { cmd, messageId } }
+async function getPin(env: Env, chatId: string | number): Promise<Pin | null> {
+	return (await mapLoad<Pin>(env, 'pins', byChat(env, 'pin')))[String(chatId)] ?? null
+}
+const setPin = (env: Env, chatId: string | number, pin: Pin) => mapSet<Pin>(env, 'pins', byChat(env, 'pin'), String(chatId), pin)
+const delPin = (env: Env, chatId: string | number) => mapSet<Pin>(env, 'pins', byChat(env, 'pin'), String(chatId), undefined)
+const isPinnedMsg = async (env: Env, chatId: string | number, messageId: number) => (await getPin(env, chatId))?.messageId === messageId
 
 // Стан «екрана» в закріпленому: що показано і яке меню кнопок. Живе VIEW_TTL_S, потім — картка станції групи
 // body — статичний вміст (усі станції, статистика); dev — «жива» картка цієї станції (оновлюється щохвилини);
@@ -1251,7 +1315,7 @@ async function editPinned(env: Env, chatId: string | number, pin: Pin, text: str
 		const err = String(e)
 		if (err.includes('message is not modified')) return
 		console.error('pin', chatId, err)
-		if (err.includes('message to edit not found')) await env.POWER_KV.delete(pinKey(chatId)) // повідомлення видалили
+		if (err.includes('message to edit not found')) await delPin(env, chatId) // повідомлення видалили
 	})
 }
 
@@ -1260,7 +1324,7 @@ async function updatePins(env: Env, readings: Map<string, Reading>, online: Map<
 	const g = await env.POWER_KV.get<GridState>('grid', 'json')
 	const now = Date.now()
 	for (const chatId of chatIds(env)) {
-		const pin = await env.POWER_KV.get<Pin>(pinKey(chatId), 'json')
+		const pin = await getPin(env, chatId)
 		if (!pin) continue
 		const d = DEVICES.find((x) => x.cmd === pin.cmd)
 		if (!d) continue
@@ -1304,13 +1368,13 @@ async function pinnedStats(env: Env, chatId: string | number, pin: Pin, data: st
 }
 
 async function pinCommand(env: Env, chatId: number | string, arg: string | undefined): Promise<string> {
-	const old = await env.POWER_KV.get<Pin>(pinKey(chatId), 'json')
+	const old = await getPin(env, chatId)
 	if (old) {
 		await tgCall(env, 'unpinChatMessage', { chat_id: chatId, message_id: old.messageId }).catch(() => {})
 		await tgCall(env, 'deleteMessage', { chat_id: chatId, message_id: old.messageId }).catch(() => {}) // старий «екран» більше не потрібен
 	}
 	if (!arg) {
-		await env.POWER_KV.delete(pinKey(chatId))
+		await delPin(env, chatId)
 		return old ? '📌 Смужку прибрано' : '📌 Закріпленої смужки не було'
 	}
 	const d = DEVICES.find((x) => x.cmd === arg.toLowerCase())
@@ -1333,38 +1397,19 @@ async function pinCommand(env: Env, chatId: number | string, arg: string | undef
 			console.error('pinChatMessage', e)
 			return '⚠️ Не можу закріпити: зробіть бота адміністратором групи з правом «Закріплювати повідомлення» і повторіть /pin'
 		}
-	await env.POWER_KV.put(pinKey(chatId), JSON.stringify({ cmd: d.cmd, messageId: msg.message_id }))
+	await setPin(env, chatId, { cmd: d.cmd, messageId: msg.message_id })
 	return ''
 }
 
-// Разове прибирання лога: 30.10 розряджений UPS «скакав», і в лог потрапили хибні відключення по 1–2 хв.
-// Склеюємо шматки з паузами < 5 хв і видаляємо залишки < 5 хв за 30.10; виконується один раз (позначка в KV)
-async function cleanupOutlog3010(env: Env) {
-	if (await env.POWER_KV.get('fix:outlog:3010')) return
-	const log = (await env.POWER_KV.get<Outage[]>('outlog', 'json')) ?? []
-	const a = localDay(2026, 9, 30),
-		b = localDay(2026, 9, 31)
-	// хибні «світло з'явилось» на 1–2 хв розрізали одне справжнє відключення на шматки — склеюємо шматки з паузою < 5 хв,
-	// потім прибираємо те, що лишилось коротшим за 5 хв
-	const sorted = [...log].sort((x, y) => x.from - y.from)
-	const merged: Outage[] = []
-	for (const o of sorted) {
-		const last = merged[merged.length - 1]
-		const day30 = o.from >= a && o.from < b
-		if (last && day30 && last.from >= a && last.from < b && o.from - last.to < 5 * 60_000) last.to = Math.max(last.to, o.to)
-		else merged.push({ ...o })
-	}
-	const keep = merged.filter((o) => !(o.from >= a && o.from < b && o.to - o.from < 5 * 60_000))
-	if (keep.length !== log.length) await env.POWER_KV.put('outlog', JSON.stringify(keep))
-	await env.POWER_KV.put('fix:outlog:3010', `${log.length - keep.length}`)
-	console.log('outlog cleanup 30.10: removed', log.length - keep.length)
-}
+// Перевірки, що змінюються рідко (меню команд, «моніторинг запущено»), — раз на годину і після старту воркера
+let bootChecked = false
 
 async function run(env: Env) {
-	await cleanupOutlog3010(env).catch((e) => console.error('cleanup 30.10', e))
-	await syncCommands(env).catch((e) => console.error('commands', e))
+	const hourly = !bootChecked || new Date().getUTCMinutes() === 0
+	bootChecked = true
+	if (hourly) await syncCommands(env).catch((e) => console.error('commands', e))
 	const { online, readings } = await readAll(env, DEVICES, false, true)
-	if (!(await env.POWER_KV.get('started:v3'))) {
+	if (hourly && !(await env.POWER_KV.get('started:v3'))) {
 		const text = `📡 <b>Моніторинг EcoFlow запущено</b>\nПороги ${THRESHOLDS.join(' · ')}% ${QUIET_FROM === QUIET_TO ? '' : ` · тиша ${QUIET_FROM}:00–${QUIET_TO}:00`}\n\n${table(DEVICES, readings, online)}`
 		for (const id of chatIds(env)) await sendPanel(env, id, { text }).catch((e) => console.error('start', id, e))
 		await env.POWER_KV.put('started:v3', String(Date.now()))
@@ -1410,7 +1455,7 @@ async function handleUpdate(env: Env, update: any) {
 		const chatId = cb.message?.chat?.id
 		const ours = isOurChat(env, chatId)
 		const data = String(cb.data)
-		const pin = ours ? await env.POWER_KV.get<Pin>(pinKey(chatId), 'json') : null
+		const pin = ours ? await getPin(env, chatId) : null
 		if (pin && pin.messageId === cb.message?.message_id) return pinnedCallback(env, cb, chatId, pin, data)
 		// Навігація між «папками» — міняємо лише кнопки під тим самим повідомленням
 		if (data === 'noop' || data.startsWith('menu:')) {
@@ -1490,7 +1535,7 @@ async function handleUpdate(env: Env, update: any) {
 	const panel = await render(env, cmd)
 	if (!panel) return
 	await removeUserMsg(env, msg)
-	const pin = await env.POWER_KV.get<Pin>(pinKey(msg.chat.id), 'json')
+	const pin = await getPin(env, msg.chat.id)
 	if (pin && cmd === 'stats') return pinnedStats(env, msg.chat.id, pin, 'stats')
 	if (pin) return showInPinned(env, msg.chat.id, pin, DEVICES.some((x) => x.cmd === cmd) ? { dev: cmd } : { body: panel.text, label: labelFor(cmd) })
 	await sendPanel(env, msg.chat.id, panel)
@@ -1643,13 +1688,15 @@ async function applyAction(env: Env, d: Device, action: Action): Promise<string>
 const removeUserMsg = (env: Env, msg: any) => tgCall(env, 'deleteMessage', { chat_id: msg.chat.id, message_id: msg.message_id }).catch(() => {})
 
 export default {
-	async scheduled(_event, env, ctx) {
+	async scheduled(_event, rawEnv, ctx) {
+		const env = { ...rawEnv, POWER_KV: memoKV(rawEnv.POWER_KV) }
 		initDevices(env)
 		settingsEnv = env
 		settingsCache.clear()
 		ctx.waitUntil(run(env))
 	},
-	async fetch(req, env, ctx) {
+	async fetch(req, rawEnv, ctx) {
+		const env = { ...rawEnv, POWER_KV: memoKV(rawEnv.POWER_KV) }
 		initDevices(env)
 		settingsEnv = env
 		settingsCache.clear()
