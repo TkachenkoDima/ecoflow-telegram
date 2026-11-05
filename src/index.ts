@@ -336,7 +336,19 @@ async function readMqtt(
 			loadW: p.outSumW !== undefined ? Math.round(p.outSumW) : discharging ? (p.battOutW ?? null) : null,
 			gridIn,
 			// впевнено — лише коли вхід відомий: є струм → ON; нуль і батарея віддає → OFF
-			grid: p.inSumW === undefined ? null : p.inSumW > 1 ? 'ON' : 'OFF',
+			// світло: за входом з мережі (пакет 254/21), а якщо його не було — за батареєю (BMS 32/50, приходить завжди):
+			// заряджається → мережа є; розряджається → мережі немає; нічого не робить (повна, без навантаження) → невідомо.
+			// UPS без навантаження шле 254/21 дуже рідко — без цього відключення лишалось непоміченим (05.11)
+			grid:
+				p.inSumW !== undefined
+					? p.inSumW > 1
+						? 'ON'
+						: 'OFF'
+					: discharging
+						? 'OFF'
+						: (p.battInW ?? 0) > 5
+							? 'ON'
+							: null,
 			maxChg: p.maxChg,
 			acMax: p.acMax,
 			minDsg: p.minDsg,
@@ -388,7 +400,6 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, 
 				settingsFor,
 				restSettings: restSet,
 				// cron: від датчика світла чекаємо й пакет із входом з мережі
-				needInput: refresh ? GRID_SOURCES.map((c) => DEVICES.find((x) => x.cmd === c)?.sn ?? '').filter(Boolean) : [],
 				timeoutMs: refresh && (settingsFor.length || restSet.length) ? 25_000 : MQTT_WAIT_MS,
 			})
 			for (const [sn, v] of r) readings.set(sn, v)
@@ -1412,6 +1423,18 @@ async function pinCommand(env: Env, chatId: number | string, arg: string | undef
 // Перевірки, що змінюються рідко (меню команд, «моніторинг запущено»), — раз на годину і після старту воркера
 let bootChecked = false
 
+// Разово: 05.11 відключення почалось о 08:55, але бот його не побачив (див. grid вище). Щойно бот зафіксує
+// «світла немає» 05.11 — ставимо початок на 08:55, щоб статистика була правдивою. Позначка в KV — лише один раз
+async function fixGrid0511(env: Env) {
+	const g = await env.POWER_KV.get<GridState>('grid', 'json')
+	const at = localDay(2026, 10, 5) + 8 * 3600_000 + 55 * 60_000
+	if (!g || g.state !== 'OFF' || g.since <= at || dayStart(g.since) !== dayStart(at)) return
+	if (await env.POWER_KV.get('fix:grid:0511')) return
+	await env.POWER_KV.put('grid', JSON.stringify({ ...g, since: at }))
+	await env.POWER_KV.put('fix:grid:0511', '1', { expirationTtl: 7 * 86400 })
+	console.log('grid 05.11: since → 08:55')
+}
+
 async function run(env: Env) {
 	const hourly = !bootChecked || new Date().getUTCMinutes() === 0
 	bootChecked = true
@@ -1430,6 +1453,7 @@ async function run(env: Env) {
 		}
 	}
 	const event = await checkGrid(env, readings, online).catch((e) => (console.error('grid', e), null))
+	if (event === 'gridOff') await fixGrid0511(env).catch((e) => console.error('fix 05.11', e))
 	await runAutomations(env, readings, online, event).catch((e) => console.error('automations', e))
 	await updatePins(env, readings, online).catch((e) => console.error('pins', e))
 	await cleanupExpired(env).catch((e) => console.error('cleanup', e))
