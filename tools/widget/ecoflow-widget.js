@@ -57,7 +57,7 @@ function bar(soc, w, h) {
 }
 function txt(stack, s, size, color, weight = 'regular') {
   const t = stack.addText(s)
-  t.font = weight === 'bold' ? Font.boldRoundedSystemFont(size) : weight === 'semi' ? Font.semiboldRoundedSystemFont(size) : Font.roundedSystemFont(size)
+  t.font = weight === 'bold' ? Font.boldRoundedSystemFont(size) : weight === 'semi' ? Font.semiboldRoundedSystemFont(size) : Font.regularRoundedSystemFont(size)
   t.textColor = color; t.lineLimit = 1; t.minimumScaleFactor = 0.6
   return t
 }
@@ -174,7 +174,7 @@ async function main(famOverride) {
   } else if (fam === 'accessoryRectangular') {
     const h = w.addStack(); h.centerAlignContent(); icon(h, d.light?.on ? 'bolt.fill' : 'bolt.slash.fill', 11, Color.white()); h.addSpacer(3)
     const t = h.addText(lightText(d.light, Date.now())); t.font = Font.boldRoundedSystemFont(12)
-    for (const s of d.stations) { const r = w.addText(`${s.name} ${s.soc ?? '—'}% · ${stateText(s)}`); r.font = Font.roundedSystemFont(11); r.lineLimit = 1 }
+    for (const s of d.stations) { const r = w.addText(`${s.name} ${s.soc ?? '—'}% · ${stateText(s)}`); r.font = Font.regularRoundedSystemFont(11); r.lineLimit = 1 }
   } else {
     const g = new LinearGradient(); g.colors = T.bg; g.locations = [0, 1]; w.backgroundGradient = g
     if (fam === 'small') { w.setPadding(14, 14, 12, 14); small(w, T, d, st) }
