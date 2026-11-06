@@ -21,7 +21,6 @@ const socColor = (s) => (s <= 10 ? RED : s <= 25 ? ORANGE : s <= 50 ? YELLOW : G
 
 // ---------- текст ----------
 const pad = (n) => String(n).padStart(2, '0')
-const hhmm = (min) => `${pad(Math.floor(min / 60))}:${pad(Math.round(min) % 60)}`
 const clock = (t) => { const d = new Date(t); return `${pad(d.getHours())}:${pad(d.getMinutes())}` }
 function dur(ms) {
   const m = Math.max(0, Math.floor(ms / 60000))
@@ -30,7 +29,7 @@ function dur(ms) {
   if (d) return `${d} д ${h} год`
   return `${h} год${mm ? ` ${mm} хв` : ''}`
 }
-const stateText = (s) => (!s.online ? 'офлайн' : s.soc === null ? 'немає даних' : s.remMin !== null ? `ще ${hhmm(s.remMin)}` : s.fromGrid ? 'від мережі' : '—')
+const stateText = (s) => (!s.online ? 'офлайн' : s.soc === null ? 'немає даних' : s.remMin !== null ? `ще ${dur(s.remMin * 60000)}` : s.fromGrid ? 'від мережі' : '—')
 const stateIcon = (s) => (!s.online ? 'wifi.slash' : s.remMin !== null ? 'hourglass' : s.fromGrid ? 'powerplug.fill' : 'hourglass')
 const lightText = (l, now) => (!l ? 'Світло: —' : `${l.on ? 'Світло є' : 'Без світла'} · ${dur(now - l.since)}`)
 
