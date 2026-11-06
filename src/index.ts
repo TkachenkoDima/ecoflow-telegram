@@ -1428,37 +1428,84 @@ async function run(env: Env) {
 	await runAutomations(env, readings, online, event).catch((e) => console.error('automations', e))
 	await updatePins(env, readings, online).catch((e) => console.error('pins', e))
 	await cleanupExpired(env).catch((e) => console.error('cleanup', e))
+	await saveSnapshot(env, readings, online).catch((e) => console.error('snapshot', e))
 }
 
-// ── Віджет iPhone (Scriptable): GET /widget?key=WIDGET_TOKEN → свіжий стан станцій і світла (JSON) ──
-// Читає станції наживо (як кнопка), без записів у KV; iOS оновлює віджет ~раз на 10–15 хв
+// ── Знімок станцій для віджета ──────────────────────────────────
+// Cron і так щохвилини читає всі станції — зберігаємо результат, а віджет читає його замість походу в EcoFlow.
+// Пишемо в KV лише коли змінився заряд / онлайн / живлення від мережі, або раз на 15 хв (час роботи, навантаження).
+interface SnapStation { soc: number | null; remMin: number | null; fromGrid: boolean | null; loadW: number | null; online: boolean; at: number }
+const SNAP_REFRESH_MS = 15 * 60_000
+async function saveSnapshot(env: Env, readings: Map<string, Reading>, online: Map<string, boolean>) {
+	const prev = (await env.POWER_KV.get<Record<string, SnapStation>>('snap', 'json')) ?? {}
+	const now = Date.now()
+	const refresh = DEVICES.some((d) => !prev[d.cmd] || now - prev[d.cmd].at >= SNAP_REFRESH_MS)
+	const next: Record<string, SnapStation> = {}
+	let changed = false
+	for (const d of DEVICES) {
+		const r = readings.get(d.sn)
+		const on = !!online.get(d.sn)
+		const p = prev[d.cmd]
+		let s: SnapStation
+		if (r) s = { soc: r.soc, remMin: r.remMin ?? null, fromGrid: r.gridIn ?? null, loadW: r.loadW ?? null, online: on, at: now }
+		// станція не відповіла цього разу: онлайн — лишаємо попередні дані з їхнім часом; офлайн — фіксуємо офлайн
+		else s = { ...(p ?? { soc: null, remMin: null, fromGrid: null, loadW: null }), online: on, at: on ? (p?.at ?? now) : now }
+		const differs = !p || p.soc !== s.soc || p.online !== s.online || p.fromGrid !== s.fromGrid
+		if (differs || (refresh && r)) {
+			next[d.cmd] = s
+			changed = true
+		} else next[d.cmd] = p
+	}
+	if (changed) await env.POWER_KV.put('snap', JSON.stringify(next))
+}
+
+// ── Віджет iPhone (Scriptable): GET /widget?key=WIDGET_TOKEN → стан станцій і світла (JSON) ──
+// Дані — зі знімка cron (≤ 15 хв для часу роботи / навантаження, заряд і світло — актуальні до хвилини).
+// Якщо знімка немає або cron давно не оновлював станцію — читаємо наживо.
+const SNAP_MAX_AGE_MS = 30 * 60_000
+// Посилання на закріплений «екран» кожної групи — щоб тап по віджету відкривав Telegram саме там.
+// t.me/c/… працює лише для супергруп (id -100…) і лише для їхніх учасників.
+async function groupLinks(env: Env, withTitles: boolean) {
+	const pins = await mapLoad<Pin>(env, 'pins')
+	const out: Array<{ chat: string; link: string; title?: string }> = []
+	for (const chat of chatIds(env)) {
+		const id = String(chat)
+		if (!id.startsWith('-100')) continue
+		const p = pins[id]
+		const link = `https://t.me/c/${id.slice(4)}/${p?.messageId ?? 1}`
+		const title = withTitles ? await tgCall(env, 'getChat', { chat_id: id }).then((c) => c?.title as string).catch(() => undefined) : undefined
+		out.push({ chat: id, link, ...(title ? { title } : {}) })
+	}
+	return out
+}
 async function widgetData(env: Env, url: URL): Promise<Response> {
 	if (!env.WIDGET_TOKEN || url.searchParams.get('key') !== env.WIDGET_TOKEN) return new Response('forbidden', { status: 403 })
+	const now = Date.now()
+	const g = await env.POWER_KV.get<GridState>('grid', 'json')
+	const light = g ? { on: g.state === 'ON', since: g.since } : null
+	const headers = { 'Cache-Control': 'no-store' }
+	const groups = await groupLinks(env, url.searchParams.has('groups')).catch(() => [])
+	const snap = await env.POWER_KV.get<Record<string, SnapStation>>('snap', 'json')
+	if (snap && DEVICES.every((d) => snap[d.cmd] && now - snap[d.cmd].at < SNAP_MAX_AGE_MS)) {
+		const stations = DEVICES.map((d) => {
+			const s = snap[d.cmd]
+			return { cmd: d.cmd, name: d.name, online: s.online, soc: s.soc, remMin: s.remMin, fromGrid: s.fromGrid, loadW: s.loadW, ...(now - s.at > 20 * 60_000 ? { staleAt: s.at } : {}) }
+		})
+		return Response.json({ at: now, light, stations, groups }, { headers })
+	}
 	let all: Awaited<ReturnType<typeof readAll>>
 	try {
 		all = await readAll(env, DEVICES, true)
 	} catch (e) {
 		console.error('widget', e)
-		return Response.json({ error: 'upstream' }, { status: 502, headers: { 'Cache-Control': 'no-store' } })
+		return Response.json({ error: 'upstream' }, { status: 502, headers })
 	}
 	const { online, readings } = all
-	const g = await env.POWER_KV.get<GridState>('grid', 'json')
 	const stations = DEVICES.map((d) => {
 		const r = readings.get(d.sn)
-		return {
-			cmd: d.cmd,
-			name: d.name,
-			online: !!online.get(d.sn),
-			soc: r?.soc ?? null,
-			remMin: r?.remMin ?? null, // хв до розряду (якщо розряджається)
-			fromGrid: r?.gridIn ?? null,
-			loadW: r?.loadW ?? null,
-		}
+		return { cmd: d.cmd, name: d.name, online: !!online.get(d.sn), soc: r?.soc ?? null, remMin: r?.remMin ?? null, fromGrid: r?.gridIn ?? null, loadW: r?.loadW ?? null }
 	})
-	return Response.json(
-		{ at: Date.now(), light: g ? { on: g.state === 'ON', since: g.since } : null, stations },
-		{ headers: { 'Cache-Control': 'no-store' } },
-	)
+	return Response.json({ at: now, light, stations, groups }, { headers })
 }
 
 // ── Telegram webhook: команди і кнопки ──────────────────────────

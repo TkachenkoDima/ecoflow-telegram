@@ -1,6 +1,6 @@
 // Віджет EcoFlow для iPhone (Scriptable).
 // Перший запуск ▶︎ у Scriptable: ключ WIDGET_TOKEN (зберігається в Keychain), тема, станція для маленького віджета.
-// Повторно: ▶︎ → «Налаштування».
+// Повторно: ▶︎ → «Налаштування» (там же — яку групу Telegram відкривати по тапу на віджет).
 // Parameter віджета (необов'язково) — інша станція для конкретного маленького віджета:
 //   router | kate | marinka (або 1 | 2 | 3). Середній і великий показують усі станції.
 const URL = 'https://frosty-union-469b.frosty-union-469b.workers.dev/widget'
@@ -126,8 +126,8 @@ async function key() {
   if ((await a.presentAlert()) === -1) return null
   const k = a.textFieldValue(0).trim(); if (k) Keychain.set(KC, k); return k || null
 }
-async function load(k) {
-  const req = new Request(`${URL}?key=${encodeURIComponent(k)}`); req.timeoutInterval = 45
+async function load(k, withGroups = false) {
+  const req = new Request(`${URL}?key=${encodeURIComponent(k)}${withGroups ? '&groups=1' : ''}`); req.timeoutInterval = 45
   const d = await req.loadJSON()
   if (req.response?.statusCode === 403) { if (!config.runsInWidget) Keychain.remove(KC); throw new Error('невірний ключ') }
   return withCache(d)
@@ -169,9 +169,15 @@ async function settings() {
   const t = await pick('Тема', ['Авто (як на iPhone)', 'Темна', 'Світла'])
   if (t >= 0) set.theme = ['auto', 'dark', 'light'][t]
   try {
-    const stations = (await load(k)).stations
+    const d = await load(k, true)
+    const stations = d.stations
     const s = await pick('Станція для маленького віджета', stations.map((x) => x.name))
     if (s >= 0) set.station = stations[s].cmd
+    const groups = d.groups ?? []
+    if (groups.length) {
+      const g = await pick('Тап по віджету відкриває', [...groups.map((x) => `Telegram: ${x.title ?? 'група'}`), 'Scriptable'])
+      if (g >= 0) set.chat = g < groups.length ? groups[g].chat : null
+    }
   } catch (e) { const a = new Alert(); a.title = 'Не вдалося отримати дані'; a.message = String(e.message || e); a.addAction('OK'); await a.present() }
   saveSet(set)
 }
@@ -193,6 +199,9 @@ async function main(famOverride) {
     return w
   }
   const { theme, st } = resolve(d.stations)
+  // тап по віджету — у Telegram на закріплений екран вибраної групи (посилання свіже: екран могли перезакріпити)
+  const tap = (d.groups ?? []).find((g) => g.chat === loadSet()?.chat)?.link
+  if (tap) w.url = tap
   const T = THEMES[theme]
   if (fam === 'accessoryInline') {
     w.addText(`${d.light?.on ? '⚡' : '⛔'} ${st.name} ${st.soc ?? '—'}%`)
