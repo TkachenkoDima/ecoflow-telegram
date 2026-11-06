@@ -1,6 +1,9 @@
 // Віджет EcoFlow для iPhone (Scriptable). Ключ у файлі не зберігається:
 // при першому запуску скрипт спитає WIDGET_TOKEN і збереже його в Keychain телефона.
 //
+// Зазвичай Parameter не потрібен: запусти скрипт ▶︎ — майстер збереже тему, місця віджетів і станцію.
+// Parameter — лише для другого віджета того ж розміру, перекриває майстра.
+//
 // ═══ PARAMETER віджета ═══ (Edit Widget → Parameter; слова через пробіл, порядок будь-який)
 //   Станція   router | kate | marinka, або 1 | 2 | 3, або назва (маринка)
 //             лише для маленького й екрана блокування; порожньо — перша станція
@@ -16,8 +19,7 @@
 //   великий з другого ряду:            mid
 //   без прозорості, світлий:           solid light
 //
-// Прозорий фон: запусти скрипт ▶︎ → «Прозорий фон: налаштувати» → скріншот порожньої
-// сторінки домашнього екрана. Після зміни шпалер — повторити.
+// Прозорий фон — у майстрі; після зміни шпалер: ▶︎ → «Оновити шпалери».
 const URL = 'https://frosty-union-469b.frosty-union-469b.workers.dev/widget'
 const KC = 'ecoflow_widget_key'
 
@@ -198,15 +200,13 @@ async function setupBg() {
   }
   const d = new Alert(); d.title = 'Готово'
   d.message = (exact ? '' : `Екран ${W}×${H} ще не виміряний — позиції приблизні. Надішли скрін домашнього екрана з віджетом, щоб додати точні.\n\n`) +
-    'У Parameter віджета вкажи його місце: ряд top / mid / bottom і для маленького left / right. Наприклад: «marinka top left», «mid» для великого посередині.'
+    'Фон збережено.'
   d.addAction('OK'); await d.present()
 }
 function resetBg() { if (FMG.fileExists(BG_DIR)) FMG.remove(BG_DIR) }
-function bgImage(fam, toks, dark) {
-  if (toks.includes('solid') || !['small', 'medium', 'large'].includes(fam)) return null
-  const row = toks.find((t) => ['top', 'mid', 'bottom'].includes(t)) ?? 'top'
-  const col = toks.find((t) => ['left', 'right'].includes(t)) ?? 'left'
-  const id = fam === 'small' ? `small-${row}-${col}` : `${fam}-${row}`
+function bgImage(fam, o, dark) {
+  if (o.solid || !['small', 'medium', 'large'].includes(fam)) return null
+  const id = fam === 'small' ? `small-${o.row}-${o.col}` : `${fam}-${o.row}`
   const path = FMG.joinPath(BG_DIR, `${id}.png`)
   if (!FMG.fileExists(path)) return null
   const img = FMG.readImage(path)
@@ -216,16 +216,61 @@ function bgImage(fam, toks, dark) {
   return ctx.getImage()
 }
 
-function parseParam(stations) {
+// Збережені налаштування (майстер у застосунку). Parameter віджета, якщо заданий, їх перекриває.
+const SET_PATH = FMG.joinPath(FMG.documentsDirectory(), 'ecoflow-settings.json')
+function loadSet() { try { return FMG.fileExists(SET_PATH) ? JSON.parse(FMG.readString(SET_PATH)) : null } catch { return null } }
+function saveSet(v) { FMG.writeString(SET_PATH, JSON.stringify(v)) }
+const ROWS = ['top', 'mid', 'bottom'], COLS = ['left', 'right']
+function resolve(stations, fam) {
+  const set = loadSet() ?? {}
   const toks = (args.widgetParameter || '').toLowerCase().split(/[\s,;]+/).filter(Boolean)
-  const theme = toks.find((t) => THEMES[t]) ?? 'auto'
-  let st = stations[0]
+  const theme = toks.find((t) => THEMES[t]) ?? set.theme ?? 'auto'
+  const kind = fam === 'small' || fam.startsWith('accessory') ? 'small' : fam
+  const saved = set[kind] ?? {}
+  let st = stations.find((s) => s.cmd === (set.small?.station)) ?? stations[0]
   for (const t of toks) {
     const i = Number(t)
     const hit = Number.isInteger(i) && i >= 1 ? stations[i - 1] : stations.find((s) => s.cmd === t || s.name.toLowerCase() === t || s.name.toLowerCase().startsWith(t))
     if (hit) { st = hit; break }
   }
-  return { theme, st, toks }
+  return {
+    theme, st,
+    row: toks.find((t) => ROWS.includes(t)) ?? saved.row ?? 'top',
+    col: toks.find((t) => COLS.includes(t)) ?? saved.col ?? 'left',
+    solid: toks.includes('solid'),
+  }
+}
+
+// Майстер: усе, що раніше писалося в Parameter, — один раз кнопками
+async function pick(title, message, options) {
+  const a = new Alert(); a.title = title; if (message) a.message = message
+  options.forEach((o) => a.addAction(o)); a.addCancelAction('Пропустити')
+  return a.presentSheet()
+}
+async function wizard() {
+  const k = await key(); if (!k) return
+  let stations = []
+  try { stations = (await load(k)).stations } catch (e) { const a = new Alert(); a.title = 'Не вдалося отримати дані'; a.message = String(e.message || e); a.addAction('OK'); await a.present(); return }
+  const set = loadSet() ?? {}
+  const rowNames = ['1-й ряд (зверху)', '2-й ряд', '3-й ряд']
+  const t = await pick('Тема', null, ['Авто (за темою iPhone)', 'Темне скло', 'Світле скло'])
+  if (t >= 0) set.theme = ['auto', 'glass', 'light'][t]
+  const m = await pick('Середній віджет', 'Де він стоїть? Показує всі станції.', [...rowNames, 'Немає'])
+  if (m >= 0 && m < 3) set.medium = { row: ROWS[m] }
+  const l = await pick('Великий віджет', 'З якого ряду починається? Показує всі станції.', [rowNames[0], rowNames[1], 'Немає'])
+  if (l >= 0 && l < 2) set.large = { row: ROWS[l] }
+  const s = await pick('Маленький віджет', 'Яку станцію показувати? (вона ж — на екрані блокування)', [...stations.map((x) => x.name), 'Немає'])
+  if (s >= 0 && s < stations.length) {
+    const places = ROWS.flatMap((r, ri) => COLS.map((c) => [`${rowNames[ri]}, ${c === 'left' ? 'ліворуч' : 'праворуч'}`, r, c]))
+    const p = await pick('Маленький віджет', 'Де він стоїть?', places.map((x) => x[0]))
+    set.small = { station: stations[s].cmd, row: p >= 0 ? places[p][1] : 'top', col: p >= 0 ? places[p][2] : 'left' }
+  }
+  saveSet(set)
+  const b = await pick('Прозорий фон', 'Фоном стануть твої шпалери під віджетом. Потрібен скріншот порожньої сторінки домашнього екрана.', ['Налаштувати', 'Без прозорості'])
+  if (b === 0) await setupBg(); else if (b === 1) resetBg()
+  const done = new Alert(); done.title = 'Готово'
+  done.message = 'Додай віджет Scriptable на екран → Edit Widget → Script: EcoFlow. Parameter залишай порожнім — усе вже збережено.\n\nParameter потрібен лише для другого віджета того ж розміру (напр. «kate mid right»).'
+  done.addAction('OK'); await done.present()
 }
 
 async function main(famOverride) {
@@ -244,9 +289,9 @@ async function main(famOverride) {
     const m = w.addText(String(e.message || e).slice(0, 90)); m.font = Font.systemFont(10); m.textColor = preTheme.dim
     return w
   }
-  const { theme, st, toks } = parseParam(d.stations)
+  const o = resolve(d.stations, fam), { theme, st } = o
   // на «прозорому» фоні auto = темне скло: шпалери затемнюються, текст білий
-  const bg = bgImage(fam, toks, theme !== 'light')
+  const bg = bgImage(fam, o, theme !== 'light')
   const T = THEMES[bg && theme === 'auto' ? 'glass' : theme]
   if (fam === 'accessoryInline') {
     w.addText(`${d.light?.on ? '⚡' : '⛔'} ${st.name} ${st.soc ?? '—'}%`)
@@ -273,13 +318,17 @@ async function main(famOverride) {
 
 if (config.runsInWidget) Script.setWidget(await main())
 else {
-  // У застосунку: прев'ю та налаштування фону
-  const a = new Alert(); a.title = 'EcoFlow'
-  ;['Прев\'ю: маленький', 'Прев\'ю: середній', 'Прев\'ю: великий', 'Прозорий фон: налаштувати', 'Прозорий фон: вимкнути'].forEach((x) => a.addAction(x))
-  a.addCancelAction('Закрити')
-  const i = await a.presentSheet()
-  if (i >= 0 && i <= 2) { const p = await main(['small', 'medium', 'large'][i]); await [p.presentSmall, p.presentMedium, p.presentLarge][i].call(p) }
-  else if (i === 3) await setupBg()
-  else if (i === 4) resetBg()
+  // У застосунку: перший запуск — майстер; далі меню
+  if (!loadSet()) await wizard()
+  else {
+    const a = new Alert(); a.title = 'EcoFlow'
+    ;['Налаштувати заново', 'Прев\'ю: маленький', 'Прев\'ю: середній', 'Прев\'ю: великий', 'Оновити шпалери (прозорий фон)', 'Вимкнути прозорий фон'].forEach((x) => a.addAction(x))
+    a.addCancelAction('Закрити')
+    const i = await a.presentSheet()
+    if (i === 0) await wizard()
+    else if (i >= 1 && i <= 3) { const p = await main(['small', 'medium', 'large'][i - 1]); await [p.presentSmall, p.presentMedium, p.presentLarge][i - 1].call(p) }
+    else if (i === 4) await setupBg()
+    else if (i === 5) resetBg()
+  }
 }
 Script.complete()
