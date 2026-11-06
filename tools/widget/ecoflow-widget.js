@@ -1,25 +1,8 @@
-// Віджет EcoFlow для iPhone (Scriptable). Ключ у файлі не зберігається:
-// при першому запуску скрипт спитає WIDGET_TOKEN і збереже його в Keychain телефона.
-//
-// Зазвичай Parameter не потрібен: запусти скрипт ▶︎ — майстер збереже тему, місця віджетів і станцію.
-// Parameter — лише для другого віджета того ж розміру, перекриває майстра.
-//
-// ═══ PARAMETER віджета ═══ (Edit Widget → Parameter; слова через пробіл, порядок будь-який)
-//   Станція   router | kate | marinka, або 1 | 2 | 3, або назва (маринка)
-//             лише для маленького й екрана блокування; порожньо — перша станція
-//   Тема      auto (типово) | glass (темне скло) | light (світле скло)
-//   Місце     top | mid | bottom — ряд віджета на екрані (типово top)
-//             left | right — колонка, лише для маленького (типово left)
-//   Фон       solid — звичайний градієнт замість прозорого фону
-//
-// Приклади:
-//   маленький зліва вгорі, Маринка:    marinka top left
-//   маленький справа в другому ряду:   kate mid right
-//   середній угорі:                    top
-//   великий з другого ряду:            mid
-//   без прозорості, світлий:           solid light
-//
-// Прозорий фон — у майстрі; після зміни шпалер: ▶︎ → «Оновити шпалери».
+// Віджет EcoFlow для iPhone (Scriptable).
+// Перший запуск ▶︎ у Scriptable: ключ WIDGET_TOKEN (зберігається в Keychain), тема, станція для маленького віджета.
+// Повторно: ▶︎ → «Налаштування».
+// Parameter віджета (необов'язково) — інша станція для конкретного маленького віджета:
+//   router | kate | marinka (або 1 | 2 | 3). Середній і великий показують усі станції.
 const URL = 'https://frosty-union-469b.frosty-union-469b.workers.dev/widget'
 const KC = 'ecoflow_widget_key'
 
@@ -27,11 +10,11 @@ const KC = 'ecoflow_widget_key'
 const hex = (h, a = 1) => new Color(h, a)
 const dyn = (l, d) => Color.dynamic(l, d)
 const THEMES = {
-  glass: { bg: [hex('#26354a'), hex('#0e141d')], card: hex('#ffffff', 0.09), edge: hex('#ffffff', 0.22), text: hex('#ffffff'), dim: hex('#ffffff', 0.6) },
+  dark: { bg: [hex('#26354a'), hex('#0e141d')], card: hex('#ffffff', 0.09), edge: hex('#ffffff', 0.22), text: hex('#ffffff'), dim: hex('#ffffff', 0.6) },
   light: { bg: [hex('#f3f6fa'), hex('#d5dee9')], card: hex('#ffffff', 0.55), edge: hex('#ffffff', 0.95), text: hex('#11161d'), dim: hex('#11161d', 0.55) },
 }
-THEMES.auto = Object.fromEntries(Object.keys(THEMES.glass).map((k) =>
-  [k, k === 'bg' ? THEMES.glass.bg.map((c, i) => dyn(THEMES.light.bg[i], c)) : dyn(THEMES.light[k], THEMES.glass[k])]))
+THEMES.auto = Object.fromEntries(Object.keys(THEMES.dark).map((k) =>
+  [k, k === 'bg' ? THEMES.dark.bg.map((c, i) => dyn(THEMES.light.bg[i], c)) : dyn(THEMES.light[k], THEMES.dark[k])]))
 const GREEN = hex('#30d158'), YELLOW = hex('#ffd60a'), ORANGE = hex('#ff9f0a'), RED = hex('#ff453a'), TRACK = hex('#8e8e93', 0.28)
 const socColor = (s) => (s <= 10 ? RED : s <= 25 ? ORANGE : s <= 50 ? YELLOW : GREEN)
 
@@ -104,7 +87,7 @@ function small(w, T, d, s) {
 }
 
 function medium(w, T, d) {
-  const head = w.addStack(); head.centerAlignContent(); lightPill(head, T, d, 12); head.addSpacer(); txt(head, clock(d.at), 10, T.dim)
+  const head = w.addStack(); head.centerAlignContent(); lightPill(head, T, d, 12); head.addSpacer(); txt(head, `оновлено ${clock(d.at)}`, 10, T.dim)
   w.addSpacer(8)
   const row = w.addStack(); row.spacing = 8
   for (const s of d.stations) {
@@ -163,121 +146,41 @@ function withCache(d) {
   try { fm.writeString(path, JSON.stringify(cache)) } catch {}
   return d
 }
-// ---------- «прозорий» фон: шматок скріншота шпалер під місцем віджета ----------
-// Геометрія віджетів у пікселях скріншота: ліві x колонок, верхні y рядів, розміри.
-// 1290×2796 виміряно зі скріншотів (iPhone Pro Max / Plus, iOS 26). Інші екрани — приблизно, масштабом.
-const GEO = {
-  '1290x2796': { x: [92, 681], y: [252, 892, 1532], s: [524, 524], m: [1113, 524], l: [1113, 1164] },
-}
+// Налаштування (тема, станція) — у файлі на телефоні; Parameter віджета може задати іншу станцію
 const FMG = FileManager.local()
-const BG_DIR = FMG.joinPath(FMG.documentsDirectory(), 'ecoflow-bg')
-function geoFor(w, h) {
-  const g = GEO[`${w}x${h}`]
-  if (g) return { g, exact: true }
-  const k = w / 1290, b = GEO['1290x2796'], sc = (a) => a.map((v) => Math.round(v * k))
-  return { g: { x: sc(b.x), y: b.y.map((v) => Math.round((v / 2796) * h)), s: sc(b.s), m: sc(b.m), l: sc(b.l) }, exact: false }
-}
-const SLOTS = [
-  ...['top', 'mid', 'bottom'].flatMap((r, ri) => ['left', 'right'].map((c, ci) => ({ id: `small-${r}-${c}`, size: 's', ri, ci }))),
-  ...['top', 'mid', 'bottom'].map((r, ri) => ({ id: `medium-${r}`, size: 'm', ri, ci: 0 })),
-  ...['top', 'mid'].map((r, ri) => ({ id: `large-${r}`, size: 'l', ri, ci: 0 })),
-]
-async function setupBg() {
-  const a = new Alert(); a.title = 'Прозорий фон'
-  a.message = 'Зроби скріншот ПОРОЖНЬОЇ сторінки домашнього екрана: довге натискання на екран → гортай праворуч до порожньої сторінки → скріншот. Потім вибери його тут.'
-  a.addAction('Вибрати скріншот'); a.addCancelAction('Скасувати')
-  if ((await a.presentAlert()) === -1) return
-  const img = await Photos.fromLibrary()
-  const W = img.size.width, H = img.size.height
-  const { g, exact } = geoFor(W, H)
-  if (!FMG.fileExists(BG_DIR)) FMG.createDirectory(BG_DIR, true)
-  for (const sl of SLOTS) {
-    const [sw, sh] = g[sl.size], x = sl.size === 's' ? g.x[sl.ci] : g.x[0], y = g.y[sl.ri]
-    if (y + sh > H) continue
-    const ctx = new DrawContext(); ctx.size = new Size(sw, sh); ctx.respectScreenScale = false
-    ctx.drawImageAtPoint(img, new Point(-x, -y))
-    FMG.writeImage(FMG.joinPath(BG_DIR, `${sl.id}.png`), ctx.getImage())
-  }
-  const d = new Alert(); d.title = 'Готово'
-  d.message = (exact ? '' : `Екран ${W}×${H} ще не виміряний — позиції приблизні. Надішли скрін домашнього екрана з віджетом, щоб додати точні.\n\n`) +
-    'Фон збережено.'
-  d.addAction('OK'); await d.present()
-}
-function resetBg() { if (FMG.fileExists(BG_DIR)) FMG.remove(BG_DIR) }
-function bgImage(fam, o, dark) {
-  if (o.solid || !['small', 'medium', 'large'].includes(fam)) return null
-  const id = fam === 'small' ? `small-${o.row}-${o.col}` : `${fam}-${o.row}`
-  const path = FMG.joinPath(BG_DIR, `${id}.png`)
-  if (!FMG.fileExists(path)) return null
-  const img = FMG.readImage(path)
-  const ctx = new DrawContext(); ctx.size = img.size; ctx.respectScreenScale = false
-  ctx.drawImageAtPoint(img, new Point(0, 0))
-  ctx.setFillColor(dark ? hex('#000000', 0.32) : hex('#ffffff', 0.35)); ctx.fillRect(new Rect(0, 0, img.size.width, img.size.height))
-  return ctx.getImage()
-}
-
-// Збережені налаштування (майстер у застосунку). Parameter віджета, якщо заданий, їх перекриває.
 const SET_PATH = FMG.joinPath(FMG.documentsDirectory(), 'ecoflow-settings.json')
 function loadSet() { try { return FMG.fileExists(SET_PATH) ? JSON.parse(FMG.readString(SET_PATH)) : null } catch { return null } }
 function saveSet(v) { FMG.writeString(SET_PATH, JSON.stringify(v)) }
-const ROWS = ['top', 'mid', 'bottom'], COLS = ['left', 'right']
-function resolve(stations, fam) {
+function resolve(stations) {
   const set = loadSet() ?? {}
-  const toks = (args.widgetParameter || '').toLowerCase().split(/[\s,;]+/).filter(Boolean)
-  const theme = toks.find((t) => THEMES[t]) ?? set.theme ?? 'auto'
-  const kind = fam === 'small' || fam.startsWith('accessory') ? 'small' : fam
-  const saved = set[kind] ?? {}
-  let st = stations.find((s) => s.cmd === (set.small?.station)) ?? stations[0]
-  for (const t of toks) {
-    const i = Number(t)
-    const hit = Number.isInteger(i) && i >= 1 ? stations[i - 1] : stations.find((s) => s.cmd === t || s.name.toLowerCase() === t || s.name.toLowerCase().startsWith(t))
-    if (hit) { st = hit; break }
-  }
-  return {
-    theme, st,
-    row: toks.find((t) => ROWS.includes(t)) ?? saved.row ?? 'top',
-    col: toks.find((t) => COLS.includes(t)) ?? saved.col ?? 'left',
-    solid: toks.includes('solid'),
-  }
+  const t = (args.widgetParameter || '').trim().toLowerCase()
+  const i = Number(t)
+  const st = (t && (Number.isInteger(i) && i >= 1 ? stations[i - 1] : stations.find((s) => s.cmd === t || s.name.toLowerCase().startsWith(t))))
+    || stations.find((s) => s.cmd === set.station) || stations[0]
+  return { theme: THEMES[set.theme] ? set.theme : 'auto', st }
 }
-
-// Майстер: усе, що раніше писалося в Parameter, — один раз кнопками
-async function pick(title, message, options) {
-  const a = new Alert(); a.title = title; if (message) a.message = message
-  options.forEach((o) => a.addAction(o)); a.addCancelAction('Пропустити')
+async function pick(title, options) {
+  const a = new Alert(); a.title = title; options.forEach((o) => a.addAction(o)); a.addCancelAction('Скасувати')
   return a.presentSheet()
 }
-async function wizard() {
+async function settings() {
   const k = await key(); if (!k) return
-  let stations = []
-  try { stations = (await load(k)).stations } catch (e) { const a = new Alert(); a.title = 'Не вдалося отримати дані'; a.message = String(e.message || e); a.addAction('OK'); await a.present(); return }
   const set = loadSet() ?? {}
-  const rowNames = ['1-й ряд (зверху)', '2-й ряд', '3-й ряд']
-  const t = await pick('Тема', null, ['Авто (за темою iPhone)', 'Темне скло', 'Світле скло'])
-  if (t >= 0) set.theme = ['auto', 'glass', 'light'][t]
-  const m = await pick('Середній віджет', 'Де він стоїть? Показує всі станції.', [...rowNames, 'Немає'])
-  if (m >= 0 && m < 3) set.medium = { row: ROWS[m] }
-  const l = await pick('Великий віджет', 'З якого ряду починається? Показує всі станції.', [rowNames[0], rowNames[1], 'Немає'])
-  if (l >= 0 && l < 2) set.large = { row: ROWS[l] }
-  const s = await pick('Маленький віджет', 'Яку станцію показувати? (вона ж — на екрані блокування)', [...stations.map((x) => x.name), 'Немає'])
-  if (s >= 0 && s < stations.length) {
-    const places = ROWS.flatMap((r, ri) => COLS.map((c) => [`${rowNames[ri]}, ${c === 'left' ? 'ліворуч' : 'праворуч'}`, r, c]))
-    const p = await pick('Маленький віджет', 'Де він стоїть?', places.map((x) => x[0]))
-    set.small = { station: stations[s].cmd, row: p >= 0 ? places[p][1] : 'top', col: p >= 0 ? places[p][2] : 'left' }
-  }
+  const t = await pick('Тема', ['Авто (як на iPhone)', 'Темна', 'Світла'])
+  if (t >= 0) set.theme = ['auto', 'dark', 'light'][t]
+  try {
+    const stations = (await load(k)).stations
+    const s = await pick('Станція для маленького віджета', stations.map((x) => x.name))
+    if (s >= 0) set.station = stations[s].cmd
+  } catch (e) { const a = new Alert(); a.title = 'Не вдалося отримати дані'; a.message = String(e.message || e); a.addAction('OK'); await a.present() }
   saveSet(set)
-  const b = await pick('Прозорий фон', 'Фоном стануть твої шпалери під віджетом. Потрібен скріншот порожньої сторінки домашнього екрана.', ['Налаштувати', 'Без прозорості'])
-  if (b === 0) await setupBg(); else if (b === 1) resetBg()
-  const done = new Alert(); done.title = 'Готово'
-  done.message = 'Додай віджет Scriptable на екран → Edit Widget → Script: EcoFlow. Parameter залишай порожнім — усе вже збережено.\n\nParameter потрібен лише для другого віджета того ж розміру (напр. «kate mid right»).'
-  done.addAction('OK'); await done.present()
 }
 
 async function main(famOverride) {
   const fam = famOverride ?? config.widgetFamily ?? 'medium'
   const w = new ListWidget(); w.refreshAfterDate = new Date(Date.now() + 10 * 60 * 1000)
   const acc = fam.startsWith('accessory')
-  const preTheme = THEMES[(args.widgetParameter || '').toLowerCase().split(/[\s,;]+/).find((t) => THEMES[t]) ?? 'auto']
+  const preTheme = THEMES[loadSet()?.theme] ?? THEMES.auto
   let d
   try {
     const k = await key(); if (!k) throw new Error('немає ключа — відкрий скрипт у Scriptable')
@@ -289,10 +192,8 @@ async function main(famOverride) {
     const m = w.addText(String(e.message || e).slice(0, 90)); m.font = Font.systemFont(10); m.textColor = preTheme.dim
     return w
   }
-  const o = resolve(d.stations, fam), { theme, st } = o
-  // на «прозорому» фоні auto = темне скло: шпалери затемнюються, текст білий
-  const bg = bgImage(fam, o, theme !== 'light')
-  const T = THEMES[bg && theme === 'auto' ? 'glass' : theme]
+  const { theme, st } = resolve(d.stations)
+  const T = THEMES[theme]
   if (fam === 'accessoryInline') {
     w.addText(`${d.light?.on ? '⚡' : '⛔'} ${st.name} ${st.soc ?? '—'}%`)
   } else if (fam === 'accessoryCircular') {
@@ -307,8 +208,7 @@ async function main(famOverride) {
     const t = h.addText(lightText(d.light, Date.now())); t.font = Font.boldRoundedSystemFont(12)
     for (const s of d.stations) { const r = w.addText(`${s.name} ${s.soc ?? '—'}% · ${stateText(s)}`); r.font = Font.regularRoundedSystemFont(11); r.lineLimit = 1 }
   } else {
-    if (bg) w.backgroundImage = bg
-    else { const g = new LinearGradient(); g.colors = T.bg; g.locations = [0, 1]; w.backgroundGradient = g }
+    const g = new LinearGradient(); g.colors = T.bg; g.locations = [0, 1]; w.backgroundGradient = g
     if (fam === 'small') { w.setPadding(14, 14, 12, 14); small(w, T, d, st) }
     else if (fam === 'medium') { w.setPadding(12, 12, 12, 12); medium(w, T, d) }
     else { w.setPadding(16, 16, 16, 16); large(w, T, d) }
@@ -318,17 +218,12 @@ async function main(famOverride) {
 
 if (config.runsInWidget) Script.setWidget(await main())
 else {
-  // У застосунку: перший запуск — майстер; далі меню
-  if (!loadSet()) await wizard()
+  // У застосунку: перший запуск — налаштування; далі меню
+  if (!loadSet()) await settings()
   else {
-    const a = new Alert(); a.title = 'EcoFlow'
-    ;['Налаштувати заново', 'Прев\'ю: маленький', 'Прев\'ю: середній', 'Прев\'ю: великий', 'Оновити шпалери (прозорий фон)', 'Вимкнути прозорий фон'].forEach((x) => a.addAction(x))
-    a.addCancelAction('Закрити')
-    const i = await a.presentSheet()
-    if (i === 0) await wizard()
-    else if (i >= 1 && i <= 3) { const p = await main(['small', 'medium', 'large'][i - 1]); await [p.presentSmall, p.presentMedium, p.presentLarge][i - 1].call(p) }
-    else if (i === 4) await setupBg()
-    else if (i === 5) resetBg()
+    const i = await pick('EcoFlow', ['Налаштування', 'Прев\'ю: маленький', 'Прев\'ю: середній', 'Прев\'ю: великий'])
+    if (i === 0) await settings()
+    else if (i >= 1) { const p = await main(['small', 'medium', 'large'][i - 1]); await [p.presentSmall, p.presentMedium, p.presentLarge][i - 1].call(p) }
   }
 }
 Script.complete()
