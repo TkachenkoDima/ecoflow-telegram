@@ -2,7 +2,7 @@
 // 1) Встав свої URL і KEY нижче. 2) Додай віджет Scriptable на екран і вибери цей скрипт.
 // Параметр віджета (Parameter): cmd станції для маленького віджета (marinka / kate / router). Порожньо — перша станція.
 const URL = 'https://frosty-union-469b.frosty-union-469b.workers.dev/widget'
-const KEY = 'ВСТАВ_СЮДИ_WIDGET_TOKEN'
+const KEY = '0d876123a3a24bc3ee030499eba00b11'
 
 const C = {
   bg1: new Color('#16191f'), bg2: new Color('#0d0f13'),
