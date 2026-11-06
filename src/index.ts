@@ -58,7 +58,7 @@ async function ecoflow(env: Env, path: string, params: Record<string, string> = 
 async function readRest(env: Env, sn: string): Promise<Reading> {
 	const q = await ecoflow(env, '/iot-open/sign/device/quota/all', { sn })
 	const soc = Number(q.cmsBattSoc)
-	if (!Number.isFinite(soc)) throw new Error(`${sn}: немає cmsBattSoc`)
+	if (!Number.isFinite(soc)) throw new Error(`${DEVICES.find((d) => d.sn === sn)?.name ?? 'станція'}: немає cmsBattSoc`)
 	const loadW = Number(q.powOutSumW ?? 0)
 	const acIn = Number(q.powGetAcIn ?? 0)
 	const maxChg = Number(q.cmsMaxChgSoc)
@@ -210,27 +210,12 @@ function memoKV(kv: KVNamespace): KVNamespace {
 	}
 	return api as unknown as KVNamespace
 }
-// 2) Дрібні ключі однієї природи (по станціях / по групах) зберігаються одним об'єктом: 1 читання замість кількох,
-//    і без читань «not found». legacy — старі окремі ключі: при першому зверненні переносимо їх в об'єкт (разово)
-async function mapLoad<T>(env: Env, key: string, legacy: Record<string, string>): Promise<Record<string, T>> {
-	const m = await env.POWER_KV.get<Record<string, T>>(key, 'json')
-	if (m) return m
-	const out: Record<string, T> = {}
-	const found: string[] = []
-	for (const [sub, old] of Object.entries(legacy)) {
-		const v = await env.POWER_KV.get<T>(old, 'json')
-		if (v !== null && v !== undefined) {
-			out[sub] = v
-			found.push(old)
-		}
-	}
-	await env.POWER_KV.put(key, JSON.stringify(out))
-	// старі ключі більше не потрібні (видалення — разово, лише тих, що були)
-	for (const old of found) await env.POWER_KV.delete(old).catch(() => {})
-	return out
+// 2) Дрібні ключі однієї природи (по станціях / по групах) зберігаються одним об'єктом: 1 читання замість кількох
+async function mapLoad<T>(env: Env, key: string): Promise<Record<string, T>> {
+	return (await env.POWER_KV.get<Record<string, T>>(key, 'json')) ?? {}
 }
-async function mapSet<T>(env: Env, key: string, legacy: Record<string, string>, sub: string, val: T | undefined) {
-	const m = await mapLoad<T>(env, key, legacy)
+async function mapSet<T>(env: Env, key: string, sub: string, val: T | undefined) {
+	const m = await mapLoad<T>(env, key)
 	if (val === undefined) {
 		if (!(sub in m)) return
 		delete m[sub]
@@ -240,8 +225,6 @@ async function mapSet<T>(env: Env, key: string, legacy: Record<string, string>, 
 	}
 	await env.POWER_KV.put(key, JSON.stringify(m))
 }
-const bySn = (prefix: string) => Object.fromEntries(DEVICES.map((d) => [d.sn, `${prefix}:${d.sn}`]))
-const byChat = (env: Env, prefix: string) => Object.fromEntries(chatIds(env).map((c) => [c, `${prefix}:${c}`]))
 
 // ── Налаштування станцій (ліміт заряду, макс. вхід) у KV — спільні для всіх дата-центрів Cloudflare ──
 // Запис лише коли значення змінилось або минула година (≈ до 72 записів/добу на 3 станції — далеко від ліміту 1000)
@@ -252,7 +235,7 @@ const SETTINGS_FRESH_MS = 6 * 60 * 60_000
 let settingsEnv: Env // KV доступний лише через env — запам'ятовуємо на час запиту
 const settingsCache = new Map<string, Settings | null>() // у межах одного запуску, щоб не читати KV двічі
 async function getSettings(sn: string): Promise<Settings | null> {
-	if (!settingsCache.has(sn)) settingsCache.set(sn, (await mapLoad<Settings>(settingsEnv, 'settings', bySn('settings')))[sn] ?? null)
+	if (!settingsCache.has(sn)) settingsCache.set(sn, (await mapLoad<Settings>(settingsEnv, 'settings'))[sn] ?? null)
 	return settingsCache.get(sn)!
 }
 async function saveSettings(sn: string, upd: { maxChg?: number; acMax?: number; minDsg?: number }, byCommand = false) {
@@ -268,7 +251,7 @@ async function saveSettings(sn: string, upd: { maxChg?: number; acMax?: number; 
 	const changed = !prev || prev.maxChg !== next.maxChg || prev.acMax !== next.acMax || prev.minDsg !== next.minDsg
 	if (!byCommand && !changed && Date.now() - prev.at < SETTINGS_FRESH_MS) return
 	settingsCache.set(sn, next)
-	await mapSet(settingsEnv, 'settings', bySn('settings'), sn, next)
+	await mapSet(settingsEnv, 'settings', sn, next)
 }
 
 // sns — з кого читаємо заряд; settingsFor — у кого ще чекаємо налаштування (повний пакет 254/21:
@@ -462,9 +445,9 @@ const CONTROL_KEYBOARD = {
 // Безстроково — доки не натиснуть «🤖 Авто»
 type Manual = { since: number }
 // усі станції — в одному ключі 'manual' { sn: { since } }
-const getManual = async (env: Env, sn: string) => (await mapLoad<Manual>(env, 'manual', bySn('manual')))[sn] ?? null
-const setManual = (env: Env, sn: string) => mapSet<Manual>(env, 'manual', bySn('manual'), sn, { since: Date.now() })
-const clearManual = (env: Env, sn: string) => mapSet<Manual>(env, 'manual', bySn('manual'), sn, undefined)
+const getManual = async (env: Env, sn: string) => (await mapLoad<Manual>(env, 'manual'))[sn] ?? null
+const setManual = (env: Env, sn: string) => mapSet<Manual>(env, 'manual', sn, { since: Date.now() })
+const clearManual = (env: Env, sn: string) => mapSet<Manual>(env, 'manual', sn, undefined)
 
 const deviceKeyboard = (d: Device) => {
 	const groups = new Map<string, { text: string; callback_data: string }[]>()
@@ -521,8 +504,8 @@ const isOurChat = (env: Env, id: unknown) => chatIds(env).includes(String(id))
 // key — тип пушу для схеми «лише останнє» (новий пуш того ж типу прибирає попередній); окремих ключів last:* більше немає
 type Expiring = { id: number; at: number; key?: string }
 // усі групи — в одному ключі 'ttl' { chatId: [{id, at}] }
-const loadTtl = (env: Env) => mapLoad<Expiring[]>(env, 'ttl', byChat(env, 'ttl'))
-const saveTtl = (env: Env, chatId: string | number, list: Expiring[]) => mapSet<Expiring[]>(env, 'ttl', byChat(env, 'ttl'), String(chatId), list.length ? list : undefined)
+const loadTtl = (env: Env) => mapLoad<Expiring[]>(env, 'ttl')
+const saveTtl = (env: Env, chatId: string | number, list: Expiring[]) => mapSet<Expiring[]>(env, 'ttl', String(chatId), list.length ? list : undefined)
 const deleteAtFor = (now: number) => {
 	if (!isQuiet()) return now + PUSH_TTL_MIN * 60_000
 	// тихий режим: до ранку (QUIET_TO) + PUSH_TTL_MIN
@@ -757,7 +740,7 @@ async function sendPanel(env: Env, chatId: string | number, p: Panel, markup: ob
 // ── Щохвилинна перевірка ────────────────────────────────────────
 async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading | undefined) {
 	// стан усіх станцій — в одному ключі 'devs' { sn: DeviceState }
-	const saved = (await mapLoad<DeviceState>(env, 'devs', bySn('dev')))[dev.sn]
+	const saved = (await mapLoad<DeviceState>(env, 'devs'))[dev.sn]
 	const st: DeviceState = saved ? { ...emptyState(), ...saved } : emptyState()
 	const before = JSON.stringify(st)
 	const now = Date.now()
@@ -789,7 +772,7 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 			st.notified = st.notified.filter((t) => r.soc < t + RESET_GAP)
 		}
 	}
-	if (JSON.stringify(st) !== before) await mapSet<DeviceState>(env, 'devs', bySn('dev'), dev.sn, st)
+	if (JSON.stringify(st) !== before) await mapSet<DeviceState>(env, 'devs', dev.sn, st)
 }
 
 // Повертає подію 'gridOn' / 'gridOff', якщо стан світла щойно змінився
@@ -1259,10 +1242,10 @@ async function runAutomations(env: Env, readings: Map<string, Reading>, online: 
 type Pin = { cmd: string; messageId: number }
 // усі групи — в одному ключі 'pins' { chatId: { cmd, messageId } }
 async function getPin(env: Env, chatId: string | number): Promise<Pin | null> {
-	return (await mapLoad<Pin>(env, 'pins', byChat(env, 'pin')))[String(chatId)] ?? null
+	return (await mapLoad<Pin>(env, 'pins'))[String(chatId)] ?? null
 }
-const setPin = (env: Env, chatId: string | number, pin: Pin) => mapSet<Pin>(env, 'pins', byChat(env, 'pin'), String(chatId), pin)
-const delPin = (env: Env, chatId: string | number) => mapSet<Pin>(env, 'pins', byChat(env, 'pin'), String(chatId), undefined)
+const setPin = (env: Env, chatId: string | number, pin: Pin) => mapSet<Pin>(env, 'pins', String(chatId), pin)
+const delPin = (env: Env, chatId: string | number) => mapSet<Pin>(env, 'pins', String(chatId), undefined)
 const isPinnedMsg = async (env: Env, chatId: string | number, messageId: number) => (await getPin(env, chatId))?.messageId === messageId
 
 // Стан «екрана» в закріпленому: що показано і яке меню кнопок. Живе VIEW_TTL_S, потім — картка станції групи
@@ -1424,18 +1407,6 @@ async function pinCommand(env: Env, chatId: number | string, arg: string | undef
 // Перевірки, що змінюються рідко (меню команд, «моніторинг запущено»), — раз на годину і після старту воркера
 let bootChecked = false
 
-// Разово: 05.11 відключення почалось о 08:55, але бот його не побачив (див. grid вище). Щойно бот зафіксує
-// «світла немає» 05.11 — ставимо початок на 08:55, щоб статистика була правдивою. Позначка в KV — лише один раз
-async function fixGrid0511(env: Env) {
-	const g = await env.POWER_KV.get<GridState>('grid', 'json')
-	const at = localDay(2026, 10, 5) + 8 * 3600_000 + 55 * 60_000
-	if (!g || g.state !== 'OFF' || g.since <= at || dayStart(g.since) !== dayStart(at)) return
-	if (await env.POWER_KV.get('fix:grid:0511')) return
-	await env.POWER_KV.put('grid', JSON.stringify({ ...g, since: at }))
-	await env.POWER_KV.put('fix:grid:0511', '1', { expirationTtl: 7 * 86400 })
-	console.log('grid 05.11: since → 08:55')
-}
-
 async function run(env: Env) {
 	const hourly = !bootChecked || new Date().getUTCMinutes() === 0
 	bootChecked = true
@@ -1454,7 +1425,6 @@ async function run(env: Env) {
 		}
 	}
 	const event = await checkGrid(env, readings, online).catch((e) => (console.error('grid', e), null))
-	if (Date.now() < localDay(2026, 10, 6)) await fixGrid0511(env).catch((e) => console.error('fix 05.11', e)) // лише 05.11
 	await runAutomations(env, readings, online, event).catch((e) => console.error('automations', e))
 	await updatePins(env, readings, online).catch((e) => console.error('pins', e))
 	await cleanupExpired(env).catch((e) => console.error('cleanup', e))
@@ -1464,7 +1434,14 @@ async function run(env: Env) {
 // Читає станції наживо (як кнопка), без записів у KV; iOS оновлює віджет ~раз на 10–15 хв
 async function widgetData(env: Env, url: URL): Promise<Response> {
 	if (!env.WIDGET_TOKEN || url.searchParams.get('key') !== env.WIDGET_TOKEN) return new Response('forbidden', { status: 403 })
-	const { online, readings } = await readAll(env, DEVICES, true)
+	let all: Awaited<ReturnType<typeof readAll>>
+	try {
+		all = await readAll(env, DEVICES, true)
+	} catch (e) {
+		console.error('widget', e)
+		return Response.json({ error: 'upstream' }, { status: 502, headers: { 'Cache-Control': 'no-store' } })
+	}
+	const { online, readings } = all
 	const g = await env.POWER_KV.get<GridState>('grid', 'json')
 	const stations = DEVICES.map((d) => {
 		const r = readings.get(d.sn)
