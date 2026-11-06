@@ -29,8 +29,8 @@ function dur(ms) {
   if (d) return `${d} д ${h} год`
   return `${h} год${mm ? ` ${mm} хв` : ''}`
 }
-const stateText = (s) => (!s.online ? 'офлайн' : s.soc === null ? 'немає даних' : s.remMin !== null ? `ще ${dur(s.remMin * 60000)}` : s.fromGrid ? 'від мережі' : '—')
-const stateIcon = (s) => (!s.online ? 'wifi.slash' : s.remMin !== null ? 'hourglass' : s.fromGrid ? 'powerplug.fill' : 'hourglass')
+const stateText = (s) => (s.staleAt ? `дані о ${clock(s.staleAt)}` : !s.online ? 'офлайн' : s.soc === null ? 'немає даних' : s.remMin !== null ? `ще ${dur(s.remMin * 60000)}` : s.fromGrid ? 'від мережі' : '—')
+const stateIcon = (s) => (s.staleAt ? 'clock' : !s.online ? 'wifi.slash' : s.remMin !== null ? 'hourglass' : s.fromGrid ? 'powerplug.fill' : 'hourglass')
 const lightText = (l, now) => (!l ? 'Світло: —' : `${l.on ? 'Світло є' : 'Без світла'} · ${dur(now - l.since)}`)
 
 // ---------- графіка ----------
@@ -103,16 +103,17 @@ function medium(w, T, d) {
 
 function large(w, T, d) {
   const head = w.addStack(); head.centerAlignContent(); lightPill(head, T, d, 14); head.addSpacer(); txt(head, `оновлено ${clock(d.at)}`, 10, T.dim)
-  w.addSpacer(12)
+  w.addSpacer(10)
   for (const s of d.stations) {
-    const c = glass(w, T, 20); c.setPadding(10, 12, 10, 12); c.centerAlignContent()
-    c.addImage(ring(s.soc, 54, 6)).imageSize = new Size(54, 54); c.addSpacer(12)
+    const c = glass(w, T, 22); c.setPadding(10, 14, 10, 14); c.centerAlignContent(); c.size = new Size(0, 96)
+    c.addImage(ring(s.soc, 66, 7)).imageSize = new Size(66, 66); c.addSpacer(14)
     const col = c.addStack(); col.layoutVertically()
-    txt(col, s.name, 15, T.text, 'bold'); col.addSpacer(3)
-    const st = col.addStack(); st.centerAlignContent(); icon(st, stateIcon(s), 11, T.dim); st.addSpacer(4); txt(st, stateText(s), 12, T.dim, 'semi')
-    if (s.loadW) { col.addSpacer(2); const l = col.addStack(); l.centerAlignContent(); icon(l, 'bolt.horizontal.fill', 11, T.dim); l.addSpacer(4); txt(l, `${s.loadW} Вт`, 12, T.dim, 'semi') }
+    txt(col, s.name, 17, T.text, 'bold'); col.addSpacer(4)
+    const st = col.addStack(); st.centerAlignContent(); icon(st, stateIcon(s), 13, T.dim); st.addSpacer(5); txt(st, stateText(s), 14, T.dim, 'semi')
+    col.addSpacer(3); const l = col.addStack(); l.centerAlignContent(); icon(l, 'bolt.horizontal.fill', 13, T.dim); l.addSpacer(5)
+    txt(l, s.loadW !== null && !s.staleAt ? `${s.loadW} Вт` : '— Вт', 14, T.dim, 'semi')
     c.addSpacer()
-    w.addSpacer(8)
+    w.addSpacer(10)
   }
   w.addSpacer()
 }
@@ -130,8 +131,77 @@ async function load(k) {
   const req = new Request(`${URL}?key=${encodeURIComponent(k)}`); req.timeoutInterval = 45
   const d = await req.loadJSON()
   if (req.response?.statusCode === 403) { if (!config.runsInWidget) Keychain.remove(KC); throw new Error('невірний ключ') }
+  return withCache(d)
+}
+// River 3 по MQTT інколи не встигає надіслати пакет за час запиту — тоді показуємо останні дані
+// з кешу на телефоні (до 2 год) з позначкою «дані о HH:MM». Cloudflare це нічого не коштує.
+function withCache(d) {
+  const fm = FileManager.local(), path = fm.joinPath(fm.cacheDirectory(), 'ecoflow-widget.json')
+  let cache = {}
+  try { if (fm.fileExists(path)) cache = JSON.parse(fm.readString(path)) } catch {}
+  for (const s of d.stations) {
+    const c = cache[s.cmd]
+    if (s.soc !== null) cache[s.cmd] = { soc: s.soc, remMin: s.remMin, fromGrid: s.fromGrid, loadW: s.loadW, at: d.at }
+    else if (c && d.at - c.at < 2 * 3600 * 1000) Object.assign(s, { soc: c.soc, remMin: c.remMin, fromGrid: c.fromGrid, loadW: c.loadW, staleAt: c.at })
+  }
+  try { fm.writeString(path, JSON.stringify(cache)) } catch {}
   return d
 }
+// ---------- «прозорий» фон: шматок скріншота шпалер під місцем віджета ----------
+// Геометрія віджетів у пікселях скріншота: ліві x колонок, верхні y рядів, розміри.
+// 1290×2796 виміряно зі скріншотів (iPhone Pro Max / Plus, iOS 26). Інші екрани — приблизно, масштабом.
+const GEO = {
+  '1290x2796': { x: [92, 681], y: [252, 892, 1532], s: [524, 524], m: [1113, 524], l: [1113, 1164] },
+}
+const FMG = FileManager.local()
+const BG_DIR = FMG.joinPath(FMG.documentsDirectory(), 'ecoflow-bg')
+function geoFor(w, h) {
+  const g = GEO[`${w}x${h}`]
+  if (g) return { g, exact: true }
+  const k = w / 1290, b = GEO['1290x2796'], sc = (a) => a.map((v) => Math.round(v * k))
+  return { g: { x: sc(b.x), y: b.y.map((v) => Math.round((v / 2796) * h)), s: sc(b.s), m: sc(b.m), l: sc(b.l) }, exact: false }
+}
+const SLOTS = [
+  ...['top', 'mid', 'bottom'].flatMap((r, ri) => ['left', 'right'].map((c, ci) => ({ id: `small-${r}-${c}`, size: 's', ri, ci }))),
+  ...['top', 'mid', 'bottom'].map((r, ri) => ({ id: `medium-${r}`, size: 'm', ri, ci: 0 })),
+  ...['top', 'mid'].map((r, ri) => ({ id: `large-${r}`, size: 'l', ri, ci: 0 })),
+]
+async function setupBg() {
+  const a = new Alert(); a.title = 'Прозорий фон'
+  a.message = 'Зроби скріншот ПОРОЖНЬОЇ сторінки домашнього екрана: довге натискання на екран → гортай праворуч до порожньої сторінки → скріншот. Потім вибери його тут.'
+  a.addAction('Вибрати скріншот'); a.addCancelAction('Скасувати')
+  if ((await a.presentAlert()) === -1) return
+  const img = await Photos.fromLibrary()
+  const W = img.size.width, H = img.size.height
+  const { g, exact } = geoFor(W, H)
+  if (!FMG.fileExists(BG_DIR)) FMG.createDirectory(BG_DIR, true)
+  for (const sl of SLOTS) {
+    const [sw, sh] = g[sl.size], x = sl.size === 's' ? g.x[sl.ci] : g.x[0], y = g.y[sl.ri]
+    if (y + sh > H) continue
+    const ctx = new DrawContext(); ctx.size = new Size(sw, sh); ctx.respectScreenScale = false
+    ctx.drawImageAtPoint(img, new Point(-x, -y))
+    FMG.writeImage(FMG.joinPath(BG_DIR, `${sl.id}.png`), ctx.getImage())
+  }
+  const d = new Alert(); d.title = 'Готово'
+  d.message = (exact ? '' : `Екран ${W}×${H} ще не виміряний — позиції приблизні. Надішли скрін домашнього екрана з віджетом, щоб додати точні.\n\n`) +
+    'У Parameter віджета вкажи його місце: ряд top / mid / bottom і для маленького left / right. Наприклад: «marinka top left», «mid» для великого посередині.'
+  d.addAction('OK'); await d.present()
+}
+function resetBg() { if (FMG.fileExists(BG_DIR)) FMG.remove(BG_DIR) }
+function bgImage(fam, toks, dark) {
+  if (toks.includes('solid') || !['small', 'medium', 'large'].includes(fam)) return null
+  const row = toks.find((t) => ['top', 'mid', 'bottom'].includes(t)) ?? 'top'
+  const col = toks.find((t) => ['left', 'right'].includes(t)) ?? 'left'
+  const id = fam === 'small' ? `small-${row}-${col}` : `${fam}-${row}`
+  const path = FMG.joinPath(BG_DIR, `${id}.png`)
+  if (!FMG.fileExists(path)) return null
+  const img = FMG.readImage(path)
+  const ctx = new DrawContext(); ctx.size = img.size; ctx.respectScreenScale = false
+  ctx.drawImageAtPoint(img, new Point(0, 0))
+  ctx.setFillColor(dark ? hex('#000000', 0.32) : hex('#ffffff', 0.35)); ctx.fillRect(new Rect(0, 0, img.size.width, img.size.height))
+  return ctx.getImage()
+}
+
 function parseParam(stations) {
   const toks = (args.widgetParameter || '').toLowerCase().split(/[\s,;]+/).filter(Boolean)
   const theme = toks.find((t) => THEMES[t]) ?? 'auto'
@@ -141,7 +211,7 @@ function parseParam(stations) {
     const hit = Number.isInteger(i) && i >= 1 ? stations[i - 1] : stations.find((s) => s.cmd === t || s.name.toLowerCase() === t || s.name.toLowerCase().startsWith(t))
     if (hit) { st = hit; break }
   }
-  return { theme, st }
+  return { theme, st, toks }
 }
 
 async function main(famOverride) {
@@ -160,8 +230,10 @@ async function main(famOverride) {
     const m = w.addText(String(e.message || e).slice(0, 90)); m.font = Font.systemFont(10); m.textColor = preTheme.dim
     return w
   }
-  const { theme, st } = parseParam(d.stations)
-  const T = THEMES[theme]
+  const { theme, st, toks } = parseParam(d.stations)
+  // на «прозорому» фоні auto = темне скло: шпалери затемнюються, текст білий
+  const bg = bgImage(fam, toks, theme !== 'light')
+  const T = THEMES[bg && theme === 'auto' ? 'glass' : theme]
   if (fam === 'accessoryInline') {
     w.addText(`${d.light?.on ? '⚡' : '⛔'} ${st.name} ${st.soc ?? '—'}%`)
   } else if (fam === 'accessoryCircular') {
@@ -176,7 +248,8 @@ async function main(famOverride) {
     const t = h.addText(lightText(d.light, Date.now())); t.font = Font.boldRoundedSystemFont(12)
     for (const s of d.stations) { const r = w.addText(`${s.name} ${s.soc ?? '—'}% · ${stateText(s)}`); r.font = Font.regularRoundedSystemFont(11); r.lineLimit = 1 }
   } else {
-    const g = new LinearGradient(); g.colors = T.bg; g.locations = [0, 1]; w.backgroundGradient = g
+    if (bg) w.backgroundImage = bg
+    else { const g = new LinearGradient(); g.colors = T.bg; g.locations = [0, 1]; w.backgroundGradient = g }
     if (fam === 'small') { w.setPadding(14, 14, 12, 14); small(w, T, d, st) }
     else if (fam === 'medium') { w.setPadding(12, 12, 12, 12); medium(w, T, d) }
     else { w.setPadding(16, 16, 16, 16); large(w, T, d) }
@@ -186,9 +259,13 @@ async function main(famOverride) {
 
 if (config.runsInWidget) Script.setWidget(await main())
 else {
-  // У застосунку: показати прев'ю потрібного розміру й теми
-  const a = new Alert(); a.title = 'Прев\'ю'; ['Маленький', 'Середній', 'Великий'].forEach((x) => a.addAction(x)); a.addCancelAction('Закрити')
+  // У застосунку: прев'ю та налаштування фону
+  const a = new Alert(); a.title = 'EcoFlow'
+  ;['Прев\'ю: маленький', 'Прев\'ю: середній', 'Прев\'ю: великий', 'Прозорий фон: налаштувати', 'Прозорий фон: вимкнути'].forEach((x) => a.addAction(x))
+  a.addCancelAction('Закрити')
   const i = await a.presentSheet()
-  if (i >= 0) { const p = await main(['small', 'medium', 'large'][i]); await [p.presentSmall, p.presentMedium, p.presentLarge][i].call(p) }
+  if (i >= 0 && i <= 2) { const p = await main(['small', 'medium', 'large'][i]); await [p.presentSmall, p.presentMedium, p.presentLarge][i].call(p) }
+  else if (i === 3) await setupBg()
+  else if (i === 4) resetBg()
 }
 Script.complete()
