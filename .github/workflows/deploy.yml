@@ -29,6 +29,7 @@ jobs:
             TELEGRAM_CHAT_ID
             TG_WEBHOOK_SECRET
             DEVICE_SNS
+            WIDGET_TOKEN
         env:
           ECOFLOW_ACCESS_KEY: ${{ secrets.ECOFLOW_ACCESS_KEY }}
           ECOFLOW_SECRET_KEY: ${{ secrets.ECOFLOW_SECRET_KEY }}
@@ -38,6 +39,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TG_WEBHOOK_SECRET: ${{ secrets.TG_WEBHOOK_SECRET }}
           DEVICE_SNS: ${{ secrets.DEVICE_SNS }}
+          WIDGET_TOKEN: ${{ secrets.WIDGET_TOKEN }}
       - name: Telegram webhook
         env:
           TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}

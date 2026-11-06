@@ -13,6 +13,7 @@ type Env = {
 	TELEGRAM_BOT_TOKEN: string
 	TELEGRAM_CHAT_ID: string
 	TG_WEBHOOK_SECRET: string
+	WIDGET_TOKEN?: string // ключ для /widget (віджет iPhone через Scriptable); не задано — /widget вимкнено
 	DEVICE_SNS: string // {"marinka": "D3M1…", "kate": "R655…"} — серійники не зберігаються в репо
 }
 
@@ -1459,6 +1460,30 @@ async function run(env: Env) {
 	await cleanupExpired(env).catch((e) => console.error('cleanup', e))
 }
 
+// ── Віджет iPhone (Scriptable): GET /widget?key=WIDGET_TOKEN → свіжий стан станцій і світла (JSON) ──
+// Читає станції наживо (як кнопка), без записів у KV; iOS оновлює віджет ~раз на 10–15 хв
+async function widgetData(env: Env, url: URL): Promise<Response> {
+	if (!env.WIDGET_TOKEN || url.searchParams.get('key') !== env.WIDGET_TOKEN) return new Response('forbidden', { status: 403 })
+	const { online, readings } = await readAll(env, DEVICES, true)
+	const g = await env.POWER_KV.get<GridState>('grid', 'json')
+	const stations = DEVICES.map((d) => {
+		const r = readings.get(d.sn)
+		return {
+			cmd: d.cmd,
+			name: d.name,
+			online: !!online.get(d.sn),
+			soc: r?.soc ?? null,
+			remMin: r?.remMin ?? null, // хв до розряду (якщо розряджається)
+			fromGrid: r?.gridIn ?? null,
+			loadW: r?.loadW ?? null,
+		}
+	})
+	return Response.json(
+		{ at: Date.now(), light: g ? { on: g.state === 'ON', since: g.since } : null, stations },
+		{ headers: { 'Cache-Control': 'no-store' } },
+	)
+}
+
 // ── Telegram webhook: команди і кнопки ──────────────────────────
 async function helpText() {
 	const list = DEVICES.map((d) => `/${d.cmd} — ${esc(d.name)}`).join('\n')
@@ -1738,6 +1763,7 @@ export default {
 			ctx.waitUntil(handleUpdate(env, await req.json()))
 			return new Response('ok')
 		}
+		if (url.pathname === '/widget' && req.method === 'GET') return widgetData(env, url)
 		return new Response('ok')
 	},
 } satisfies ExportedHandler<Env>
