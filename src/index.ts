@@ -34,7 +34,7 @@ function initDevices(env: Env) {
 }
 
 // grid — «свідчення» станції про світло: ON — є струм на вході, OFF — входу немає і батарея розряджається, null — не знає
-type Reading = { soc: number; remMin: number | null; loadW: number | null; inW?: number | null; gridIn: boolean | null; grid?: 'ON' | 'OFF' | null; maxChg?: number; acMax?: number; minDsg?: number }
+type Reading = { soc: number; remMin: number | null; loadW: number | null; inW?: number | null; gridIn: boolean | null; batt?: 'in' | 'out' | 'idle'; grid?: 'ON' | 'OFF' | null; maxChg?: number; acMax?: number; minDsg?: number }
 type DeviceState = { notified: number[]; offlineSince: number | null; offlineAlerted: boolean }
 type GridState = { state: 'ON' | 'OFF'; since: number }
 
@@ -313,14 +313,17 @@ async function readMqtt(
 	for (const [sn, p] of parts) {
 		if (p.soc === undefined || restOnly.includes(sn)) continue
 		const discharging = (p.battOutW ?? 0) > 5 && (p.battInW ?? 0) === 0
-		// вхід відомий лише з 254/21; інакше — якщо батарея не розряджається, живимось від мережі
-		const gridIn = p.inSumW !== undefined ? p.inSumW > 1 : !discharging
+		// «від мережі»: вхід відомий (пакет 254/21) — він і є правдою; інакше заряджається → так,
+		// а розряджається / нічого не робить — вирішуємо після за станом світла (див. readAll)
+		const gridIn = p.inSumW !== undefined ? p.inSumW > 1 : (p.battInW ?? 0) > 5 ? true : null
+		const batt = (p.battInW ?? 0) > 5 ? 'in' : discharging ? 'out' : 'idle'
 		result.set(sn, {
 			soc: Math.round(p.soc),
 			remMin: discharging && p.remMin !== undefined ? p.remMin : null,
 			loadW: p.outSumW !== undefined ? Math.round(p.outSumW) : discharging ? (p.battOutW ?? null) : null,
 			inW: p.inSumW !== undefined ? Math.round(p.inSumW) : (p.battInW ?? 0) > 5 ? Math.round(p.battInW!) : null,
 			gridIn,
+			batt,
 			// впевнено — лише коли вхід відомий: є струм → ON; нуль і батарея віддає → OFF
 			// світло: за входом з мережі (пакет 254/21), а якщо його не було — за батареєю (BMS 32/50, приходить завжди):
 			// заряджається → мережа є; розряджається → мережі немає; нічого не робить (повна, без навантаження) → невідомо.
@@ -413,6 +416,15 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, 
 				rd.minDsg ??= c.minDsg
 			}
 		}
+	// Невідомо, чи живиться River від мережі (пакет без входу): світла немає → від батареї;
+	// світло є → від мережі, якщо батарея не розряджається. Визначення самого світла цього не використовує.
+	if ([...readings.values()].some((r) => r.gridIn === null)) {
+		const g = await env.POWER_KV.get<GridState>('grid', 'json').catch(() => null)
+		for (const r of readings.values()) {
+			if (r.gridIn !== null) continue
+			r.gridIn = r.batt === 'out' || g?.state === 'OFF' ? false : g?.state === 'ON' ? true : null
+		}
+	}
 	for (const e of errors) console.error(e)
 	return { online, readings, errors }
 }
@@ -602,9 +614,11 @@ const bar = (soc: number) => {
 type Panel = { text: string; device?: Device; markup?: object }
 
 // Стан станції одним рядком: «⏳ 04:01 · ⚡ 58 Вт» / «🔌 від мережі»
+// Немає прогнозу і не від мережі: нічого не живить — «без навантаження», інакше прогноз невідомий
+const idle = (r: Reading) => (r.loadW ?? 0) <= 0
 const stateLine = (r: Reading) => {
-	const load = r.loadW !== null ? ` · ⚡ ${r.loadW} Вт` : ''
-	return r.remMin !== null ? `⏳ ${hhmm(r.remMin)}${load}` : r.gridIn ? `🔌 від мережі${load}` : `⏳ —${load}`
+	const load = r.loadW ? ` · ⚡ ${r.loadW} Вт` : ''
+	return r.remMin !== null ? `⏳ ${hhmm(r.remMin)}${load}` : r.gridIn ? `🔌 від мережі${load}` : idle(r) ? '💤 без навантаження' : `⏳ —${load}`
 }
 
 // Список станцій звичайним текстом: кожна — міні-блок «назва + %» і «шкала · прогноз · навантаження»,
@@ -616,8 +630,8 @@ const table = (devices: Device[], readings: Map<string, Reading>, online: Map<st
 			const r = readings.get(d.sn)
 			if (!online.get(d.sn)) return `⚫️ ${name} — офлайн`
 			if (!r) return `❔ ${name} — немає даних`
-			const load = r.loadW !== null ? ` · ⚡ ${r.loadW} Вт` : ''
-			const st = r.remMin !== null ? `⏳ ${hhmm(r.remMin)}` : r.gridIn ? '🔌 від мережі' : '⏳ —'
+			const load = r.loadW ? ` · ⚡ ${r.loadW} Вт` : ''
+			const st = r.remMin !== null ? `⏳ ${hhmm(r.remMin)}` : r.gridIn ? '🔌 від мережі' : idle(r) ? '💤 без навантаження' : '⏳ —'
 			return `${socIcon(r.soc)} ${name} <b>${r.soc}%</b>${load}\n<code>${bar(r.soc)}</code> ${st}`
 		})
 		.join('\n\n')
@@ -645,7 +659,7 @@ const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState
 	if (!isOnline) return `⚫️ ${head}\nОфлайн${foot}`
 	if (!r) return `❔ ${head}\nНемає даних${foot}`
 	const time =
-		r.remMin !== null ? `⏳ Залишилось <b>${hhmm(r.remMin)}</b>` : r.gridIn ? `🔌 <b>Від мережі</b>` : `⏳ Залишилось <b>—</b>`
+		r.remMin !== null ? `⏳ Залишилось <b>${hhmm(r.remMin)}</b>` : r.gridIn ? `🔌 <b>Від мережі</b>` : idle(r) ? '💤 <b>Без навантаження</b>' : `⏳ Залишилось <b>—</b>`
 	const load = r.loadW !== null ? `\n⚡ Споживання <b>${r.loadW} Вт</b>` : ''
 	const lim =
 		(r.maxChg !== undefined ? `\n🔝 Ліміт заряду <b>${r.maxChg}%</b>` : '') +
@@ -765,7 +779,7 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 			if (crossed.length) {
 				const t = Math.min(...crossed)
 				const loud = t === Math.min(...THRESHOLDS)
-				const rem = r.remMin !== null ? `⏳ Залишилось ≈ <b>${hhmm(r.remMin)}</b>` : r.gridIn ? '🔌 Від мережі' : '⏳ Час невідомий'
+				const rem = r.remMin !== null ? `⏳ Залишилось ≈ <b>${hhmm(r.remMin)}</b>` : r.gridIn ? '🔌 Від мережі' : idle(r) ? '💤 Без навантаження' : '⏳ Час невідомий'
 				const load = r.loadW !== null ? `\n⚡ Споживання ${r.loadW} Вт` : ''
 				const custom = dev.messages?.[t] ? `\n💬 <i>${esc(dev.messages[t])}</i>` : ''
 				await telegram(env, `${socIcon(t)} <b>${esc(dev.name)} — ${r.soc}%</b>${custom}\n<code>${bar(r.soc)}</code>\n${rem}${load}`, { loud, forDevice: dev.cmd, replaceKey: `last:thr:${dev.cmd}` })
