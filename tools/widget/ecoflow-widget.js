@@ -22,18 +22,16 @@ const pad = (n) => String(n).padStart(2, '0')
 const clock = (t) => { const d = new Date(t); return `${pad(d.getHours())}:${pad(d.getMinutes())}` }
 // тривалість для «вистачить ~…» / «до 100% ~…»
 function human(min) {
-  const m = Math.max(0, Math.round(min))
-  if (m < 60) return `${m} хв`
-  const h = Math.floor(m / 60), mm = m % 60
-  if (h < 24) return h >= 10 || !mm ? `${h} г` : `${h} г ${mm} хв`
-  return h % 24 ? `${Math.floor(h / 24)} д ${h % 24} г` : `${Math.floor(h / 24)} д`
+  // компактно, без пробілу між числом і одиницею: 25хв · 1г 35хв · 10д 23г 59хв
+  const m = Math.max(0, Math.round(min)), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mm = m % 60
+  return [d && `${d}д`, h && `${h}г`, mm && `${mm}хв`].filter(Boolean).join(' ') || '0хв'
 }
-// тривалість стану світла: довга (2 г 10 хв, 152 д 23 г) і коротка (2:10)
+// тривалість стану світла: довга (2г 10хв, 152д 23г) і коротка (2:10)
 function since(ms, short) {
   const m = Math.max(0, Math.floor(ms / 60000)), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mm = m % 60
-  if (d) return h ? `${d} д ${h} г` : `${d} д`
+  if (d) return h ? `${d}д ${h}г` : `${d}д`
   if (short) return `${h}:${pad(mm)}`
-  return h ? `${h} г${mm ? ` ${mm} хв` : ''}` : `${mm} хв`
+  return h ? `${h}г${mm ? ` ${mm}хв` : ''}` : `${mm}хв`
 }
 const status = (l, now, short) => (!l ? 'СВІТЛО: —' : `${l.on ? 'СВІТЛО Є' : 'БЕЗ СВІТЛА'} · ${since(now - l.since, short)}`)
 const plural = (n) => (n % 10 === 1 && n % 100 !== 11 ? 'відключення' : [2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100) ? 'відключення' : 'відключень')
@@ -47,6 +45,8 @@ function lines(s) {
   if (charging(s)) return [s.fullMin ? `до 100% ~${human(s.fullMin)}` : 'заряджається', `заряд +${s.inW} Вт`]
   if (s.remMin !== null) return [`вистачить ~${human(s.remMin)}`, use]
   if (s.fromGrid) return [s.soc >= 99 ? 'заряджена' : 'від мережі', use]
+  // не заряджається й нічого не живить
+  if (!s.loadW) return ['без навантаження', '']
   return ['—', use]
 }
 
@@ -100,26 +100,34 @@ function hourLabels(stack, size) {
   const r = stack.addStack(); ['00', '06', '12', '18', '24'].forEach((x, i) => { if (i) r.addSpacer(); txt(r, x, size, C.faint) })
 }
 // назва + маленька батарейка (+ що завгодно справа)
-function nameRow(parent, s, size, bw) {
+// назва · (блискавка, якщо передано стан світла) · маленька батарейка
+// right — батарейка притиснута до правого краю рядка
+function nameRow(parent, s, size, bw, lightOn, right = false) {
   const r = parent.addStack(); r.centerAlignContent()
-  txt(r, s.name, size, C.text, 'bold'); r.addSpacer(size * 0.45)
+  txt(r, s.name, size, C.text, 'bold'); r.addSpacer(size * 0.4)
+  if (lightOn !== undefined) { bolt(r, lightOn, size * 0.85); r.addSpacer(size * 0.4) }
+  if (right) r.addSpacer()
   img(r, battery(s.soc, bw, bw / 2), bw + bw / 18 + 2, bw / 2)
   return r
 }
 
 // ---------- розміри ----------
 function small(w, d, s) {
-  // у маленькому батарейка велика — під назвою, тож у шапці лише назва й блискавка
-  const top = w.addStack(); top.centerAlignContent(); txt(top, s.name, 15, C.text, 'bold'); top.addSpacer(); bolt(top, d.light?.on, 13)
-  w.addSpacer(9)
+  // шапка · (простір) · батарейка з % · (простір) · статус і два рядки — вільне місце ділиться порівну
+  const top = w.addStack(); top.centerAlignContent(); txt(top, s.name, 17, C.text, 'bold'); top.addSpacer(6); bolt(top, d.light?.on, 15); top.addSpacer(); txt(top, clock(d.at), 10, C.faint)
+  w.addSpacer()
   const b = w.addStack(); b.centerAlignContent()
-  img(b, battery(s.soc, 66, 31), 66 + 4 + 2, 31); b.addSpacer(7)
-  txt(b, s.soc === null ? '—' : `${s.soc}%`, 29, C.text, 'heavy')
+  // батарейка фіксованого розміру, а шрифт % підібраний так, щоб «100%» влазило поруч без стискання
+  // % — по центру вільного місця праворуч від батарейки
+  img(b, battery(s.soc, 50, 28), 50 + 4 + 2, 28); b.addSpacer(4); b.addSpacer()
+  txt(b, s.soc === null ? '—' : `${s.soc}%`, 30, C.text, 'heavy'); b.addSpacer()
   w.addSpacer()
   const [l1, l2] = lines(s)
-  txt(w, status(d.light, Date.now(), true), 9.5, d.light?.on ? C.on : C.off, 'bold')
-  w.addSpacer(3); txt(w, l1, 12, C.soft, 'semi')
-  const r = w.addStack(); r.bottomAlignContent(); txt(r, l2 || ' ', 10.5, C.dim); r.addSpacer(4); txt(r, clock(d.at), 8.5, C.faint)
+  // час оновлення — у шапці після блискавки: статус («152 д 23 г») і «споживання 120 Вт» займають усю ширину
+  txt(w, status(d.light, Date.now(), true), 12, d.light?.on ? C.on : C.off, 'bold')
+  // «ще ~10д 23г 59хв» коротше за «вистачить …» — влазить у ширину маленького віджета
+  w.addSpacer(3); txt(w, l1.replace('вистачить ', 'ще '), 15, C.soft, 'semi')
+  txt(w, l2 || ' ', 12.5, C.dim)
 }
 
 function others(d, main) { return d.stations.filter((x) => x.cmd !== main.cmd) }
@@ -128,7 +136,7 @@ function medium(w, d, s) {
   const row = w.addStack(); row.spacing = 13
   // ліворуч — головна станція (без смужки годин: текст крупніше)
   const L = row.addStack(); L.layoutVertically(); L.size = new Size(176, 0)
-  const h = nameRow(L, s, 18, 26); h.addSpacer(); bolt(h, d.light?.on, 14)
+  nameRow(L, s, 18, 26, !!d.light?.on, true)
   L.addSpacer(2); txt(L, s.soc === null ? '—' : `${s.soc}%`, 50, C.text, 'heavy')
   L.addSpacer()
   txt(L, status(d.light, Date.now(), false), 11, d.light?.on ? C.on : C.off, 'bold'); L.addSpacer(4)
@@ -141,17 +149,20 @@ function medium(w, d, s) {
   const sep = row.addStack(); sep.size = new Size(1, 0); sep.backgroundColor = C.divider; sep.layoutVertically(); sep.addSpacer()
   // праворуч — решта станцій
   const R = row.addStack(); R.layoutVertically()
-  others(d, s).forEach((o, i) => {
+  const rest = others(d, s)
+  rest.forEach((o, i) => {
     if (i) R.addSpacer()
-    const n = nameRow(R, o, 12, 21)
-    if (i === 0) { n.addSpacer(); txt(n, clock(d.at), 8, C.faint) }
+    nameRow(R, o, 12, 21, undefined, true)
     txt(R, o.soc === null ? '—' : `${o.soc}%`, 25, C.text, 'heavy')
-    const [a, b] = lines(o); txt(R, a, 10.5, C.soft, 'semi'); txt(R, b || ' ', 10, C.dim)
+    const [a, b] = lines(o); txt(R, a, 10.5, C.soft, 'semi')
+    // час оновлення — у правому нижньому куті (в останньому рядку правої колонки)
+    if (i === rest.length - 1) { const z = R.addStack(); z.bottomAlignContent(); txt(z, b || ' ', 10, C.dim); z.addSpacer(); z.addSpacer(4); txt(z, clock(d.at), 8, C.faint) }
+    else txt(R, b || ' ', 10, C.dim)
   })
 }
 
 function large(w, d, s) {
-  const h = nameRow(w, s, 15, 26); h.addSpacer(5); bolt(h, d.light?.on, 13); h.addSpacer(); txt(h, clock(d.at), 8, C.faint)
+  const h = nameRow(w, s, 15, 26, !!d.light?.on); h.addSpacer(); txt(h, clock(d.at), 8, C.faint)
   w.addSpacer()
   const ch = charging(s), [l1, l2] = lines(s)
   const big = w.addStack(); big.bottomAlignContent()
