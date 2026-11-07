@@ -126,27 +126,27 @@ function others(d, main) { return d.stations.filter((x) => x.cmd !== main.cmd) }
 
 function medium(w, d, s) {
   const row = w.addStack(); row.spacing = 13
-  // ліворуч — головна станція
+  // ліворуч — головна станція (без смужки годин: текст крупніше)
   const L = row.addStack(); L.layoutVertically(); L.size = new Size(176, 0)
-  const h = nameRow(L, s, 13, 24); h.addSpacer(); bolt(h, d.light?.on, 12)
-  L.addSpacer(3); txt(L, s.soc === null ? '—' : `${s.soc}%`, 46, C.text, 'heavy')
-  L.addSpacer(2); txt(L, status(d.light, Date.now(), false), 8.5, d.light?.on ? C.on : C.off, 'bold')
-  L.addSpacer(5); img(L, hoursBar(d.day?.hours, 176, 4), 176, 4); L.addSpacer(2); hourLabels(L, 6.5)
+  const h = nameRow(L, s, 15, 26); h.addSpacer(); bolt(h, d.light?.on, 14)
+  L.addSpacer(2); txt(L, s.soc === null ? '—' : `${s.soc}%`, 50, C.text, 'heavy')
+  txt(L, status(d.light, Date.now(), false), 11, d.light?.on ? C.on : C.off, 'bold')
   L.addSpacer()
   const ch = charging(s), [l1, l2] = lines(s)
-  txt(L, ch ? 'ЗАРЯДЖАЄТЬСЯ' : 'ВИСТАЧИТЬ НА', 7, C.dim, 'bold')
-  const v = L.addStack(); v.bottomAlignContent()
-  txt(v, ch ? l1 : l1.replace('вистачить ', ''), 15, C.text, 'bold'); v.addSpacer(5); txt(v, l2, 9, C.dim)
+  // підпис, значення і другорядне — окремими рядками, щоб нічого не переносилось
+  txt(L, ch ? 'ДО 100%' : 'ВИСТАЧИТЬ НА', 8.5, C.dim, 'bold')
+  txt(L, l1.replace('вистачить ', '').replace('до 100% ', ''), 18, C.text, 'bold')
+  if (l2) txt(L, l2, 11, C.dim)
   // роздільник
   const sep = row.addStack(); sep.size = new Size(1, 0); sep.backgroundColor = C.divider; sep.layoutVertically(); sep.addSpacer()
   // праворуч — решта станцій
   const R = row.addStack(); R.layoutVertically()
   others(d, s).forEach((o, i) => {
     if (i) R.addSpacer()
-    const n = nameRow(R, o, 10.5, 20)
-    if (i === 0) { n.addSpacer(); txt(n, clock(d.at), 7, C.faint) }
-    txt(R, o.soc === null ? '—' : `${o.soc}%`, 22, C.text, 'heavy')
-    const [a, b] = lines(o); txt(R, a, 8.5, C.soft, 'semi'); txt(R, b || ' ', 8, C.dim)
+    const n = nameRow(R, o, 12, 21)
+    if (i === 0) { n.addSpacer(); txt(n, clock(d.at), 8, C.faint) }
+    txt(R, o.soc === null ? '—' : `${o.soc}%`, 25, C.text, 'heavy')
+    const [a, b] = lines(o); txt(R, a, 10.5, C.soft, 'semi'); txt(R, b || ' ', 10, C.dim)
   })
 }
 
