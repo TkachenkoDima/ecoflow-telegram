@@ -34,7 +34,7 @@ function initDevices(env: Env) {
 }
 
 // grid — «свідчення» станції про світло: ON — є струм на вході, OFF — входу немає і батарея розряджається, null — не знає
-type Reading = { soc: number; remMin: number | null; loadW: number | null; gridIn: boolean | null; grid?: 'ON' | 'OFF' | null; maxChg?: number; acMax?: number; minDsg?: number }
+type Reading = { soc: number; remMin: number | null; loadW: number | null; inW?: number | null; gridIn: boolean | null; grid?: 'ON' | 'OFF' | null; maxChg?: number; acMax?: number; minDsg?: number }
 type DeviceState = { notified: number[]; offlineSince: number | null; offlineAlerted: boolean }
 type GridState = { state: 'ON' | 'OFF'; since: number }
 
@@ -66,6 +66,7 @@ async function readRest(env: Env, sn: string): Promise<Reading> {
 	return {
 		soc,
 		loadW,
+		inW: Math.round(acIn),
 		gridIn: acIn > 0,
 		grid: acIn > 1 ? 'ON' : 'OFF',
 		remMin: loadW > 0 && acIn === 0 ? Number(q.cmsDsgRemTime) : null,
@@ -318,6 +319,7 @@ async function readMqtt(
 			soc: Math.round(p.soc),
 			remMin: discharging && p.remMin !== undefined ? p.remMin : null,
 			loadW: p.outSumW !== undefined ? Math.round(p.outSumW) : discharging ? (p.battOutW ?? null) : null,
+			inW: p.inSumW !== undefined ? Math.round(p.inSumW) : (p.battInW ?? 0) > 5 ? Math.round(p.battInW!) : null,
 			gridIn,
 			// впевнено — лише коли вхід відомий: є струм → ON; нуль і батарея віддає → OFF
 			// світло: за входом з мережі (пакет 254/21), а якщо його не було — за батареєю (BMS 32/50, приходить завжди):
@@ -1438,7 +1440,7 @@ async function run(env: Env) {
 //   • змінився заряд — не частіше ніж раз на 5 хв (при швидкій зарядці % росте щохвилини);
 //   • інакше — раз на 15 хв (час роботи, навантаження).
 // «Від мережі» на запис не впливає: у River 3 воно мерехтить від пакета до пакета.
-interface SnapStation { soc: number | null; remMin: number | null; fromGrid: boolean | null; loadW: number | null; online: boolean; at: number }
+interface SnapStation { soc: number | null; remMin: number | null; fromGrid: boolean | null; loadW: number | null; inW?: number | null; online: boolean; at: number }
 const SNAP_REFRESH_MS = 15 * 60_000
 const SNAP_SOC_GAP_MS = 5 * 60_000
 async function saveSnapshot(env: Env, readings: Map<string, Reading>, online: Map<string, boolean>) {
@@ -1457,7 +1459,7 @@ async function saveSnapshot(env: Env, readings: Map<string, Reading>, online: Ma
 		if (!p || p.online !== on) onlineChanged = true
 		if (r && p && p.soc !== r.soc) socChanged = true
 		next[d.cmd] = r
-			? { soc: r.soc, remMin: r.remMin ?? null, fromGrid: r.gridIn ?? null, loadW: r.loadW ?? null, online: on, at: now }
+			? { soc: r.soc, remMin: r.remMin ?? null, fromGrid: r.gridIn ?? null, loadW: r.loadW ?? null, inW: r.inW ?? null, online: on, at: now }
 			: { ...(p ?? { soc: null, remMin: null, fromGrid: null, loadW: null, at: now }), online: on }
 	}
 	const write = onlineChanged || (socChanged && sinceWrite >= SNAP_SOC_GAP_MS) || sinceWrite >= SNAP_REFRESH_MS
@@ -1468,6 +1470,29 @@ async function saveSnapshot(env: Env, readings: Map<string, Reading>, online: Ma
 // Дані — зі знімка cron (≤ 15 хв для часу роботи / навантаження, заряд і світло — актуальні до хвилини).
 // Якщо знімка немає або cron давно не оновлював станцію — читаємо наживо.
 const SNAP_MAX_AGE_MS = 30 * 60_000
+// Станція для віджета: + «до 100%» (хв) з ємності батареї та чистої потужності заряду
+function widgetStation(d: Device, s: { online: boolean; soc: number | null; remMin: number | null; fromGrid: boolean | null; loadW: number | null; inW?: number | null }) {
+	const inW = s.inW ?? null
+	const net = inW !== null ? inW - (s.loadW ?? 0) : 0
+	const fullMin = d.capWh && s.soc !== null && s.soc < 100 && net > 10 ? Math.round((((100 - s.soc) / 100) * d.capWh * 60) / net) : null
+	return { cmd: d.cmd, name: d.name, online: s.online, soc: s.soc, remMin: s.remMin, fromGrid: s.fromGrid, loadW: s.loadW, inW, fullMin }
+}
+// Сьогодні по годинах (1 — світло було, 0 — не було ≥ 30 хв, null — ще не настала), сумарно без світла і кількість відключень
+async function widgetDay(env: Env, g: GridState | null, now: number) {
+	const start = dayStart(now)
+	const log = (await env.POWER_KV.get<Outage[]>('outlog', 'json')) ?? []
+	const outs = log.filter((o) => o.to > start).map((o) => ({ from: Math.max(o.from, start), to: o.to }))
+	if (g && g.state === 'OFF') outs.push({ from: Math.max(g.since, start), to: now })
+	const hours = Array.from({ length: 24 }, (_, h) => {
+		const a = start + h * 3600_000
+		const b = a + 3600_000
+		if (a > now) return null
+		const off = outs.reduce((sum, o) => sum + Math.max(0, Math.min(b, o.to, now) - Math.max(a, o.from)), 0)
+		return off >= 30 * 60_000 ? 0 : 1
+	})
+	const offMin = Math.round(outs.reduce((sum, o) => sum + (o.to - o.from), 0) / 60_000)
+	return { hours, offMin, count: outs.length }
+}
 // Посилання на закріплений «екран» кожної групи — щоб тап по віджету відкривав Telegram саме там.
 // t.me/c/… працює лише для супергруп (id -100…) і лише для їхніх учасників.
 async function groupLinks(env: Env, withTitles: boolean) {
@@ -1490,13 +1515,14 @@ async function widgetData(env: Env, url: URL): Promise<Response> {
 	const light = g ? { on: g.state === 'ON', since: g.since } : null
 	const headers = { 'Cache-Control': 'no-store' }
 	const groups = await groupLinks(env, url.searchParams.has('groups')).catch(() => [])
+	const day = await widgetDay(env, g, now).catch(() => null)
 	const snap = await env.POWER_KV.get<Record<string, SnapStation>>('snap', 'json')
 	if (snap && DEVICES.every((d) => snap[d.cmd] && (!snap[d.cmd].online || now - snap[d.cmd].at < SNAP_MAX_AGE_MS))) {
 		const stations = DEVICES.map((d) => {
 			const s = snap[d.cmd]
-			return { cmd: d.cmd, name: d.name, online: s.online, soc: s.soc, remMin: s.remMin, fromGrid: s.fromGrid, loadW: s.loadW, ...(s.online && now - s.at > 20 * 60_000 ? { staleAt: s.at } : {}) }
+			return { ...widgetStation(d, s), ...(s.online && now - s.at > 20 * 60_000 ? { staleAt: s.at } : {}) }
 		})
-		return Response.json({ at: now, light, stations, groups }, { headers })
+		return Response.json({ at: now, light, stations, groups, day }, { headers })
 	}
 	let all: Awaited<ReturnType<typeof readAll>>
 	try {
@@ -1508,9 +1534,9 @@ async function widgetData(env: Env, url: URL): Promise<Response> {
 	const { online, readings } = all
 	const stations = DEVICES.map((d) => {
 		const r = readings.get(d.sn)
-		return { cmd: d.cmd, name: d.name, online: !!online.get(d.sn), soc: r?.soc ?? null, remMin: r?.remMin ?? null, fromGrid: r?.gridIn ?? null, loadW: r?.loadW ?? null }
+		return widgetStation(d, { online: !!online.get(d.sn), soc: r?.soc ?? null, remMin: r?.remMin ?? null, fromGrid: r?.gridIn ?? null, loadW: r?.loadW ?? null, inW: r?.inW ?? null })
 	})
-	return Response.json({ at: now, light, stations, groups }, { headers })
+	return Response.json({ at: now, light, stations, groups, day }, { headers })
 }
 
 // ── Telegram webhook: команди і кнопки ──────────────────────────

@@ -8,6 +8,7 @@ export type Device = {
 	via: 'rest' | 'mqtt' // 'rest' — якщо check-api показує code 0; 'mqtt' — якщо code 1006
 	cmd: string // команда бота латиницею, напр. 'kate' → /kate
 	messages?: Record<number, string> // необов'язково: свій текст для порогу, напр. { 10: 'Я сідаю!' }
+	capWh?: number // ємність батареї, Вт·год — для віджета «до 100% ~N хв» (необов'язково)
 }
 
 export const DEVICES: Device[] = [
@@ -16,6 +17,7 @@ export const DEVICES: Device[] = [
 		name: 'Маринка',
 		via: 'rest',
 		cmd: 'marinka',
+		capWh: 2048, // DELTA 3 Max Plus
 		messages: {
 			50: 'Половина, можно жить',
 			25: 'Пора закругляться',
@@ -27,13 +29,14 @@ export const DEVICES: Device[] = [
 		name: 'Kate',
 		via: 'mqtt',
 		cmd: 'kate',
+		capWh: 245, // River 3
 		messages: {
 			50: 'Половина, уменьши яркость',
 			25: 'Максимум еще одну серию протяну',
 			10: 'Скоро крякну, закругляемся',
 		},
 	},
-	{ sn: '', name: 'Router', via: 'mqtt', cmd: 'router' },
+	{ sn: '', name: 'Router', via: 'mqtt', cmd: 'router', capWh: 245 },
 ]
 
 // Станції, по яких визначаємо світло (увімкнені прямо в стіну). Правило: вхід з мережі > 1 Вт — світло є, інакше — немає;
