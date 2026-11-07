@@ -25,15 +25,15 @@ function human(min) {
   const m = Math.max(0, Math.round(min))
   if (m < 60) return `${m} хв`
   const h = Math.floor(m / 60), mm = m % 60
-  if (h < 48) return h >= 10 || !mm ? `${h} год` : `${h} год ${mm} хв`
-  return `${Math.floor(h / 24)} д ${h % 24} год`
+  if (h < 24) return h >= 10 || !mm ? `${h} г` : `${h} г ${mm} хв`
+  return h % 24 ? `${Math.floor(h / 24)} д ${h % 24} г` : `${Math.floor(h / 24)} д`
 }
-// тривалість стану світла: довга (2 ГОД 10 ХВ) і коротка (2:10)
+// тривалість стану світла: довга (2 г 10 хв, 152 д 23 г) і коротка (2:10)
 function since(ms, short) {
   const m = Math.max(0, Math.floor(ms / 60000)), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mm = m % 60
-  if (d) return short ? `${d} д ${h} год` : `${d} Д ${h} ГОД`
+  if (d) return h ? `${d} д ${h} г` : `${d} д`
   if (short) return `${h}:${pad(mm)}`
-  return h ? `${h} ГОД${mm ? ` ${mm} ХВ` : ''}` : `${mm} ХВ`
+  return h ? `${h} г${mm ? ` ${mm} хв` : ''}` : `${mm} хв`
 }
 const status = (l, now, short) => (!l ? 'СВІТЛО: —' : `${l.on ? 'СВІТЛО Є' : 'БЕЗ СВІТЛА'} · ${since(now - l.since, short)}`)
 const plural = (n) => (n % 10 === 1 && n % 100 !== 11 ? 'відключення' : [2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100) ? 'відключення' : 'відключень')
@@ -128,10 +128,10 @@ function medium(w, d, s) {
   const row = w.addStack(); row.spacing = 13
   // ліворуч — головна станція (без смужки годин: текст крупніше)
   const L = row.addStack(); L.layoutVertically(); L.size = new Size(176, 0)
-  const h = nameRow(L, s, 15, 26); h.addSpacer(); bolt(h, d.light?.on, 14)
+  const h = nameRow(L, s, 18, 26); h.addSpacer(); bolt(h, d.light?.on, 14)
   L.addSpacer(2); txt(L, s.soc === null ? '—' : `${s.soc}%`, 50, C.text, 'heavy')
-  txt(L, status(d.light, Date.now(), false), 11, d.light?.on ? C.on : C.off, 'bold')
   L.addSpacer()
+  txt(L, status(d.light, Date.now(), false), 11, d.light?.on ? C.on : C.off, 'bold'); L.addSpacer(4)
   const ch = charging(s), [l1, l2] = lines(s)
   // підпис, значення і другорядне — окремими рядками, щоб нічого не переносилось
   txt(L, ch ? 'ДО 100%' : 'ВИСТАЧИТЬ НА', 8.5, C.dim, 'bold')
