@@ -1433,30 +1433,35 @@ async function run(env: Env) {
 
 // ── Знімок станцій для віджета ──────────────────────────────────
 // Cron і так щохвилини читає всі станції — зберігаємо результат, а віджет читає його замість походу в EcoFlow.
-// Пишемо в KV лише коли змінився заряд / онлайн / живлення від мережі, або раз на 15 хв (час роботи, навантаження).
+// Записи в KV економимо (ліміт 1000/добу на акаунт):
+//   • онлайн/офлайн змінився — пишемо одразу;
+//   • змінився заряд — не частіше ніж раз на 5 хв (при швидкій зарядці % росте щохвилини);
+//   • інакше — раз на 15 хв (час роботи, навантаження).
+// «Від мережі» на запис не впливає: у River 3 воно мерехтить від пакета до пакета.
 interface SnapStation { soc: number | null; remMin: number | null; fromGrid: boolean | null; loadW: number | null; online: boolean; at: number }
 const SNAP_REFRESH_MS = 15 * 60_000
+const SNAP_SOC_GAP_MS = 5 * 60_000
 async function saveSnapshot(env: Env, readings: Map<string, Reading>, online: Map<string, boolean>) {
 	const prev = (await env.POWER_KV.get<Record<string, SnapStation>>('snap', 'json')) ?? {}
 	const now = Date.now()
-	const refresh = DEVICES.some((d) => !prev[d.cmd] || now - prev[d.cmd].at >= SNAP_REFRESH_MS)
+	// час останнього запису = найсвіжіший `at` (станція без показань зберігає свій старий `at` і запис не провокує)
+	const lastWrite = Math.max(0, ...Object.values(prev).map((p) => p.at))
+	const sinceWrite = now - lastWrite
 	const next: Record<string, SnapStation> = {}
-	let changed = false
+	let onlineChanged = false
+	let socChanged = false
 	for (const d of DEVICES) {
 		const r = readings.get(d.sn)
 		const on = !!online.get(d.sn)
 		const p = prev[d.cmd]
-		let s: SnapStation
-		if (r) s = { soc: r.soc, remMin: r.remMin ?? null, fromGrid: r.gridIn ?? null, loadW: r.loadW ?? null, online: on, at: now }
-		// станція не відповіла цього разу: онлайн — лишаємо попередні дані з їхнім часом; офлайн — фіксуємо офлайн
-		else s = { ...(p ?? { soc: null, remMin: null, fromGrid: null, loadW: null }), online: on, at: on ? (p?.at ?? now) : now }
-		const differs = !p || p.soc !== s.soc || p.online !== s.online || p.fromGrid !== s.fromGrid
-		if (differs || (refresh && r)) {
-			next[d.cmd] = s
-			changed = true
-		} else next[d.cmd] = p
+		if (!p || p.online !== on) onlineChanged = true
+		if (r && p && p.soc !== r.soc) socChanged = true
+		next[d.cmd] = r
+			? { soc: r.soc, remMin: r.remMin ?? null, fromGrid: r.gridIn ?? null, loadW: r.loadW ?? null, online: on, at: now }
+			: { ...(p ?? { soc: null, remMin: null, fromGrid: null, loadW: null, at: now }), online: on }
 	}
-	if (changed) await env.POWER_KV.put('snap', JSON.stringify(next))
+	const write = onlineChanged || (socChanged && sinceWrite >= SNAP_SOC_GAP_MS) || sinceWrite >= SNAP_REFRESH_MS
+	if (write) await env.POWER_KV.put('snap', JSON.stringify(next))
 }
 
 // ── Віджет iPhone (Scriptable): GET /widget?key=WIDGET_TOKEN → стан станцій і світла (JSON) ──
@@ -1486,10 +1491,10 @@ async function widgetData(env: Env, url: URL): Promise<Response> {
 	const headers = { 'Cache-Control': 'no-store' }
 	const groups = await groupLinks(env, url.searchParams.has('groups')).catch(() => [])
 	const snap = await env.POWER_KV.get<Record<string, SnapStation>>('snap', 'json')
-	if (snap && DEVICES.every((d) => snap[d.cmd] && now - snap[d.cmd].at < SNAP_MAX_AGE_MS)) {
+	if (snap && DEVICES.every((d) => snap[d.cmd] && (!snap[d.cmd].online || now - snap[d.cmd].at < SNAP_MAX_AGE_MS))) {
 		const stations = DEVICES.map((d) => {
 			const s = snap[d.cmd]
-			return { cmd: d.cmd, name: d.name, online: s.online, soc: s.soc, remMin: s.remMin, fromGrid: s.fromGrid, loadW: s.loadW, ...(now - s.at > 20 * 60_000 ? { staleAt: s.at } : {}) }
+			return { cmd: d.cmd, name: d.name, online: s.online, soc: s.soc, remMin: s.remMin, fromGrid: s.fromGrid, loadW: s.loadW, ...(s.online && now - s.at > 20 * 60_000 ? { staleAt: s.at } : {}) }
 		})
 		return Response.json({ at: now, light, stations, groups }, { headers })
 	}
