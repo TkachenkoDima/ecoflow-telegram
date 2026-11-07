@@ -616,6 +616,14 @@ type Panel = { text: string; device?: Device; markup?: object }
 // Стан станції одним рядком: «⏳ 04:01 · ⚡ 58 Вт» / «🔌 від мережі»
 // Немає прогнозу і не від мережі: нічого не живить — «без навантаження», інакше прогноз невідомий
 const idle = (r: Reading) => (r.loadW ?? 0) <= 0
+// Заряджається від мережі: «заряд +312 Вт · до 100% ~16 хв» (до 100% — з ємності батареї та чистої потужності)
+const chargeText = (d: Device, r: Reading) => {
+	const inW = r.inW ?? 0
+	if (!r.gridIn || inW <= 10 || r.soc >= 100) return ''
+	const net = inW - (r.loadW ?? 0)
+	const full = d.capWh && net > 10 ? Math.round((((100 - r.soc) / 100) * d.capWh * 60) / net) : null
+	return `заряд +${inW} Вт${full ? ` · до 100% ~${duration(full * 60_000)}` : ''}`
+}
 const stateLine = (r: Reading) => {
 	const load = r.loadW ? ` · ⚡ ${r.loadW} Вт` : ''
 	return r.remMin !== null ? `⏳ ${hhmm(r.remMin)}${load}` : r.gridIn ? `🔌 від мережі${load}` : idle(r) ? '💤 без навантаження' : `⏳ —${load}`
@@ -631,7 +639,8 @@ const table = (devices: Device[], readings: Map<string, Reading>, online: Map<st
 			if (!online.get(d.sn)) return `⚫️ ${name} — офлайн`
 			if (!r) return `❔ ${name} — немає даних`
 			const load = r.loadW ? ` · ⚡ ${r.loadW} Вт` : ''
-			const st = r.remMin !== null ? `⏳ ${hhmm(r.remMin)}` : r.gridIn ? '🔌 від мережі' : idle(r) ? '💤 без навантаження' : '⏳ —'
+			const ch = chargeText(d, r)
+			const st = r.remMin !== null ? `⏳ ${hhmm(r.remMin)}` : r.gridIn ? `🔌 від мережі${ch ? ` · ${ch}` : ''}` : idle(r) ? '💤 без навантаження' : '⏳ —'
 			return `${socIcon(r.soc)} ${name} <b>${r.soc}%</b>${load}\n<code>${bar(r.soc)}</code> ${st}`
 		})
 		.join('\n\n')
@@ -659,7 +668,7 @@ const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState
 	if (!isOnline) return `⚫️ ${head}\nОфлайн${foot}`
 	if (!r) return `❔ ${head}\nНемає даних${foot}`
 	const time =
-		r.remMin !== null ? `⏳ Залишилось <b>${hhmm(r.remMin)}</b>` : r.gridIn ? `🔌 <b>Від мережі</b>` : idle(r) ? '💤 <b>Без навантаження</b>' : `⏳ Залишилось <b>—</b>`
+		r.remMin !== null ? `⏳ Залишилось <b>${hhmm(r.remMin)}</b>` : r.gridIn ? `🔌 <b>Від мережі</b>${chargeText(d, r) ? `\n🔋 ${chargeText(d, r)}` : ''}` : idle(r) ? '💤 <b>Без навантаження</b>' : `⏳ Залишилось <b>—</b>`
 	const load = r.loadW !== null ? `\n⚡ Споживання <b>${r.loadW} Вт</b>` : ''
 	const lim =
 		(r.maxChg !== undefined ? `\n🔝 Ліміт заряду <b>${r.maxChg}%</b>` : '') +
@@ -1457,6 +1466,7 @@ async function run(env: Env) {
 interface SnapStation { soc: number | null; remMin: number | null; fromGrid: boolean | null; loadW: number | null; inW?: number | null; online: boolean; at: number }
 const SNAP_REFRESH_MS = 15 * 60_000
 const SNAP_SOC_GAP_MS = 5 * 60_000
+const SNAP_SOC_GAP_CHARGING_MS = 60_000 // при зарядці % росте швидко (до ~2%/хв) — оновлюємо щохвилини
 async function saveSnapshot(env: Env, readings: Map<string, Reading>, online: Map<string, boolean>) {
 	const prev = (await env.POWER_KV.get<Record<string, SnapStation>>('snap', 'json')) ?? {}
 	const now = Date.now()
@@ -1476,7 +1486,9 @@ async function saveSnapshot(env: Env, readings: Map<string, Reading>, online: Ma
 			? { soc: r.soc, remMin: r.remMin ?? null, fromGrid: r.gridIn ?? null, loadW: r.loadW ?? null, inW: r.inW ?? null, online: on, at: now }
 			: { ...(p ?? { soc: null, remMin: null, fromGrid: null, loadW: null, at: now }), online: on }
 	}
-	const write = onlineChanged || (socChanged && sinceWrite >= SNAP_SOC_GAP_MS) || sinceWrite >= SNAP_REFRESH_MS
+	const charging = [...readings.values()].some((r) => (r.inW ?? 0) > 10 || r.batt === 'in')
+	const gap = charging ? SNAP_SOC_GAP_CHARGING_MS : SNAP_SOC_GAP_MS
+	const write = onlineChanged || (socChanged && sinceWrite >= gap) || sinceWrite >= SNAP_REFRESH_MS
 	if (write) await env.POWER_KV.put('snap', JSON.stringify(next))
 }
 
@@ -1536,7 +1548,9 @@ async function widgetData(env: Env, url: URL): Promise<Response> {
 			const s = snap[d.cmd]
 			return { ...widgetStation(d, s), ...(s.online && now - s.at > 20 * 60_000 ? { staleAt: s.at } : {}) }
 		})
-		return Response.json({ at: now, light, stations, groups, day }, { headers })
+		// «оновлено» у віджеті — час даних (останній запис знімка), а не час запиту
+		const dataAt = Math.max(...DEVICES.map((d) => (snap[d.cmd].online ? snap[d.cmd].at : 0)), 0) || now
+		return Response.json({ at: dataAt, light, stations, groups, day }, { headers })
 	}
 	let all: Awaited<ReturnType<typeof readAll>>
 	try {
