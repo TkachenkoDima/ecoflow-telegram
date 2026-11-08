@@ -42,9 +42,10 @@ function lines(s) {
   if (!s.online) return ['офлайн', '']
   if (s.soc === null) return ['немає даних', '']
   const use = s.loadW !== null && s.loadW !== undefined ? `споживання ${s.loadW} Вт` : ''
-  if (charging(s)) return [s.fullMin ? `до 100% ~${human(s.fullMin)}` : 'заряджається', `заряд +${s.inW} Вт`]
+  if (charging(s)) return [s.fullMin ? `до 100% ~${human(s.fullMin)}` : 'заряджається', `${s.other ? 'вхід' : 'заряд'} +${s.inW} Вт`]
   if (s.remMin !== null) return [`вистачить ~${human(s.remMin)}`, use]
-  if (s.fromGrid) return [s.soc >= 99 ? 'заряджена' : 'від мережі', use]
+  // світла немає, а вхід є — це не мережа (інша станція / сонце)
+  if (s.fromGrid) return [s.other ? `вхід +${s.inW ?? 0} Вт` : s.soc >= 99 ? 'заряджена' : 'від мережі', use]
   // не заряджається й нічого не живить
   if (!s.loadW) return ['без навантаження', '']
   return ['—', use]
@@ -124,7 +125,7 @@ function small(w, d, s) {
   w.addSpacer()
   const [l1, l2] = lines(s)
   // час оновлення — у шапці після блискавки: статус («152 д 23 г») і «споживання 120 Вт» займають усю ширину
-  txt(w, status(d.light, Date.now(), true), 12, d.light?.on ? C.on : C.off, 'bold')
+  txt(w, status(d.light, Date.now(), false), 12, d.light?.on ? C.on : C.off, 'bold')
   // «ще ~10д 23г 59хв» коротше за «вистачить …» — влазить у ширину маленького віджета
   w.addSpacer(3); txt(w, l1.replace('вистачить ', 'ще '), 15, C.soft, 'semi')
   txt(w, l2 || ' ', 12.5, C.dim)
@@ -217,7 +218,7 @@ function withCache(d) {
   const fm = FileManager.local(), path = fm.joinPath(fm.cacheDirectory(), 'ecoflow-widget.json')
   let cache = {}
   try { if (fm.fileExists(path)) cache = JSON.parse(fm.readString(path)) } catch {}
-  const keys = ['soc', 'remMin', 'fromGrid', 'loadW', 'inW', 'fullMin']
+  const keys = ['soc', 'remMin', 'fromGrid', 'loadW', 'inW', 'fullMin', 'other']
   for (const s of d.stations) {
     const c = cache[s.cmd]
     if (s.soc !== null) cache[s.cmd] = { ...Object.fromEntries(keys.map((x) => [x, s[x] ?? null])), at: d.at }
@@ -288,7 +289,7 @@ async function main(famOverride) {
     s.addSpacer()
   } else if (fam === 'accessoryRectangular') {
     const h = w.addStack(); h.centerAlignContent(); icon(h, d.light?.on ? 'bolt.fill' : 'bolt.slash.fill', 11, Color.white()); h.addSpacer(3)
-    const t = h.addText(status(d.light, Date.now(), true)); t.font = Font.boldRoundedSystemFont(12)
+    const t = h.addText(status(d.light, Date.now(), false)); t.font = Font.boldRoundedSystemFont(12)
     for (const s of d.stations) { const r = w.addText(`${s.name} ${s.soc ?? '—'}% · ${lines(s)[0]}`); r.font = Font.regularRoundedSystemFont(11); r.lineLimit = 1 }
   } else if (fam === 'small') { w.setPadding(13, 14, 12, 14); small(w, d, st) }
   else if (fam === 'medium') { w.setPadding(14, 16, 14, 16); medium(w, d, st) }

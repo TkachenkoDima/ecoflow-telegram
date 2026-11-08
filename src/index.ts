@@ -34,7 +34,7 @@ function initDevices(env: Env) {
 }
 
 // grid — «свідчення» станції про світло: ON — є струм на вході, OFF — входу немає і батарея розряджається, null — не знає
-type Reading = { soc: number; remMin: number | null; loadW: number | null; inW?: number | null; gridIn: boolean | null; batt?: 'in' | 'out' | 'idle'; grid?: 'ON' | 'OFF' | null; maxChg?: number; acMax?: number; minDsg?: number }
+type Reading = { soc: number; remMin: number | null; loadW: number | null; inW?: number | null; gridIn: boolean | null; batt?: 'in' | 'out' | 'idle'; via?: 'rest' | 'mqtt'; other?: boolean; dsgRem?: number; raw?: { gridIn: boolean | null; inW: number | null; remMin: number | null }; grid?: 'ON' | 'OFF' | null; maxChg?: number; acMax?: number; minDsg?: number }
 type DeviceState = { notified: number[]; offlineSince: number | null; offlineAlerted: boolean }
 type GridState = { state: 'ON' | 'OFF'; since: number }
 
@@ -64,12 +64,14 @@ async function readRest(env: Env, sn: string): Promise<Reading> {
 	const maxChg = Number(q.cmsMaxChgSoc)
 	const minDsg = Number(q.cmsMinDsgSoc)
 	return {
+		via: 'rest',
 		soc,
 		loadW,
 		inW: Math.round(acIn),
 		gridIn: acIn > 0,
 		grid: acIn > 1 ? 'ON' : 'OFF',
 		remMin: loadW > 0 && acIn === 0 ? Number(q.cmsDsgRemTime) : null,
+		dsgRem: Number.isFinite(Number(q.cmsDsgRemTime)) ? Number(q.cmsDsgRemTime) : undefined,
 		maxChg: Number.isFinite(maxChg) ? maxChg : undefined,
 		minDsg: Number.isFinite(minDsg) ? minDsg : undefined,
 	}
@@ -318,6 +320,7 @@ async function readMqtt(
 		const gridIn = p.inSumW !== undefined ? p.inSumW > 1 : (p.battInW ?? 0) > 5 ? true : null
 		const batt = (p.battInW ?? 0) > 5 ? 'in' : discharging ? 'out' : 'idle'
 		result.set(sn, {
+			via: 'mqtt',
 			soc: Math.round(p.soc),
 			remMin: discharging && p.remMin !== undefined ? p.remMin : null,
 			loadW: p.outSumW !== undefined ? Math.round(p.outSumW) : discharging ? (p.battOutW ?? null) : null,
@@ -349,6 +352,37 @@ async function readMqtt(
 // ── Збір даних з усіх станцій ───────────────────────────────────
 // detailed — картка однієї станції: додаємо налаштування з кешу (живі мають пріоритет)
 // refresh — cron: якщо налаштування в кеші застаріли, чекаємо повний пакет телеметрії довше
+// ── Узгодження «від мережі» зі станом світла (одне правило для бота, пушів і віджета) ──
+// Світло (визначається окремо, по Router) — головне джерело правди:
+//  • DELTA 3 (REST) стоїть у розетці, але хмара віддає вхід із запізненням до 15 хв: світла немає → живлення
+//    лише від батареї (вхід ігноруємо); світло є → від мережі (застарілий прогноз розряду не показуємо).
+//  • River 3 (MQTT) дані живі: вхід відомий — він і правда; світла немає, а вхід є → це не мережа
+//    (інша станція / сонце) — позначаємо other. Входу в пакеті немає → батарея розряджається або світла
+//    немає → від батареї; світло є → від мережі.
+// Застосовується з «сирих» значень, тож його можна викликати повторно, коли стан світла оновився.
+async function applyLight(env: Env, readings: Map<string, Reading>) {
+	const g = await env.POWER_KV.get<GridState>('grid', 'json').catch(() => null)
+	const light = g?.state ?? null
+	for (const r of readings.values()) {
+		r.raw ??= { gridIn: r.gridIn, inW: r.inW ?? null, remMin: r.remMin }
+		const { gridIn, inW, remMin } = r.raw
+		r.other = false
+		if (r.via === 'rest') {
+			// світла немає, а хмара ще показує вхід — прогноз розряду беремо з cmsDsgRemTime
+			if (light === 'OFF') Object.assign(r, { gridIn: false, inW: 0, remMin: remMin ?? ((r.loadW ?? 0) > 0 && r.dsgRem ? r.dsgRem : null) })
+			else if (light === 'ON') Object.assign(r, { gridIn: true, inW, remMin: null })
+			else Object.assign(r, { gridIn, inW, remMin })
+			continue
+		}
+		r.inW = inW
+		r.remMin = remMin
+		if (gridIn !== null) {
+			r.gridIn = gridIn
+			r.other = gridIn && light === 'OFF'
+		} else r.gridIn = r.batt === 'out' || light === 'OFF' ? false : light === 'ON' ? true : null
+	}
+}
+
 async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, refresh = false) {
 	const list: Array<{ sn: string; online: number }> = await ecoflow(env, '/iot-open/sign/device/list')
 	const online = new Map(DEVICES.map((d) => [d.sn, list.find((x) => x.sn === d.sn)?.online === 1]))
@@ -416,15 +450,7 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, 
 				rd.minDsg ??= c.minDsg
 			}
 		}
-	// Невідомо, чи живиться River від мережі (пакет без входу): світла немає → від батареї;
-	// світло є → від мережі, якщо батарея не розряджається. Визначення самого світла цього не використовує.
-	if ([...readings.values()].some((r) => r.gridIn === null)) {
-		const g = await env.POWER_KV.get<GridState>('grid', 'json').catch(() => null)
-		for (const r of readings.values()) {
-			if (r.gridIn !== null) continue
-			r.gridIn = r.batt === 'out' || g?.state === 'OFF' ? false : g?.state === 'ON' ? true : null
-		}
-	}
+	await applyLight(env, readings)
 	for (const e of errors) console.error(e)
 	return { online, readings, errors }
 }
@@ -587,21 +613,15 @@ async function telegram(env: Env, text: string, o: SendOpts = {}) {
 }
 
 const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-const hhmm = (minutes: number) => {
-	const m = Math.max(0, Math.round(minutes))
-	return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`
+// Тривалості — тим самим компактним форматом, що й у віджеті:
+//  залишок / до 100% — усі частини: ~25хв · ~1г 35хв · ~10д 23г 59хв
+//  скільки триває (світло, офлайн, статистика) — з добою без хвилин: 48хв · 2г 10хв · 152д 23г
+const compactDur = (minutes: number, minutesWithDays = true) => {
+	const m = Math.max(0, Math.round(minutes)), d = Math.floor(m / 1440), h = Math.floor((m % 1440) / 60), mm = m % 60
+	return [d && `${d}д`, h && `${h}г`, (!d || minutesWithDays) && mm && `${mm}хв`].filter(Boolean).join(' ') || '0хв'
 }
-const duration = (ms: number) => {
-	const m = Math.floor(ms / 60000)
-	if (m >= 1440) {
-		// від доби — дні, години й хвилини: 1 день, 2 дні, 5 днів, 21 день
-		const dd = Math.floor(m / 1440)
-		const h = Math.floor((m % 1440) / 60)
-		const word = dd % 10 === 1 && dd % 100 !== 11 ? 'день' : [2, 3, 4].includes(dd % 10) && ![12, 13, 14].includes(dd % 100) ? 'дні' : 'днів'
-		return [`${dd} ${word}`, h ? `${h} год` : '', m % 60 ? `${m % 60} хв` : ''].filter(Boolean).join(', ')
-	}
-	return m < 60 ? `${m} хв` : `${Math.floor(m / 60)} год${m % 60 ? ` ${m % 60} хв` : ''}`
-}
+const hhmm = (minutes: number) => `~${compactDur(minutes)}`
+const duration = (ms: number) => compactDur(Math.floor(ms / 60000), false)
 const clock = (t: number, sec = false) =>
 	new Date(t).toLocaleTimeString('uk-UA', { timeZone: TIMEZONE, hour: '2-digit', minute: '2-digit', ...(sec ? { second: '2-digit' } : {}) })
 const socIcon = (soc: number) => (soc <= 10 ? '🚨' : soc <= 25 ? '🪫' : '🔋')
@@ -616,17 +636,19 @@ type Panel = { text: string; device?: Device; markup?: object }
 // Стан станції одним рядком: «⏳ 04:01 · ⚡ 58 Вт» / «🔌 від мережі»
 // Немає прогнозу і не від мережі: нічого не живить — «без навантаження», інакше прогноз невідомий
 const idle = (r: Reading) => (r.loadW ?? 0) <= 0
+// «від мережі», або «вхід +N Вт», коли світла немає, а станцію живить щось інше
+const srcText = (r: Reading) => (r.other ? `вхід +${r.inW ?? 0} Вт` : 'від мережі')
 // Заряджається від мережі: «заряд +312 Вт · до 100% ~16 хв» (до 100% — з ємності батареї та чистої потужності)
 const chargeText = (d: Device, r: Reading) => {
 	const inW = r.inW ?? 0
 	if (!r.gridIn || inW <= 10 || r.soc >= 100) return ''
 	const net = inW - (r.loadW ?? 0)
 	const full = d.capWh && net > 10 ? Math.round((((100 - r.soc) / 100) * d.capWh * 60) / net) : null
-	return `заряд +${inW} Вт${full ? ` · до 100% ~${duration(full * 60_000)}` : ''}`
+	return `${r.other ? 'вхід' : 'заряд'} +${inW} Вт${full ? ` · до 100% ${hhmm(full)}` : ''}`
 }
 const stateLine = (r: Reading) => {
 	const load = r.loadW ? ` · ⚡ ${r.loadW} Вт` : ''
-	return r.remMin !== null ? `⏳ ${hhmm(r.remMin)}${load}` : r.gridIn ? `🔌 від мережі${load}` : idle(r) ? '💤 без навантаження' : `⏳ —${load}`
+	return r.remMin !== null ? `⏳ ${hhmm(r.remMin)}${load}` : r.gridIn ? `🔌 ${srcText(r)}${load}` : idle(r) ? '💤 без навантаження' : `⏳ —${load}`
 }
 
 // Список станцій звичайним текстом: кожна — міні-блок «назва + %» і «шкала · прогноз · навантаження»,
@@ -639,23 +661,24 @@ const table = (devices: Device[], readings: Map<string, Reading>, online: Map<st
 			if (!online.get(d.sn)) return `⚫️ ${name} — офлайн`
 			if (!r) return `❔ ${name} — немає даних`
 			const load = r.loadW ? ` · ⚡ ${r.loadW} Вт` : ''
-			const ch = chargeText(d, r)
-			const st = r.remMin !== null ? `⏳ ${hhmm(r.remMin)}` : r.gridIn ? `🔌 від мережі${ch ? ` · ${ch}` : ''}` : idle(r) ? '💤 без навантаження' : '⏳ —'
-			return `${socIcon(r.soc)} ${name} <b>${r.soc}%</b>${load}\n<code>${bar(r.soc)}</code> ${st}`
+			// зарядка — окремим рядком, щоб рядок зі шкалою не переносився
+			const ch = r.gridIn ? chargeText(d, r) : ''
+			const st = r.remMin !== null ? `⏳ ${hhmm(r.remMin)}` : r.gridIn ? `🔌 ${r.other && ch ? 'не від мережі' : srcText(r)}` : idle(r) ? '💤 без навантаження' : '⏳ —'
+			return `${socIcon(r.soc)} ${name} <b>${r.soc}%</b>${load}\n<code>${bar(r.soc)}</code> ${st}${ch ? `\n🔋 ${ch}` : ''}`
 		})
 		.join('\n\n')
 
 // Рядок про світло: спершу «з якого часу», потім «скільки вже» — кожне повноцінним реченням
 //   🟢 Світло є з 15:17          🔴 Без світла з 23.10, 13:38
-//   ⏱ вже 7 хв                   ⏱ вже 3 дні, 2 год, 15 хв
-//                                (усього 74 год 15 хв)
+//   ⏱ вже 7хв                    ⏱ вже 3д 2г
+//                                (усього 74г 15хв)
 const gridText = (g: GridState | null, now: number) => {
 	if (!g) return ''
 	const head = g.state === 'ON' ? '🟢 Світло є' : '🔴 Без світла'
 	const since = dayStart(g.since) === dayStart(now) ? clock(g.since) : `${dateLabel(g.since)}, ${clock(g.since)}`
 	const tm = Math.floor((now - g.since) / 60_000)
 	// від доби — ще й загальна кількість годин окремим рядком (в один не влазить по ширині)
-	const total = tm >= 1440 ? `\n(усього ${Math.floor(tm / 60)} год${tm % 60 ? ` ${tm % 60} хв` : ''})` : ''
+	const total = tm >= 1440 ? `\n(усього ${Math.floor(tm / 60)}г${tm % 60 ? ` ${tm % 60}хв` : ''})` : ''
 	return `${head} з ${since}\n⏱ вже ${duration(now - g.since)}${total}`
 }
 
@@ -668,7 +691,7 @@ const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState
 	if (!isOnline) return `⚫️ ${head}\nОфлайн${foot}`
 	if (!r) return `❔ ${head}\nНемає даних${foot}`
 	const time =
-		r.remMin !== null ? `⏳ Залишилось <b>${hhmm(r.remMin)}</b>` : r.gridIn ? `🔌 <b>Від мережі</b>${chargeText(d, r) ? `\n🔋 ${chargeText(d, r)}` : ''}` : idle(r) ? '💤 <b>Без навантаження</b>' : `⏳ Залишилось <b>—</b>`
+		r.remMin !== null ? `⏳ Залишилось <b>${hhmm(r.remMin)}</b>` : r.gridIn ? `🔌 <b>${r.other ? `Вхід +${r.inW ?? 0} Вт` : 'Від мережі'}</b>${chargeText(d, r) ? `\n🔋 ${chargeText(d, r)}` : ''}` : idle(r) ? '💤 <b>Без навантаження</b>' : `⏳ Залишилось <b>—</b>`
 	const load = r.loadW !== null ? `\n⚡ Споживання <b>${r.loadW} Вт</b>` : ''
 	const lim =
 		(r.maxChg !== undefined ? `\n🔝 Ліміт заряду <b>${r.maxChg}%</b>` : '') +
@@ -788,7 +811,7 @@ async function checkDevice(env: Env, dev: Device, isOnline: boolean, r: Reading 
 			if (crossed.length) {
 				const t = Math.min(...crossed)
 				const loud = t === Math.min(...THRESHOLDS)
-				const rem = r.remMin !== null ? `⏳ Залишилось ≈ <b>${hhmm(r.remMin)}</b>` : r.gridIn ? '🔌 Від мережі' : idle(r) ? '💤 Без навантаження' : '⏳ Час невідомий'
+				const rem = r.remMin !== null ? `⏳ Залишилось <b>${hhmm(r.remMin)}</b>` : r.gridIn ? `🔌 ${r.other ? `Вхід +${r.inW ?? 0} Вт` : 'Від мережі'}` : idle(r) ? '💤 Без навантаження' : '⏳ Час невідомий'
 				const load = r.loadW !== null ? `\n⚡ Споживання ${r.loadW} Вт` : ''
 				const custom = dev.messages?.[t] ? `\n💬 <i>${esc(dev.messages[t])}</i>` : ''
 				await telegram(env, `${socIcon(t)} <b>${esc(dev.name)} — ${r.soc}%</b>${custom}\n<code>${bar(r.soc)}</code>\n${rem}${load}`, { loud, forDevice: dev.cmd, replaceKey: `last:thr:${dev.cmd}` })
@@ -890,7 +913,7 @@ const dayStart = (t: number) => {
 }
 const dateLabel = (t: number) => new Date(t).toLocaleDateString('uk-UA', { timeZone: TIMEZONE, day: '2-digit', month: '2-digit' })
 
-// «⏮ Попереднє: 2 год 5 хв (09:10–11:15)»; якщо не сьогодні — з датою
+// «⏮ Попереднє: 2г 5хв (09:10–11:15)»; якщо не сьогодні — з датою
 async function prevOutageLine(env: Env, skipLast = false) {
 	const log = (await env.POWER_KV.get<Outage[]>('outlog', 'json')) ?? []
 	const o = log[log.length - 1 - (skipLast ? 1 : 0)]
@@ -941,13 +964,8 @@ const offBar = (ms: number, span: number) => {
 	const off = ms ? Math.min(6, Math.max(1, Math.round((ms / span) * 6))) : 0
 	return `<code>${'▰'.repeat(6 - off)}${'▱'.repeat(off)}</code>`
 }
-// коротка тривалість для рядків тижня/місяця: «3год 31хв», «45хв», «2д 21год»
-const shortDur = (ms: number) => {
-	const m = Math.round(ms / 60_000)
-	if (m < 60) return `${m}хв`
-	if (m >= 1440) return `${Math.floor(m / 1440)}д${Math.floor((m % 1440) / 60) ? ` ${Math.floor((m % 1440) / 60)}год` : ''}`
-	return `${Math.floor(m / 60)}год${m % 60 ? ` ${m % 60}хв` : ''}`
-}
+// коротка тривалість для рядків тижня/місяця: «3г 31хв», «45хв», «2д 21г» (те саме, що duration)
+const shortDur = duration
 
 async function statsData(env: Env) {
 	const now = Date.now()
@@ -976,7 +994,7 @@ async function statsData(env: Env) {
 		if (span <= 0) return ['<i>немає даних</i>']
 		if (!o.ms) return ['Без відключень ✨']
 		// кожен показник — окремим рядком
-		// від доби — коротко («4д 14год»), інакше рядок не влазить по ширині екрана
+		// від доби — коротко («4д 14г»), інакше рядок не влазить по ширині екрана
 		const fit = (ms: number) => (ms >= 86400_000 ? shortDur(ms) : duration(ms))
 		const offPct = Math.min(100, Math.max(0, Math.round((o.ms / span) * 100)))
 		const lines = [
@@ -1450,10 +1468,12 @@ async function run(env: Env) {
 		}
 	}
 	const event = await checkGrid(env, readings, online).catch((e) => (console.error('grid', e), null))
+	// світло могло щойно змінитися — підписи станцій узгоджуємо з новим станом (до пінів і знімка)
+	if (event) await applyLight(env, readings).catch((e) => console.error('applyLight', e))
 	await runAutomations(env, readings, online, event).catch((e) => console.error('automations', e))
 	await updatePins(env, readings, online).catch((e) => console.error('pins', e))
 	await cleanupExpired(env).catch((e) => console.error('cleanup', e))
-	await saveSnapshot(env, readings, online).catch((e) => console.error('snapshot', e))
+	await saveSnapshot(env, readings, online, !!event).catch((e) => console.error('snapshot', e))
 }
 
 // ── Знімок станцій для віджета ──────────────────────────────────
@@ -1463,11 +1483,11 @@ async function run(env: Env) {
 //   • змінився заряд — не частіше ніж раз на 5 хв (при швидкій зарядці % росте щохвилини);
 //   • інакше — раз на 15 хв (час роботи, навантаження).
 // «Від мережі» на запис не впливає: у River 3 воно мерехтить від пакета до пакета.
-interface SnapStation { soc: number | null; remMin: number | null; fromGrid: boolean | null; loadW: number | null; inW?: number | null; online: boolean; at: number }
+interface SnapStation { soc: number | null; remMin: number | null; fromGrid: boolean | null; loadW: number | null; inW?: number | null; other?: boolean; online: boolean; at: number }
 const SNAP_REFRESH_MS = 15 * 60_000
 const SNAP_SOC_GAP_MS = 5 * 60_000
 const SNAP_SOC_GAP_CHARGING_MS = 60_000 // при зарядці % росте швидко (до ~2%/хв) — оновлюємо щохвилини
-async function saveSnapshot(env: Env, readings: Map<string, Reading>, online: Map<string, boolean>) {
+async function saveSnapshot(env: Env, readings: Map<string, Reading>, online: Map<string, boolean>, lightChanged = false) {
 	const prev = (await env.POWER_KV.get<Record<string, SnapStation>>('snap', 'json')) ?? {}
 	const now = Date.now()
 	// час останнього запису = найсвіжіший `at` (станція без показань зберігає свій старий `at` і запис не провокує)
@@ -1483,12 +1503,13 @@ async function saveSnapshot(env: Env, readings: Map<string, Reading>, online: Ma
 		if (!p || p.online !== on) onlineChanged = true
 		if (r && p && p.soc !== r.soc) socChanged = true
 		next[d.cmd] = r
-			? { soc: r.soc, remMin: r.remMin ?? null, fromGrid: r.gridIn ?? null, loadW: r.loadW ?? null, inW: r.inW ?? null, online: on, at: now }
+			? { soc: r.soc, remMin: r.remMin ?? null, fromGrid: r.gridIn ?? null, loadW: r.loadW ?? null, inW: r.inW ?? null, other: !!r.other, online: on, at: now }
 			: { ...(p ?? { soc: null, remMin: null, fromGrid: null, loadW: null, at: now }), online: on }
 	}
 	const charging = [...readings.values()].some((r) => (r.inW ?? 0) > 10 || r.batt === 'in')
 	const gap = charging ? SNAP_SOC_GAP_CHARGING_MS : SNAP_SOC_GAP_MS
-	const write = onlineChanged || (socChanged && sinceWrite >= gap) || sinceWrite >= SNAP_REFRESH_MS
+	// світло змінилося — підписи «від мережі» в знімку теж, пишемо одразу
+	const write = lightChanged || onlineChanged || (socChanged && sinceWrite >= gap) || sinceWrite >= SNAP_REFRESH_MS
 	if (write) await env.POWER_KV.put('snap', JSON.stringify(next))
 }
 
@@ -1497,11 +1518,11 @@ async function saveSnapshot(env: Env, readings: Map<string, Reading>, online: Ma
 // Якщо знімка немає або cron давно не оновлював станцію — читаємо наживо.
 const SNAP_MAX_AGE_MS = 30 * 60_000
 // Станція для віджета: + «до 100%» (хв) з ємності батареї та чистої потужності заряду
-function widgetStation(d: Device, s: { online: boolean; soc: number | null; remMin: number | null; fromGrid: boolean | null; loadW: number | null; inW?: number | null }) {
+function widgetStation(d: Device, s: { online: boolean; soc: number | null; remMin: number | null; fromGrid: boolean | null; loadW: number | null; inW?: number | null; other?: boolean }) {
 	const inW = s.inW ?? null
 	const net = inW !== null ? inW - (s.loadW ?? 0) : 0
 	const fullMin = d.capWh && s.soc !== null && s.soc < 100 && net > 10 ? Math.round((((100 - s.soc) / 100) * d.capWh * 60) / net) : null
-	return { cmd: d.cmd, name: d.name, online: s.online, soc: s.soc, remMin: s.remMin, fromGrid: s.fromGrid, loadW: s.loadW, inW, fullMin }
+	return { cmd: d.cmd, name: d.name, online: s.online, soc: s.soc, remMin: s.remMin, fromGrid: s.fromGrid, loadW: s.loadW, inW, fullMin, other: !!s.other }
 }
 // Сьогодні по годинах (1 — світло було, 0 — не було ≥ 30 хв, null — ще не настала), сумарно без світла і кількість відключень
 async function widgetDay(env: Env, g: GridState | null, now: number) {
@@ -1562,7 +1583,7 @@ async function widgetData(env: Env, url: URL): Promise<Response> {
 	const { online, readings } = all
 	const stations = DEVICES.map((d) => {
 		const r = readings.get(d.sn)
-		return widgetStation(d, { online: !!online.get(d.sn), soc: r?.soc ?? null, remMin: r?.remMin ?? null, fromGrid: r?.gridIn ?? null, loadW: r?.loadW ?? null, inW: r?.inW ?? null })
+		return widgetStation(d, { online: !!online.get(d.sn), soc: r?.soc ?? null, remMin: r?.remMin ?? null, fromGrid: r?.gridIn ?? null, loadW: r?.loadW ?? null, inW: r?.inW ?? null, other: !!r?.other })
 	})
 	return Response.json({ at: now, light, stations, groups, day }, { headers })
 }
