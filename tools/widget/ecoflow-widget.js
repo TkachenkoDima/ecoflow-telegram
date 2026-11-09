@@ -33,19 +33,22 @@ function since(ms, short) {
   if (short) return `${h}:${pad(mm)}`
   return h ? `${h}г${mm ? ` ${mm}хв` : ''}` : `${mm}хв`
 }
-const status = (l, now, short) => (!l ? 'СВІТЛО: —' : `${l.on ? 'СВІТЛО Є' : 'БЕЗ СВІТЛА'} · ${since(now - l.since, short)}`)
+const status = (l, now, short) => (!l ? 'СВІТЛО: —' : `${l.on ? 'СВІТЛО Є' : 'БЕЗ СВІТЛА'} · ${now - l.since < 60000 ? 'щойно' : since(now - l.since, short)}`)
 const plural = (n) => (n % 10 === 1 && n % 100 !== 11 ? 'відключення' : [2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100) ? 'відключення' : 'відключень')
-const charging = (s) => (s.inW ?? 0) > 10 && s.fromGrid !== false && (s.soc ?? 100) < 100
+// ціль заряду — ліміт станції (toPct), зазвичай 100%
+const charging = (s) => (s.inW ?? 0) > 10 && s.fromGrid !== false && (s.soc ?? 100) < (s.toPct ?? 100)
+// заголовок над головним рядком (середній і великий віджет)
+const head = (s, ch) => (ch ? `ДО ${s.toPct ?? 100}%` : !s.online || s.staleAt || s.soc === null ? 'СТАН' : s.remMin !== null ? 'ВИСТАЧИТЬ НА' : s.fromGrid ? 'ЖИВЛЕННЯ' : 'СТАН')
 // два рядки під станцією: головне (вистачить / до 100%) і другорядне (споживання / заряд)
 function lines(s) {
   if (s.staleAt) return [`дані о ${clock(s.staleAt)}`, s.loadW !== null ? `споживання ${s.loadW} Вт` : '']
   if (!s.online) return ['офлайн', '']
   if (s.soc === null) return ['немає даних', '']
   const use = s.loadW !== null && s.loadW !== undefined ? `споживання ${s.loadW} Вт` : ''
-  if (charging(s)) return [s.fullMin ? `до 100% ~${human(s.fullMin)}` : 'заряджається', `${s.other ? 'вхід' : 'заряд'} +${s.inW} Вт`]
+  if (charging(s)) return [s.fullMin ? `до ${s.toPct ?? 100}% ~${human(s.fullMin)}` : 'заряджається', `${s.other ? 'вхід' : 'заряд'} +${s.inW} Вт`]
   if (s.remMin !== null) return [`вистачить ~${human(s.remMin)}`, use]
   // світла немає, а вхід є — це не мережа (інша станція / сонце)
-  if (s.fromGrid) return [s.other ? `вхід +${s.inW ?? 0} Вт` : s.soc >= 99 ? 'заряджена' : 'від мережі', use]
+  if (s.fromGrid) return [s.other ? `вхід +${s.inW ?? 0} Вт` : s.soc >= (s.toPct ?? 100) - 1 ? 'заряджена' : 'від мережі', use]
   // не заряджається й нічого не живить
   if (!s.loadW) return ['без навантаження', '']
   return ['—', use]
@@ -143,8 +146,8 @@ function medium(w, d, s) {
   txt(L, status(d.light, Date.now(), false), 11, d.light?.on ? C.on : C.off, 'bold'); L.addSpacer(4)
   const ch = charging(s), [l1, l2] = lines(s)
   // підпис, значення і другорядне — окремими рядками, щоб нічого не переносилось
-  txt(L, ch ? 'ДО 100%' : 'ВИСТАЧИТЬ НА', 8.5, C.dim, 'bold')
-  txt(L, l1.replace('вистачить ', '').replace('до 100% ', ''), 18, C.text, 'bold')
+  txt(L, head(s, ch), 8.5, C.dim, 'bold')
+  txt(L, l1.replace('вистачить ', '').replace(/^до \d+% /, ''), 18, C.text, 'bold')
   if (l2) txt(L, l2, 11, C.dim)
   // роздільник
   const sep = row.addStack(); sep.size = new Size(1, 0); sep.backgroundColor = C.divider; sep.layoutVertically(); sep.addSpacer()
@@ -169,8 +172,8 @@ function large(w, d, s) {
   const big = w.addStack(); big.bottomAlignContent()
   txt(big, s.soc === null ? '—' : `${s.soc}%`, 64, C.text, 'heavy'); big.addSpacer()
   const k = big.addStack(); k.layoutVertically()
-  const kl = k.addStack(); kl.addSpacer(); txt(kl, ch ? 'ДО 100%' : 'ВИСТАЧИТЬ НА', 7.5, C.dim, 'bold')
-  const kv = k.addStack(); kv.addSpacer(); txt(kv, l1.replace('вистачить ', '').replace('до 100% ', ''), 19, C.text, 'bold')
+  const kl = k.addStack(); kl.addSpacer(); txt(kl, head(s, ch), 7.5, C.dim, 'bold')
+  const kv = k.addStack(); kv.addSpacer(); txt(kv, l1.replace('вистачить ', '').replace(/^до \d+% /, ''), 19, C.text, 'bold')
   k.addSpacer(5)
   w.addSpacer(4); txt(w, status(d.light, Date.now(), false), 9, d.light?.on ? C.on : C.off, 'bold')
   w.addSpacer(7); img(w, hoursBar(d.day?.hours, 328, 7), 328, 7); w.addSpacer(3); hourLabels(w, 7)
@@ -218,7 +221,7 @@ function withCache(d) {
   const fm = FileManager.local(), path = fm.joinPath(fm.cacheDirectory(), 'ecoflow-widget.json')
   let cache = {}
   try { if (fm.fileExists(path)) cache = JSON.parse(fm.readString(path)) } catch {}
-  const keys = ['soc', 'remMin', 'fromGrid', 'loadW', 'inW', 'fullMin', 'other']
+  const keys = ['soc', 'remMin', 'fromGrid', 'loadW', 'inW', 'fullMin', 'toPct', 'other']
   for (const s of d.stations) {
     const c = cache[s.cmd]
     if (s.soc !== null) cache[s.cmd] = { ...Object.fromEntries(keys.map((x) => [x, s[x] ?? null])), at: d.at }
@@ -259,9 +262,18 @@ async function settings() {
   saveSet(set)
 }
 
+// коли просити iOS оновити віджет: вдень — через 5 хв, уночі (00–07) — через 30 хв, але не пізніше 07:00
+// (точний момент вирішує iOS; ніч економить її денний «бюджет» оновлень)
+function nextRefresh() {
+  const now = new Date(), t = now.getTime()
+  if (now.getHours() >= 7) return new Date(t + 5 * 60 * 1000)
+  const morning = new Date(now); morning.setHours(7, 0, 0, 0)
+  return new Date(Math.min(t + 30 * 60 * 1000, morning.getTime()))
+}
+
 async function main(famOverride) {
   const fam = famOverride ?? config.widgetFamily ?? 'medium'
-  const w = new ListWidget(); w.refreshAfterDate = new Date(Date.now() + 10 * 60 * 1000)
+  const w = new ListWidget(); w.refreshAfterDate = nextRefresh()
   const acc = fam.startsWith('accessory')
   if (!acc) w.backgroundColor = C.bg
   let d
