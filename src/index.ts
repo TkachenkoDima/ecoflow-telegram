@@ -650,7 +650,7 @@ const srcText = (r: Reading) => (r.other ? `вхід +${r.inW ?? 0} Вт` : 'в�
 // • Станцію веде автоматизація входу (Маринка: 2 кВт → 1 кВт після 80% → 500 Вт після 90%) — рахуємо по порогах:
 //   застосунок EcoFlow про них не знає, тож його прогноз на старті оптимістичніший.
 // • Без автоматизацій — прогноз самої станції (cmsChgRemTime у DELTA), якщо він є.
-// • Інакше оцінка: до батареї доходить ~90% чистої потужності (вхід − споживання), після 90% — удвічі повільніше.
+// • Інакше оцінка: до батареї доходить ~90% чистої потужності (вхід − споживання). River бере ~300 Вт до самого кінця — без сповільнення.
 type ChargeIn = { soc: number | null; inW?: number | null; loadW?: number | null; chgRem?: number; maxChg?: number; auto?: boolean; other?: boolean }
 const chargeTo = (s: ChargeIn) => Math.min(100, s.maxChg ?? 100)
 function toFull(d: Device, s: ChargeIn) {
@@ -664,7 +664,7 @@ function toFull(d: Device, s: ChargeIn) {
 	let min = 0
 	for (let p = Math.floor(s.soc); p < to; p++) {
 		const rule = rules.find((x) => (x.socAtLeast ?? 0) <= p && p <= (x.socAtMost ?? 100))
-		const net = (((rule ? Math.min(inW, rule.set.acMax!) : inW) - load) * 0.9) / (!rules.length && p >= 90 ? 2 : 1)
+		const net = ((rule ? Math.min(inW, rule.set.acMax!) : inW) - load) * 0.9
 		if (net <= 10) return null
 		min += (d.capWh / 100 / net) * 60
 	}
