@@ -46,6 +46,8 @@ function lines(s) {
   if (s.soc === null) return ['немає даних', '']
   const use = s.loadW !== null && s.loadW !== undefined ? `споживання ${s.loadW} Вт` : ''
   if (charging(s)) return [s.fullMin ? `до ${s.toPct ?? 100}% ~${human(s.fullMin)}` : 'заряджається', `${s.other ? 'вхід' : 'заряд'} +${s.inW} Вт`]
+  // світло щойно з'явилось, а хмара EcoFlow (Маринка) ще не бачить зарядки
+  if (s.lag && s.fromGrid) return ['заряджається', use]
   if (s.remMin !== null) return [`вистачить ~${human(s.remMin)}`, use]
   // світла немає, а вхід є — це не мережа (інша станція / сонце)
   if (s.fromGrid) return [s.other ? `вхід +${s.inW ?? 0} Вт` : s.soc >= (s.toPct ?? 100) - 1 ? 'заряджена' : 'від мережі', use]
@@ -221,7 +223,7 @@ function withCache(d) {
   const fm = FileManager.local(), path = fm.joinPath(fm.cacheDirectory(), 'ecoflow-widget.json')
   let cache = {}
   try { if (fm.fileExists(path)) cache = JSON.parse(fm.readString(path)) } catch {}
-  const keys = ['soc', 'remMin', 'fromGrid', 'loadW', 'inW', 'fullMin', 'toPct', 'other']
+  const keys = ['soc', 'remMin', 'fromGrid', 'loadW', 'inW', 'fullMin', 'toPct', 'other', 'lag']
   for (const s of d.stations) {
     const c = cache[s.cmd]
     if (s.soc !== null) cache[s.cmd] = { ...Object.fromEntries(keys.map((x) => [x, s[x] ?? null])), at: d.at }
