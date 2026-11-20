@@ -9,6 +9,7 @@ export type Device = {
 	cmd: string // команда бота латиницею, напр. 'kate' → /kate
 	messages?: Record<number, string> // необов'язково: свій текст для порогу, напр. { 10: 'Я сідаю!' }
 	capWh?: number // ємність батареї, Вт·год — для віджета «до 100% ~N хв» (необов'язково)
+	packs?: number // скільки батарей (станція + додаткові) — показувати заряд кожної окремо (DELTA шле їх по MQTT)
 }
 
 export const DEVICES: Device[] = [
@@ -18,6 +19,7 @@ export const DEVICES: Device[] = [
 		via: 'rest',
 		cmd: 'marinka',
 		capWh: 4096, // DELTA 3 Max Plus 2048 + додаткова батарея 2048 (cmsBattSoc — загальний % обох)
+		packs: 2, // станція + додаткова батарея
 		messages: {
 			50: 'Половина, можно жить',
 			25: 'Пора закругляться',

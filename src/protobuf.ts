@@ -60,6 +60,7 @@ const num = (m: Fields, fn: number): number | undefined => {
 // Часткові дані однієї UPS з одного MQTT-повідомлення
 export type UpsPart = {
 	soc?: number // %, BMS heartbeat (32/50) поле 25 (float) або 6
+	packs?: Record<number, number> // заряд кожної батареї: BMS 32/50 поле 1 — номер (0 — станція, 1 — додаткова), значення — %
 	remMin?: number // хв, BMS 32/50 поле 28
 	battInW?: number // BMS 32/50 поле 26
 	battOutW?: number // BMS 32/50 поле 27
@@ -100,6 +101,7 @@ export function parseEcoflowPacket(payload: Uint8Array): UpsPart {
 		}
 		if (cmdFunc === 32 && cmdId === 50) {
 			part.soc = num(m, 25) ?? num(m, 6)
+			if (part.soc !== undefined) part.packs = { [num(m, 1) ?? 0]: part.soc }
 			part.battInW = num(m, 26)
 			part.battOutW = num(m, 27)
 			part.remMin = num(m, 28)

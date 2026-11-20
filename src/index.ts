@@ -34,7 +34,7 @@ function initDevices(env: Env) {
 }
 
 // grid — «свідчення» станції про світло: ON — є струм на вході, OFF — входу немає і батарея розряджається, null — не знає
-type Reading = { soc: number; remMin: number | null; loadW: number | null; inW?: number | null; gridIn: boolean | null; batt?: 'in' | 'out' | 'idle'; via?: 'rest' | 'mqtt'; other?: boolean; dsgRem?: number; chgRem?: number; auto?: boolean; lag?: boolean; raw?: { gridIn: boolean | null; inW: number | null; remMin: number | null }; grid?: 'ON' | 'OFF' | null; maxChg?: number; acMax?: number; minDsg?: number }
+type Reading = { soc: number; remMin: number | null; loadW: number | null; inW?: number | null; gridIn: boolean | null; batt?: 'in' | 'out' | 'idle'; via?: 'rest' | 'mqtt'; other?: boolean; dsgRem?: number; chgRem?: number; auto?: boolean; lag?: boolean; packs?: number[]; raw?: { gridIn: boolean | null; inW: number | null; remMin: number | null }; grid?: 'ON' | 'OFF' | null; maxChg?: number; acMax?: number; minDsg?: number }
 type DeviceState = { notified: number[]; offlineSince: number | null; offlineAlerted: boolean }
 type GridState = { state: 'ON' | 'OFF'; since: number }
 
@@ -264,18 +264,21 @@ async function saveSettings(sn: string, upd: { maxChg?: number; acMax?: number; 
 async function readMqtt(
 	env: Env,
 	sns: string[],
-	o: { settingsFor?: string[]; restSettings?: string[]; needInput?: string[]; timeoutMs?: number } = {},
+	o: { settingsFor?: string[]; restSettings?: string[]; packsFor?: string[]; needInput?: string[]; timeoutMs?: number } = {},
 ): Promise<{ result: Map<string, Reading>; parts: Map<string, UpsPart> }> {
 	const result = new Map<string, Reading>()
 	const settingsFor = new Set(o.settingsFor ?? [])
 	const restOnly = o.restSettings ?? []
-	const all = [...sns, ...restOnly]
+	// REST-станції з дод. батареями: з MQTT беремо лише заряд кожної батареї (BMS 32/50)
+	const packsFor = (o.packsFor ?? []).filter((sn) => !sns.includes(sn) && !restOnly.includes(sn))
+	const all = [...sns, ...restOnly, ...packsFor]
 	if (!all.length) return { result, parts: new Map() }
 	const a = await appAuth(env)
 	const parts = new Map<string, UpsPart>(all.map((sn) => [sn, {}]))
 	const ready = (sn: string) => {
 		const p = parts.get(sn)!
 		if (restOnly.includes(sn)) return p.acMax !== undefined
+		if (packsFor.includes(sn)) return Object.keys(p.packs ?? {}).length >= (DEVICES.find((d) => d.sn === sn)?.packs ?? 1)
 		if (p.soc === undefined) return false
 		if (o.needInput?.includes(sn) && p.inSumW === undefined) return false // датчик світла: потрібен вхід з мережі
 		// заряджається, а пакета 254/21 (вхід і споживання) ще не було — чекаємо його (до MQTT_WAIT_MS):
@@ -303,7 +306,11 @@ async function readMqtt(
 				const sn = all.find((s) => topic.endsWith(s))
 				if (!sn) return false
 				try {
-					Object.assign(parts.get(sn)!, parseEcoflowPacket(payload))
+					const part = parseEcoflowPacket(payload)
+					const cur = parts.get(sn)!
+					// кожна батарея шле свій пакет — збираємо всі, а не лише останню
+					if (part.packs) part.packs = { ...cur.packs, ...part.packs }
+					Object.assign(cur, part)
 				} catch (e) {
 					console.warn('parse', sn, e)
 				}
@@ -318,7 +325,7 @@ async function readMqtt(
 	// усе, що побачили з налаштувань, — у кеш
 	await Promise.all([...parts].map(([sn, p]) => saveSettings(sn, { maxChg: restOnly.includes(sn) ? undefined : p.maxChg, acMax: p.acMax, minDsg: restOnly.includes(sn) ? undefined : p.minDsg }).catch((e) => console.error('settings', sn, e))))
 	for (const [sn, p] of parts) {
-		if (p.soc === undefined || restOnly.includes(sn)) continue
+		if (p.soc === undefined || restOnly.includes(sn) || packsFor.includes(sn)) continue
 		const discharging = (p.battOutW ?? 0) > 5 && (p.battInW ?? 0) === 0
 		// «від мережі»: вхід відомий (пакет 254/21) — він і є правдою; інакше заряджається → так,
 		// а розряджається / нічого не робить — вирішуємо після за станом світла (див. readAll)
@@ -446,9 +453,12 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, 
 			// REST-станції (DELTA 3) не шлють налаштування в MQTT-телеметрії — не чекаємо їх;
 			// їхній «макс. вхід» запам'ятовується, коли його виставляють кнопкою з «Керування»
 			const restSet: string[] = []
+			// заряд кожної батареї REST-станції з дод. батареєю (Маринка) — по MQTT; список «офлайн» тут не заважає
+			const packsFor = devices.filter((d) => d.via === 'rest' && (d.packs ?? 1) > 1).map((d) => d.sn)
 			const { result: r, parts } = await readMqtt(env, want.map((d) => d.sn), {
 				settingsFor,
 				restSettings: restSet,
+				packsFor,
 				// cron: від датчика світла чекаємо й пакет із входом з мережі
 				timeoutMs: refresh && (settingsFor.length || restSet.length) ? 25_000 : MQTT_WAIT_MS,
 			})
@@ -459,6 +469,18 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, 
 				const ac = parts.get(sn)?.acMax
 				const rd = readings.get(sn)
 				if (rd && ac !== undefined) rd.acMax = ac
+			}
+			// заряд кожної батареї; загальний % — їхнє середнє (батареї однакові): так він живий і збігається з розбивкою,
+			// а не відстає, як хмара
+			for (const sn of packsFor) {
+				const rd = readings.get(sn)
+				const p = parts.get(sn)?.packs
+				const n = DEVICES.find((d) => d.sn === sn)?.packs ?? 1
+				if (!rd || !p) continue
+				const list = Array.from({ length: n }, (_, i) => p[i])
+				if (list.some((x) => x === undefined)) continue
+				rd.packs = list.map((x) => Math.round(x!))
+				rd.soc = Math.round(list.reduce((a, x) => a + x!, 0) / n)
 			}
 			const missing = want.filter((d) => !r.has(d.sn)).map((d) => d.name)
 			if (missing.length) errors.push(`${missing.join(', ')}: станція не надіслала дані за ${MQTT_WAIT_MS / 1000} с`)
@@ -701,6 +723,13 @@ const chargeText = (d: Device, r: Reading) => {
 	const full = toFull(d, r)
 	return `${r.other ? 'вхід' : 'заряд'} +${inW} Вт${full ? ` · до ${to}% ${hhmm(full)}` : ''}`
 }
+// Заряд кожної батареї: «станція 83% · батарея 28%» (дод. батарей кілька — «батарея 1 … · батарея 2 …»)
+const packsText = (r: { packs?: number[] | null }) => {
+	const p = r.packs
+	if (!p || p.length < 2) return ''
+	const extra = p.slice(1)
+	return [`станція ${p[0]}%`, ...extra.map((x, i) => `батарея${extra.length > 1 ? ` ${i + 1}` : ''} ${x}%`)].join(' · ')
+}
 const stateLine = (r: Reading) => {
 	const load = r.loadW ? ` · ⚡ ${r.loadW} Вт` : ''
 	return r.remMin !== null ? `⏳ ${hhmm(r.remMin)}${load}` : r.gridIn ? `🔌 ${srcText(r)}${load}` : idle(r) ? '💤 без навантаження' : `⏳ —${load}`
@@ -719,7 +748,8 @@ const table = (devices: Device[], readings: Map<string, Reading>, online: Map<st
 			// зарядка — окремим рядком, щоб рядок зі шкалою не переносився
 			const ch = r.gridIn ? chargeText(d, r) : ''
 			const st = r.remMin !== null ? `⏳ ${hhmm(r.remMin)}` : r.gridIn ? `🔌 ${r.other && ch ? 'не від мережі' : srcText(r)}` : idle(r) ? '💤 без навантаження' : '⏳ —'
-			return `${socIcon(r.soc)} ${name} <b>${r.soc}%</b>${load}\n<code>${bar(r.soc)}</code> ${st}${ch ? `\n🔋 ${ch}` : ''}`
+			const pk = packsText(r)
+			return `${socIcon(r.soc)} ${name} <b>${r.soc}%</b>${load}\n<code>${bar(r.soc)}</code> ${st}${pk ? `\n<i>${pk}</i>` : ''}${ch ? `\n🔋 ${ch}` : ''}`
 		})
 		.join('\n\n')
 
@@ -752,7 +782,8 @@ const card = (d: Device, r: Reading | undefined, isOnline: boolean, g: GridState
 		(r.maxChg !== undefined ? `\n🔝 Ліміт заряду <b>${r.maxChg}%</b>` : '') +
 		(r.acMax !== undefined ? `\n${mode || '🔌'} Макс. вхід <b>${r.acMax} Вт</b>` : '') +
 		(r.minDsg !== undefined ? `\n🔻 Мін. розряд <b>${r.minDsg}%</b>` : '')
-	return `${socIcon(r.soc)} ${head}\n<code>${bar(r.soc)}</code> <b>${r.soc}%</b>\n${time}${load}${lim}${foot}`
+	const pk = packsText(r)
+	return `${socIcon(r.soc)} ${head}\n<code>${bar(r.soc)}</code> <b>${r.soc}%</b>${pk ? `\n<i>${pk}</i>` : ''}\n${time}${load}${lim}${foot}`
 }
 
 // Чи діє правило зараз (за зарядом і світлом); правила «on: подія» — лише в момент події
@@ -1538,7 +1569,7 @@ async function run(env: Env) {
 //   • змінився заряд — не частіше ніж раз на 5 хв (при швидкій зарядці % росте щохвилини);
 //   • інакше — раз на 15 хв (час роботи, навантаження).
 // «Від мережі» на запис не впливає: у River 3 воно мерехтить від пакета до пакета.
-interface SnapStation { soc: number | null; remMin: number | null; fromGrid: boolean | null; loadW: number | null; inW?: number | null; fullMin?: number | null; toPct?: number; other?: boolean; lag?: boolean; online: boolean; at: number; chg?: number } // chg — коли востаннє змінились заряд/навантаження
+interface SnapStation { soc: number | null; remMin: number | null; fromGrid: boolean | null; loadW: number | null; inW?: number | null; fullMin?: number | null; toPct?: number; other?: boolean; lag?: boolean; packs?: number[]; online: boolean; at: number; chg?: number } // chg — коли востаннє змінились заряд/навантаження
 const SNAP_REFRESH_MS = 15 * 60_000
 const SNAP_SOC_GAP_MS = 5 * 60_000
 const SNAP_SOC_GAP_CHARGING_MS = 60_000 // при зарядці % росте швидко (до ~2%/хв) — оновлюємо щохвилини
@@ -1558,7 +1589,7 @@ async function saveSnapshot(env: Env, readings: Map<string, Reading>, online: Ma
 		if (!p || p.online !== on) onlineChanged = true
 		if (r && p && p.soc !== r.soc) socChanged = true
 		next[d.cmd] = r
-			? { soc: r.soc, remMin: r.remMin ?? null, fromGrid: r.gridIn ?? null, loadW: r.loadW ?? null, inW: r.inW ?? null, fullMin: toFull(d, r), toPct: chargeTo(r), other: !!r.other, lag: !!r.lag, online: on, at: now, chg: !p || p.soc !== r.soc || p.loadW !== (r.loadW ?? null) ? now : (p.chg ?? now) }
+			? { soc: r.soc, remMin: r.remMin ?? null, fromGrid: r.gridIn ?? null, loadW: r.loadW ?? null, inW: r.inW ?? null, fullMin: toFull(d, r), toPct: chargeTo(r), other: !!r.other, lag: !!r.lag, packs: r.packs, online: on, at: now, chg: !p || p.soc !== r.soc || p.loadW !== (r.loadW ?? null) ? now : (p.chg ?? now) }
 			: { ...(p ?? { soc: null, remMin: null, fromGrid: null, loadW: null, at: now }), online: on }
 	}
 	const charging = [...readings.values()].some((r) => (r.inW ?? 0) > 10 || r.batt === 'in')
@@ -1573,8 +1604,8 @@ async function saveSnapshot(env: Env, readings: Map<string, Reading>, online: Ma
 // Якщо знімка немає або cron давно не оновлював станцію — читаємо наживо.
 const SNAP_MAX_AGE_MS = 30 * 60_000
 // Станція для віджета: «до N%» — та сама оцінка, що в боті (toFull), порахована при записі знімка
-function widgetStation(d: Device, s: { online: boolean; soc: number | null; remMin: number | null; fromGrid: boolean | null; loadW: number | null; inW?: number | null; fullMin?: number | null; toPct?: number; other?: boolean; lag?: boolean }) {
-	return { cmd: d.cmd, name: d.name, online: s.online, soc: s.soc, remMin: s.remMin, fromGrid: s.fromGrid, loadW: s.loadW, inW: s.inW ?? null, fullMin: s.fullMin ?? null, toPct: s.toPct ?? 100, other: !!s.other, lag: !!s.lag }
+function widgetStation(d: Device, s: { online: boolean; soc: number | null; remMin: number | null; fromGrid: boolean | null; loadW: number | null; inW?: number | null; fullMin?: number | null; toPct?: number; other?: boolean; lag?: boolean; packs?: number[] }) {
+	return { cmd: d.cmd, name: d.name, online: s.online, soc: s.soc, remMin: s.remMin, fromGrid: s.fromGrid, loadW: s.loadW, inW: s.inW ?? null, fullMin: s.fullMin ?? null, toPct: s.toPct ?? 100, other: !!s.other, lag: !!s.lag, packs: s.packs ?? null }
 }
 // Сьогодні по годинах (1 — світло було, 0 — не було ≥ 30 хв, null — ще не настала), сумарно без світла і кількість відключень
 async function widgetDay(env: Env, g: GridState | null, now: number) {
@@ -1635,7 +1666,7 @@ async function widgetData(env: Env, url: URL): Promise<Response> {
 	const { online, readings } = all
 	const stations = DEVICES.map((d) => {
 		const r = readings.get(d.sn)
-		return widgetStation(d, { online: !!online.get(d.sn), soc: r?.soc ?? null, remMin: r?.remMin ?? null, fromGrid: r?.gridIn ?? null, loadW: r?.loadW ?? null, inW: r?.inW ?? null, fullMin: r ? toFull(d, r) : null, toPct: r ? chargeTo(r) : 100, other: !!r?.other, lag: !!r?.lag })
+		return widgetStation(d, { online: !!online.get(d.sn), soc: r?.soc ?? null, remMin: r?.remMin ?? null, fromGrid: r?.gridIn ?? null, loadW: r?.loadW ?? null, inW: r?.inW ?? null, fullMin: r ? toFull(d, r) : null, toPct: r ? chargeTo(r) : 100, other: !!r?.other, lag: !!r?.lag, packs: r?.packs })
 	})
 	return Response.json({ at: now, light, stations, groups, day }, { headers })
 }

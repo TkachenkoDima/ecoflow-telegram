@@ -34,6 +34,8 @@ function since(ms, short) {
   return h ? `${h}г${mm ? ` ${mm}хв` : ''}` : `${mm}хв`
 }
 const status = (l, now, short) => (!l ? 'СВІТЛО: —' : `${l.on ? 'СВІТЛО Є' : 'БЕЗ СВІТЛА'} · ${now - l.since < 60000 ? 'щойно' : since(now - l.since, short)}`)
+// заряд кожної батареї (станція + дод. батарея): «станція 83% · батарея 28%»
+const packsText = (s) => (s.packs && s.packs.length > 1 ? [`станція ${s.packs[0]}%`, ...s.packs.slice(1).map((x, i, a) => `батарея${a.length > 1 ? ' ' + (i + 1) : ''} ${x}%`)].join(' · ') : '')
 const plural = (n) => (n % 10 === 1 && n % 100 !== 11 ? 'відключення' : [2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100) ? 'відключення' : 'відключень')
 // ціль заряду — ліміт станції (toPct), зазвичай 100%
 const charging = (s) => (s.inW ?? 0) > 10 && s.fromGrid !== false && (s.soc ?? 100) < (s.toPct ?? 100)
@@ -127,6 +129,7 @@ function small(w, d, s) {
   // % — по центру вільного місця праворуч від батарейки
   img(b, battery(s.soc, 50, 28), 50 + 4 + 2, 28); b.addSpacer(4); b.addSpacer()
   txt(b, s.soc === null ? '—' : `${s.soc}%`, 30, C.text, 'heavy'); b.addSpacer()
+  const pk = packsText(s); if (pk) { w.addSpacer(3); txt(w, pk, 10, C.faint) }
   w.addSpacer()
   const [l1, l2] = lines(s)
   // час оновлення — у шапці після блискавки: статус («152 д 23 г») і «споживання 120 Вт» займають усю ширину
@@ -143,7 +146,10 @@ function medium(w, d, s) {
   // ліворуч — головна станція (без смужки годин: текст крупніше)
   const L = row.addStack(); L.layoutVertically(); L.size = new Size(176, 0)
   nameRow(L, s, 18, 26, !!d.light?.on, true)
-  L.addSpacer(2); txt(L, s.soc === null ? '—' : `${s.soc}%`, 50, C.text, 'heavy')
+  // з розбивкою по батареях % трохи менший — щоб додатковий рядок влазив по висоті
+  const pk = packsText(s)
+  L.addSpacer(2); txt(L, s.soc === null ? '—' : `${s.soc}%`, pk ? 43 : 50, C.text, 'heavy')
+  if (pk) txt(L, pk, 9.5, C.dim)
   L.addSpacer()
   txt(L, status(d.light, Date.now(), false), 11, d.light?.on ? C.on : C.off, 'bold'); L.addSpacer(4)
   const ch = charging(s), [l1, l2] = lines(s)
@@ -177,6 +183,7 @@ function large(w, d, s) {
   const kl = k.addStack(); kl.addSpacer(); txt(kl, head(s, ch), 7.5, C.dim, 'bold')
   const kv = k.addStack(); kv.addSpacer(); txt(kv, l1.replace('вистачить ', '').replace(/^до \d+% /, ''), 19, C.text, 'bold')
   k.addSpacer(5)
+  const pk = packsText(s); if (pk) { w.addSpacer(2); txt(w, pk, 9.5, C.dim) }
   w.addSpacer(4); txt(w, status(d.light, Date.now(), false), 9, d.light?.on ? C.on : C.off, 'bold')
   w.addSpacer(7); img(w, hoursBar(d.day?.hours, 328, 7), 328, 7); w.addSpacer(3); hourLabels(w, 7)
   w.addSpacer()
@@ -223,7 +230,7 @@ function withCache(d) {
   const fm = FileManager.local(), path = fm.joinPath(fm.cacheDirectory(), 'ecoflow-widget.json')
   let cache = {}
   try { if (fm.fileExists(path)) cache = JSON.parse(fm.readString(path)) } catch {}
-  const keys = ['soc', 'remMin', 'fromGrid', 'loadW', 'inW', 'fullMin', 'toPct', 'other', 'lag']
+  const keys = ['soc', 'remMin', 'fromGrid', 'loadW', 'inW', 'fullMin', 'toPct', 'other', 'lag', 'packs']
   for (const s of d.stations) {
     const c = cache[s.cmd]
     if (s.soc !== null) cache[s.cmd] = { ...Object.fromEntries(keys.map((x) => [x, s[x] ?? null])), at: d.at }
