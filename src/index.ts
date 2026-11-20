@@ -398,15 +398,27 @@ async function applyLight(env: Env, readings: Map<string, Reading>) {
 	}
 }
 
+const FROZEN_MS = 45 * 60_000 // скільки цифри REST-станції можуть стояти на місці (при навантаженні), поки список каже «офлайн»
 async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, refresh = false) {
 	const list: Array<{ sn: string; online: number }> = await ecoflow(env, '/iot-open/sign/device/list')
 	const online = new Map(DEVICES.map((d) => [d.sn, list.find((x) => x.sn === d.sn)?.online === 1]))
 	const readings = new Map<string, Reading>()
 	const errors: string[] = []
 
-	const restJobs = devices.filter((d) => d.via === 'rest' && online.get(d.sn)).map(async (d) => {
+	// REST-станцію (Маринку) читаємо завжди, навіть якщо список пристроїв каже «офлайн»: після підключення
+	// дод. батареї (20.11) список уперто показував офлайн, хоча станція в мережі, а дані живі.
+	// Дані прийшли — станція онлайн. Але справді офлайн-станцію хмара, найімовірніше, віддає з останніми цифрами,
+	// тож якщо список каже «офлайн», а заряд і навантаження (ненульове) не змінюються FROZEN_MS — вважаємо офлайн
+	const restJobs = devices.filter((d) => d.via === 'rest').map(async (d) => {
+		const listed = online.get(d.sn)
 		try {
 			const rd = await readRest(env, d.sn)
+			if (!listed) {
+				const s = (await env.POWER_KV.get<Record<string, SnapStation>>('snap', 'json'))?.[d.cmd]
+				const frozen = !!s && s.soc === rd.soc && s.loadW === rd.loadW && (rd.loadW ?? 0) > 0 && s.chg !== undefined && Date.now() - s.chg > FROZEN_MS
+				if (frozen) return
+				online.set(d.sn, true)
+			}
 			// Хмарний API віддає налаштування з запізненням (хвилини). Якщо бот сам щойно змінив ліміт —
 			// 10 хв довіряємо своєму значенню, а не старому з API
 			const c = await getSettings(d.sn)
@@ -416,7 +428,7 @@ async function readAll(env: Env, devices: Device[] = DEVICES, detailed = false, 
 			if (!recent) await saveSettings(d.sn, { maxChg: rd.maxChg, minDsg: rd.minDsg }).catch((e) => console.error('settings', d.name, e))
 			readings.set(d.sn, rd)
 		} catch (e) {
-			errors.push(`${d.name}: ${e}`)
+			if (listed) errors.push(`${d.name}: ${e}`) // офлайн за списком і без даних — це просто офлайн
 		}
 	})
 	const mqttJob = (async () => {
@@ -1526,7 +1538,7 @@ async function run(env: Env) {
 //   • змінився заряд — не частіше ніж раз на 5 хв (при швидкій зарядці % росте щохвилини);
 //   • інакше — раз на 15 хв (час роботи, навантаження).
 // «Від мережі» на запис не впливає: у River 3 воно мерехтить від пакета до пакета.
-interface SnapStation { soc: number | null; remMin: number | null; fromGrid: boolean | null; loadW: number | null; inW?: number | null; fullMin?: number | null; toPct?: number; other?: boolean; lag?: boolean; online: boolean; at: number }
+interface SnapStation { soc: number | null; remMin: number | null; fromGrid: boolean | null; loadW: number | null; inW?: number | null; fullMin?: number | null; toPct?: number; other?: boolean; lag?: boolean; online: boolean; at: number; chg?: number } // chg — коли востаннє змінились заряд/навантаження
 const SNAP_REFRESH_MS = 15 * 60_000
 const SNAP_SOC_GAP_MS = 5 * 60_000
 const SNAP_SOC_GAP_CHARGING_MS = 60_000 // при зарядці % росте швидко (до ~2%/хв) — оновлюємо щохвилини
@@ -1546,7 +1558,7 @@ async function saveSnapshot(env: Env, readings: Map<string, Reading>, online: Ma
 		if (!p || p.online !== on) onlineChanged = true
 		if (r && p && p.soc !== r.soc) socChanged = true
 		next[d.cmd] = r
-			? { soc: r.soc, remMin: r.remMin ?? null, fromGrid: r.gridIn ?? null, loadW: r.loadW ?? null, inW: r.inW ?? null, fullMin: toFull(d, r), toPct: chargeTo(r), other: !!r.other, lag: !!r.lag, online: on, at: now }
+			? { soc: r.soc, remMin: r.remMin ?? null, fromGrid: r.gridIn ?? null, loadW: r.loadW ?? null, inW: r.inW ?? null, fullMin: toFull(d, r), toPct: chargeTo(r), other: !!r.other, lag: !!r.lag, online: on, at: now, chg: !p || p.soc !== r.soc || p.loadW !== (r.loadW ?? null) ? now : (p.chg ?? now) }
 			: { ...(p ?? { soc: null, remMin: null, fromGrid: null, loadW: null, at: now }), online: on }
 	}
 	const charging = [...readings.values()].some((r) => (r.inW ?? 0) > 10 || r.batt === 'in')

@@ -17,7 +17,7 @@ export const DEVICES: Device[] = [
 		name: 'Маринка',
 		via: 'rest',
 		cmd: 'marinka',
-		capWh: 2048, // DELTA 3 Max Plus
+		capWh: 4096, // DELTA 3 Max Plus 2048 + додаткова батарея 2048 (cmsBattSoc — загальний % обох)
 		messages: {
 			50: 'Половина, можно жить',
 			25: 'Пора закругляться',
